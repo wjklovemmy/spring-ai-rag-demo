@@ -1,0 +1,81 @@
+spring:
+  application:
+    name: spring-ai-rag-demo
+  servlet:
+    multipart:
+      max-file-size: 50MB
+      max-request-size: 50MB
+  ai:
+    deepseek:
+      base-url: https://api.deepseek.com
+      api-key: sk-ebb4b4c34c9c4884b94d63ed9d38544c
+      chat:
+        model: deepseek-chat
+        temperature: 0.8
+    dashscope:
+      api-key: sk-ws-H.ERHHHRP.P3JA.MEUCIBvoNljiyJ3bQYri02O_YuFhXvU5OjJe0E7PO4cXF_8_AiEAz9SadUbRiYXCts5jQlwzizmUnZ5woZ4uoF1mNZw8RTA
+      embedding:
+        model: text-embedding-v3
+    vectorstore:
+      milvus:
+        database-name: default
+        # collection-name 不再需要静态配置，由 VectorStoreService 按知识库动态创建 kb_{id}
+        initialize-schema: false
+        embedding-dimension: 1024
+        index-type: IVF_FLAT
+        metric-type: COSINE
+        client:
+          host: localhost
+          port: 19530
+  datasource:
+    url: jdbc:mysql://localhost:3306/knowledge_base?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    username: root
+    password: root
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+server:
+  port: 8080
+
+# RAG 配置：按岗位 → 文档类型 → 分块参数 三层结构
+rag:
+  # 文件存储配置：local（本地磁盘）/ minio（MinIO 对象存储）
+  storage:
+    type: minio
+    minio:
+      endpoint: http://localhost:9002
+      access-key: minioadmin
+      secret-key: minioadmin
+      bucket: knowledge-documents
+  document:
+    # 文档版本共存天数：新版本上传后，旧版本仍可检索的天数，超期后自动过滤
+    version-ttl-days: 30
+    # 上传文件持久化存储目录
+    upload-dir: ./uploads
+  positions:
+    dev:
+      document:
+        types:
+          pdf:
+            chunk-size: 800
+            min-chunk-size-chars: 350
+            min-chunk-length-to-embed: 80
+            max-num-chunks: 10000
+            keep-separator: true
+    finance:
+      document:
+        types:
+          pdf:
+            chunk-size: 800
+            min-chunk-size-chars: 350
+            min-chunk-length-to-embed: 80
+            max-num-chunks: 10000
+            keep-separator: true
+    hr:
+      document:
+        types:
+          pdf:
+            chunk-size: 800
+            min-chunk-size-chars: 350
+            min-chunk-length-to-embed: 80
+            max-num-chunks: 10000
+            keep-separator: true
