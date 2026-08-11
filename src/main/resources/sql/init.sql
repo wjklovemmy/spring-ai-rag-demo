@@ -118,5 +118,19 @@ ALTER TABLE knowledge_document
   ADD COLUMN expire_time DATETIME   DEFAULT NULL COMMENT '过期时间，旧版本平滑下线用',
   ADD COLUMN is_active   TINYINT    DEFAULT 1   COMMENT '是否启用：1-启用 0-禁用';
 
+ALTER TABLE knowledge_document ADD COLUMN position VARCHAR(32) DEFAULT NULL COMMENT '岗位类型' AFTER knowledge_id;
 
 
+-- ==================== 用户表 ====================
+CREATE TABLE IF NOT EXISTS sys_user (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键',
+    username VARCHAR(50) NOT NULL COMMENT '用户名，登录用',
+    password VARCHAR(255) NOT NULL COMMENT 'BCrypt 加密后的密码',
+    nickname VARCHAR(50) DEFAULT NULL COMMENT '显示昵称',
+    email VARCHAR(100) DEFAULT NULL COMMENT '邮箱',
+    status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1-启用 0-禁用',
+    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+
+    UNIQUE KEY uk_username (username)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='系统用户';

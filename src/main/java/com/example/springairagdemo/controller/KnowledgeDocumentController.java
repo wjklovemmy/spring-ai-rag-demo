@@ -1,10 +1,13 @@
 package com.example.springairagdemo.controller;
 
 import com.example.springairagdemo.config.RagConfigProperties;
+import com.example.springairagdemo.entity.KnowledgeBaseEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.service.FileStorageService;
+import com.example.springairagdemo.service.KnowledgeBaseService;
 import com.example.springairagdemo.service.KnowledgeDocumentEntityService;
 import com.example.springairagdemo.service.KnowledgeDocumentService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.InputStreamResource;
@@ -12,6 +15,7 @@ import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -41,6 +45,7 @@ public class KnowledgeDocumentController {
 
     private final KnowledgeDocumentService knowledgeDocumentService;
     private final KnowledgeDocumentEntityService knowledgeDocumentEntityService;
+    private final KnowledgeBaseService knowledgeBaseService;
     private final FileStorageService fileStorageService;
     private final RagConfigProperties ragConfig;
 
@@ -207,6 +212,96 @@ public class KnowledgeDocumentController {
             log.error("文件下载失败: {}", objectName, e);
             return ResponseEntity.internalServerError().body(Map.of(
                     "success", false, "message", "文件下载失败: " + e.getMessage()
+            ));
+        }
+    }
+
+    /**
+     * 查询文档列表，支持多条件筛选
+     *
+     * @param knowledgeBaseId 知识库 ID（可选）
+     * @param position        岗位（可选）
+     * @param keyword         文档名称模糊搜索（可选）
+     */
+    @GetMapping("/list")
+    public ResponseEntity<Map<String, Object>> list(
+            @RequestParam(required = false) Long knowledgeBaseId,
+            @RequestParam(required = false) String position,
+            @RequestParam(required = false) String keyword) {
+
+        LambdaQueryWrapper<KnowledgeDocumentEntity> wrapper = new LambdaQueryWrapper<>();
+
+        if (knowledgeBaseId != null) {
+            wrapper.eq(KnowledgeDocumentEntity::getKnowledgeId, knowledgeBaseId);
+        }
+        if (position != null && !position.isBlank()) {
+            wrapper.eq(KnowledgeDocumentEntity::getPosition, position);
+        }
+        if (keyword != null && !keyword.isBlank()) {
+            wrapper.like(KnowledgeDocumentEntity::getFileName, keyword);
+        }
+
+        // 按创建时间倒序，取最新 100 条
+        wrapper.orderByDesc(KnowledgeDocumentEntity::getCreateTime).last("LIMIT 100");
+
+        List<KnowledgeDocumentEntity> list = knowledgeDocumentEntityService.list(wrapper);
+
+        List<Map<String, Object>> result = list.stream().map(doc -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", doc.getId());
+            item.put("knowledgeBaseId", doc.getKnowledgeId());
+            item.put("position", doc.getPosition());
+            item.put("fileName", doc.getFileName());
+            item.put("fileType", doc.getFileType());
+            item.put("fileSize", doc.getFileSize());
+            item.put("chunkCount", doc.getChunkCount());
+            item.put("status", doc.getStatus());
+            item.put("version", doc.getVersion());
+            item.put("createTime", doc.getCreateTime());
+            item.put("updateTime", doc.getUpdateTime());
+            return item;
+        }).toList();
+
+        return ResponseEntity.ok(Map.of("success", true, "total", result.size(), "data", result));
+    }
+
+    /**
+     * 获取可用知识库列表（供下拉框使用）
+     */
+    @GetMapping("/knowledge-bases")
+    public ResponseEntity<Map<String, Object>> knowledgeBases() {
+        List<KnowledgeBaseEntity> list = knowledgeBaseService.lambdaQuery()
+                .eq(KnowledgeBaseEntity::getStatus, 1)
+                .list();
+
+        List<Map<String, Object>> result = list.stream().map(kb -> {
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("id", kb.getId());
+            item.put("name", kb.getName());
+            item.put("description", kb.getDescription());
+            return item;
+        }).toList();
+
+        return ResponseEntity.ok(Map.of("success", true, "data", result));
+    }
+
+    /**
+     * 删除文档及其关联数据（MySQL chunk + Milvus 向量 + MinIO 文件）
+     */
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Map<String, Object>> delete(@PathVariable Long id) {
+        KnowledgeDocumentEntity doc = knowledgeDocumentEntityService.getById(id);
+        if (doc == null) {
+            return ResponseEntity.status(404).body(Map.of("success", false, "message", "文档不存在"));
+        }
+
+        try {
+            knowledgeDocumentService.deleteDocument(id);
+            return ResponseEntity.ok(Map.of("success", true, "message", "文档已删除"));
+        } catch (Exception e) {
+            log.error("删除文档失败: id={}", id, e);
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "success", false, "message", "删除失败: " + e.getMessage()
             ));
         }
     }

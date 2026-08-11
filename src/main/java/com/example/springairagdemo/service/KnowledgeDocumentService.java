@@ -15,9 +15,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -172,6 +169,7 @@ public abstract class KnowledgeDocumentService {
 
         KnowledgeDocumentEntity entity = new KnowledgeDocumentEntity();
         entity.setKnowledgeId(knowledgeBaseId);
+        entity.setPosition(position);
         entity.setFileName(originalFilename);
         entity.setFilePath(originalFilename);
         entity.setFileSize(file.getSize());
@@ -188,6 +186,52 @@ public abstract class KnowledgeDocumentService {
                 originalFilename, newVersion, entity.getId(), knowledgeBaseId);
 
         return entity;
+    }
+
+    // ===================== 文档删除 =====================
+
+    /**
+     * 删除文档及其关联数据：MySQL 文档+chunk 记录、Milvus 向量、MinIO 文件。
+     * 三个存储独立处理：任一个失败不影响其他回滚（只记日志，不阻断）。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public void deleteDocument(Long documentId) {
+        KnowledgeDocumentEntity doc = knowledgeDocumentEntityService.getById(documentId);
+        if (doc == null) {
+            log.warn("删除文档时未找到记录: id={}", documentId);
+            return;
+        }
+
+        log.info("开始删除文档: id={}, fileName={}, knowledgeBaseId={}", documentId, doc.getFileName(), doc.getKnowledgeId());
+
+        // 1. MySQL：删除 chunk 记录
+        boolean chunkDeleted = knowledgeChunkEntityService.lambdaUpdate()
+                .eq(KnowledgeChunkEntity::getDocumentId, documentId)
+                .remove();
+        log.info("MySQL chunk 记录已删除: documentId={}, 结果={}", documentId, chunkDeleted);
+
+        // 2. MySQL：删除 document 记录（@Transactional 保证与 chunk 原子性）
+        knowledgeDocumentEntityService.removeById(documentId);
+        log.info("MySQL 文档记录已删除: id={}", documentId);
+
+        // 3. MinIO：删除文件（独立捕获异常，不阻塞事务提交）
+        String filePath = doc.getFilePath();
+        if (filePath != null && !filePath.isBlank()) {
+            try {
+                fileStorageService.delete(filePath);
+            } catch (Exception e) {
+                log.error("MinIO 文件删除失败（文档 id={}, path={}），需手动清理", documentId, filePath, e);
+            }
+        }
+
+        // 4. Milvus：删除向量（独立捕获异常，不阻塞事务提交）
+        if (doc.getKnowledgeId() != null) {
+            try {
+                vectorStoreService.deleteVectorsByDocumentId(doc.getKnowledgeId(), documentId);
+            } catch (Exception e) {
+                log.error("Milvus 向量删除失败（知识库 id={}, 文档 id={}），需手动清理", doc.getKnowledgeId(), documentId, e);
+            }
+        }
     }
 
     /**
@@ -208,9 +252,8 @@ public abstract class KnowledgeDocumentService {
         log.info("文件已持久化: {}", objectName);
     }
 
-    /**
-     * 标记文档为失败状态（独立事务，不受主事务回滚影响）
-     */
+    // ===================== 辅助方法 =====================
+
     /**
      * 清洗文件名，去掉可能导致对象存储路径问题的特殊字符
      */
@@ -229,6 +272,9 @@ public abstract class KnowledgeDocumentService {
         return name;
     }
 
+    /**
+     * 标记文档为失败状态（独立事务，不受主事务回滚影响）
+     */
     private void markDocumentFailed(KnowledgeDocumentEntity entity) {
         if (entity == null || entity.getId() == null) return;
         try {
@@ -361,7 +407,7 @@ public abstract class KnowledgeDocumentService {
         List<KnowledgeChunkEntity> chunks = knowledgeChunkEntityService.listByIds(chunkIds);
 
         // 按检索顺序组装上下文
-        java.util.Map<Long, KnowledgeChunkEntity> chunkMap = chunks.stream()
+        Map<Long, KnowledgeChunkEntity> chunkMap = chunks.stream()
                 .collect(Collectors.toMap(KnowledgeChunkEntity::getId, c -> c, (a, b) -> a));
 
         // 获取文档信息，并过滤已过期的版本（过期文档在问答中不可见）
@@ -382,7 +428,7 @@ public abstract class KnowledgeDocumentService {
             // 已过期的跳过
             if (doc.getExpireTime() != null && doc.getExpireTime().before(now)) continue;
             validResults.add(r);
-            docNameMap.putIfAbsent(doc.getId(), doc.getFileName() + " v" + doc.getVersion());
+            docNameMap.putIfAbsent(doc.getId(), doc.getFileName());
         }
         searchResults = validResults;
 
@@ -430,8 +476,8 @@ public abstract class KnowledgeDocumentService {
                 .content();
 
         // 从回答中提取实际引用的来源编号，只保留精准来源
-        java.util.Set<Integer> citedRefs = new java.util.HashSet<>();
-        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
+        Set<Integer> citedRefs = new HashSet<>();
+        Matcher m = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
         while (m.find()) {
             citedRefs.add(Integer.parseInt(m.group(1)));
         }

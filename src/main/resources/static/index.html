@@ -239,6 +239,41 @@
             background: #111128;
             color: #e2e8f0;
         }
+
+        /* 文档列表表格 */
+        .doc-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+        .doc-table th {
+            text-align: left;
+            padding: 12px 14px;
+            color: #94a3b8;
+            font-weight: 500;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            white-space: nowrap;
+        }
+        .doc-table td {
+            padding: 12px 14px;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
+            vertical-align: middle;
+        }
+        .doc-table tr:hover td {
+            background: rgba(255,255,255,0.02);
+        }
+        .doc-table .status-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+        }
+        .doc-table .doc-name {
+            color: #818cf8;
+            cursor: pointer;
+        }
+        .doc-table .doc-name:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
@@ -273,6 +308,16 @@
             <line x1="12" y1="3" x2="12" y2="15"/>
         </svg>
         上传文档
+    </button>
+
+    <button class="nav-item" onclick="switchTab(this, 'docs')">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+        </svg>
+        文档列表
     </button>
 
     <button class="nav-item" onclick="switchTab(this, 'kb')">
@@ -391,6 +436,51 @@
             <div id="uploadResult" style="margin-top:16px;text-align:center;min-height:24px;"></div>
         </div>
 
+        <!-- 文档列表 Tab -->
+        <div id="tab-docs" class="tab-content" style="display:none;">
+            <!-- 筛选条件 -->
+            <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin-bottom:20px;">
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">知识库</label>
+                    <select id="docsKbFilter"
+                            style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:200px;">
+                        <option value="">全部知识库</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">岗位</label>
+                    <select id="docsPosFilter"
+                            style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:160px;">
+                        <option value="">全部岗位</option>
+                        <option value="dev">研发</option>
+                        <option value="finance">财务</option>
+                        <option value="hr">人事</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">文档名称</label>
+                    <input type="text" id="docsKeyword" placeholder="模糊搜索..."
+                           style="width:260px;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;"
+                           onkeydown="if(event.key==='Enter') loadDocList()">
+                </div>
+                <button onclick="loadDocList()"
+                        style="height:42px;padding:0 24px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">
+                    查询
+                </button>
+                <button onclick="resetDocFilter()"
+                        style="height:42px;padding:0 18px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.04);color:#94a3b8;cursor:pointer;font-size:14px;">
+                    重置
+                </button>
+            </div>
+
+            <!-- 结果表格 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;overflow:auto;">
+                <div id="docListContainer" style="min-height:200px;padding:16px;">
+                    <div style="text-align:center;color:#64748b;padding:60px 0;">点击"查询"加载文档列表</div>
+                </div>
+            </div>
+        </div>
+
         <!-- 知识库管理 Tab -->
         <div id="tab-kb" class="tab-content" style="display:none;">
             <!-- 创建知识库表单 -->
@@ -457,7 +547,7 @@
         container.innerHTML = '';
         showToast('正在下载 ' + docName + ' ...', 'info');
         try {
-            var res = await fetch('/api/knowledge-document/' + docId + '/download');
+            var res = await fetchApi('/api/knowledge-document/' + docId + '/download');
             if (!res.ok) throw new Error('下载失败');
             var blob = await res.blob();
             var url = URL.createObjectURL(blob);
@@ -481,9 +571,19 @@
         }
     }
 
+    // ---- JWT Token 管理 ----
+    function getToken() { return localStorage.getItem('token'); }
+
+    async function fetchApi(url, options) {
+        options = options || {};
+        const headers = options.headers || {};
+        const authHeaders = { 'Authorization': 'Bearer ' + getToken() };
+        return fetch(url, Object.assign({}, options, { headers: Object.assign({}, headers, authHeaders) }));
+    }
+
     // ---- 登录状态检查 ----
     (async function checkAuth() {
-        const res = await fetch('/api/user');
+        const res = await fetchApi('/api/user');
         if (!res.ok) {
             window.location.href = '/login.html';
             return;
@@ -494,7 +594,8 @@
     })();
 
     async function logout() {
-        await fetch('/api/logout');
+        localStorage.removeItem('token');
+        localStorage.removeItem('username');
         window.location.href = '/login.html';
     }
 
@@ -504,10 +605,11 @@
         el.classList.add('active');
         document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
         document.getElementById('tab-' + tab).style.display = 'block';
-        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', kb: '知识库管理' };
+        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表', kb: '知识库管理' };
         document.getElementById('pageTitle').textContent = titles[tab];
         if (tab === 'kb') loadKnowledgeBases();
         if (tab === 'chat' || tab === 'upload') loadKbSelectors();
+        if (tab === 'docs') loadDocKbFilter();
     }
 
     // ---- 知识问答 ----
@@ -533,7 +635,7 @@
         input.value = '';
 
         try {
-            const res = await fetch('/api/knowledge-document/chat', {
+            const res = await fetchApi('/api/knowledge-document/chat', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ question, knowledgeBaseId: Number(kbId) })
@@ -596,7 +698,7 @@
         formData.append('knowledgeBaseId', kbId);
 
         try {
-            const res = await fetch('/api/knowledge-document/upload', { method: 'POST', body: formData });
+            const res = await fetchApi('/api/knowledge-document/upload', { method: 'POST', body: formData });
             const data = await res.json();
             if (data.success) {
                 const verInfo = data.isUpdate ? ' <span style="color:#fbbf24;">(已更新为 v' + data.version + ')</span>' : ' <span style="color:#64748b;">(v' + data.version + ')</span>';
@@ -612,7 +714,7 @@
     // ---- 知识库管理 ----
     async function loadKbSelectors() {
         try {
-            const res = await fetch('/api/knowledge-base');
+            const res = await fetchApi('/api/knowledge-base');
             const data = await res.json();
             if (data.success && data.data) {
                 const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + (kb.status === 1 ? '' : ' [已禁用]') + '</option>').join('');
@@ -634,7 +736,7 @@
         if (!creator) { resultEl.innerHTML = '<span style="color:#f87171;">请输入创建人</span>'; return; }
 
         try {
-            const res = await fetch('/api/knowledge-base', {
+            const res = await fetchApi('/api/knowledge-base', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ name, description: desc, createUser: creator })
@@ -657,7 +759,7 @@
     async function loadKnowledgeBases() {
         const listEl = document.getElementById('kbList');
         try {
-            const res = await fetch('/api/knowledge-base');
+            const res = await fetchApi('/api/knowledge-base');
             const data = await res.json();
             if (data.success && data.data && data.data.length > 0) {
                 listEl.innerHTML = data.data.map(kb => `
@@ -683,10 +785,106 @@
         }
     }
 
+    // ====== 文档列表 ======
+    async function loadDocKbFilter() {
+        try {
+            const res = await fetchApi('/api/knowledge-document/knowledge-bases');
+            const data = await res.json();
+            if (data.success && data.data) {
+                const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + '</option>').join('');
+                document.getElementById('docsKbFilter').innerHTML = '<option value="">全部知识库</option>' + options;
+            }
+        } catch (err) {
+            console.error('加载知识库筛选列表失败', err);
+        }
+    }
+
+    async function loadDocList() {
+        const container = document.getElementById('docListContainer');
+        container.innerHTML = '<div style="text-align:center;color:#64748b;padding:60px 0;">⏳ 加载中...</div>';
+
+        const kbId = document.getElementById('docsKbFilter').value;
+        const pos = document.getElementById('docsPosFilter').value;
+        const keyword = document.getElementById('docsKeyword').value.trim();
+
+        const params = new URLSearchParams();
+        if (kbId) params.append('knowledgeBaseId', kbId);
+        if (pos) params.append('position', pos);
+        if (keyword) params.append('keyword', keyword);
+
+        try {
+            const res = await fetchApi('/api/knowledge-document/list?' + params.toString());
+            const data = await res.json();
+
+            if (!data.success) {
+                container.innerHTML = '<div style="text-align:center;color:#f87171;padding:60px 0;">' + (data.message || '查询失败') + '</div>';
+                return;
+            }
+
+            if (!data.data || data.data.length === 0) {
+                container.innerHTML = '<div style="text-align:center;color:#64748b;padding:60px 0;">暂无匹配的文档</div>';
+                return;
+            }
+
+            const statusMap = { 0: ['处理中', '#fbbf24'], 3: ['成功', '#34d399'], 4: ['失败', '#f87171'] };
+            const rows = data.data.map(doc => {
+                const st = statusMap[doc.status] || ['未知', '#94a3b8'];
+                const ctime = doc.createTime ? new Date(doc.createTime).toLocaleString('zh-CN') : '-';
+                const utime = doc.updateTime ? new Date(doc.updateTime).toLocaleString('zh-CN') : '-';
+                const size = doc.fileSize ? (doc.fileSize / 1024).toFixed(1) + ' KB' : '-';
+                return '<tr>' +
+                    '<td style="min-width:200px;"><a class="doc-name" href="javascript:void(0)" onclick="downloadFile(' + doc.id + ',\'' + (doc.fileName || 'document').replace(/'/g, "\\'") + '\')" title="点击下载">' + (doc.fileName || '-') + '</a></td>' +
+                    '<td>' + (doc.fileType || '-') + '</td>' +
+                    '<td>' + size + '</td>' +
+                    '<td>' + (doc.chunkCount || 0) + '</td>' +
+                    '<td><span class="status-badge" style="background:' + st[1] + '20;color:' + st[1] + ';">' + st[0] + '</span></td>' +
+                    '<td>' + (doc.version || 1) + '</td>' +
+                    '<td>' + ctime + '</td>' +
+                    '<td>' + utime + '</td>' +
+                    '<td style="text-align:center;"><button onclick="deleteDocument(' + doc.id + ',\'' + (doc.fileName || '文档').replace(/'/g, "\\'") + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(239,68,68,0.15)\'" onmouseout="this.style.background=\'none\'">删除</button></td>' +
+                    '</tr>';
+            }).join('');
+
+            container.innerHTML =
+                '<table class="doc-table">' +
+                '<thead><tr>' +
+                '<th>文档名称</th><th>类型</th><th>大小</th><th>片段数</th><th>状态</th><th>版本</th><th>创建时间</th><th>更新时间</th><th style="text-align:center;">操作</th>' +
+                '</tr></thead>' +
+                '<tbody>' + rows + '</tbody>' +
+                '</table>';
+        } catch (err) {
+            container.innerHTML = '<div style="text-align:center;color:#f87171;padding:60px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    async function deleteDocument(docId, docName) {
+        if (!confirm('确定要删除「' + docName + '」吗？\n\n此操作将同时删除：\n- 文档记录和 Chunk 数据\n- MinIO 文件\n- Milvus 向量\n\n删除后不可恢复。')) return;
+        try {
+            const res = await fetchApi('/api/knowledge-document/' + docId, { method: 'DELETE' });
+            const data = await res.json();
+            if (data.success) {
+                showToast('「' + docName + '」已删除', 'success');
+                loadDocList();
+            } else {
+                showToast('删除失败: ' + (data.message || '未知错误'), 'error');
+            }
+        } catch (err) {
+            showToast('删除失败，请重试', 'error');
+        }
+    }
+
+    function resetDocFilter() {
+        document.getElementById('docsKbFilter').value = '';
+        document.getElementById('docsPosFilter').value = '';
+        document.getElementById('docsKeyword').value = '';
+        loadDocList();
+    }
+    // ====== 文档列表 END ======
+
     async function deleteKnowledgeBase(id) {
         if (!confirm('确定要删除该知识库吗？此操作不可恢复。')) return;
         try {
-            const res = await fetch('/api/knowledge-base/' + id, { method: 'DELETE' });
+            const res = await fetchApi('/api/knowledge-base/' + id, { method: 'DELETE' });
             const data = await res.json();
             if (data.success) {
                 loadKnowledgeBases();
