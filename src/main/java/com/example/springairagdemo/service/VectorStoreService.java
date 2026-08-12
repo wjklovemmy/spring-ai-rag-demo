@@ -392,6 +392,36 @@ public class VectorStoreService {
         return results;
     }
 
+    /**
+     * 纯 BM25 全文检索：仅用关键词路召回，不依赖 embedding
+     * <p>
+     * 用于 embedding 服务异常时的兜底检索（HybridSearchService 降级链的一环），
+     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建），旧版 collection 不支持。
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param query           查询文本（由 Milvus 内置 analyzer 分词）
+     * @param topK            返回 Top-K 条
+     * @return 检索结果列表（score 为 BM25 相关性分）
+     */
+    public List<SearchResult> bm25Search(Long knowledgeBaseId, String query, int topK) {
+        String collectionName = getCollectionName(knowledgeBaseId);
+        ensureReady(knowledgeBaseId);
+
+        SearchReq searchReq = SearchReq.builder()
+                .collectionName(collectionName)
+                .data(List.of(new EmbeddedText(query)))
+                .annsField(FIELD_SPARSE)
+                .metricType(IndexParam.MetricType.BM25)
+                .topK(topK)
+                .outputFields(OUT_FIELDS)
+                .build();
+        SearchResp resp = milvusClient.search(searchReq);
+
+        List<SearchResult> results = parseSearchResp(resp, 0.0);
+        log.info("BM25 全文检索 collection [{}] 召回 {} 个 chunk (query={})", collectionName, results.size(), query);
+        return results;
+    }
+
     // ===================== 辅助方法 =====================
 
     private List<Float> embedQuery(String query) {

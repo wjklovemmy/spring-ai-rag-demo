@@ -59,6 +59,8 @@
 
     <!-- MyBatis-Plus -->
     <logger name="com.baomidou.mybatisplus" level="WARN"/>
+    <!-- 业务 mapper 接口的 SQL 日志（Preparing/Parameters）会输出 chunk 全文等大字段，仅保留 WARN 级别 -->
+    <logger name="com.example.springairagdemo.mapper" level="WARN"/>
 
     <!-- Milvus -->
     <logger name="io.milvus" level="WARN"/>

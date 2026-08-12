@@ -57,8 +57,14 @@ public class HybridSearchService {
             return results;
         } catch (Exception e) {
             if (hybrid.isFallbackOnError()) {
-                log.warn("Hybrid 检索失败，降级为纯向量检索: {}", e.getMessage());
-                return vectorStoreService.search(knowledgeBaseId, query, topK, threshold);
+                // 优先降级 BM25 全文检索：不依赖 embedding，embedding 服务异常时仍可关键词兜底
+                try {
+                    log.warn("Hybrid 检索失败，降级为 BM25 全文检索: {}", e.getMessage());
+                    return vectorStoreService.bm25Search(knowledgeBaseId, query, topK);
+                } catch (Exception bm25Ex) {
+                    log.warn("BM25 全文检索失败（可能为旧版 collection），降级为纯向量检索: {}", bm25Ex.getMessage());
+                    return vectorStoreService.search(knowledgeBaseId, query, topK, threshold);
+                }
             }
             throw e;
         }

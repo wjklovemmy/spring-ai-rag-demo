@@ -53,9 +53,11 @@ public class AliyunOcrService implements OcrService {
     @Override
     public String recognizeImage(byte[] imageBytes) {
         try {
+            // 注意：Type 参数大小写敏感，通用文字识别基础版取值必须为 "General"（首字母大写），
+            // 传小写 "general" 会触发 400 "Specified parameter Type is not valid"
             RecognizeAllTextRequest request = new RecognizeAllTextRequest()
                     .setBody(new java.io.ByteArrayInputStream(imageBytes))
-                    .setType("general");
+                    .setType("General");
             RecognizeAllTextResponse response = getClient().recognizeAllText(request);
             if (response == null || response.getBody() == null || response.getBody().getData() == null) {
                 log.warn("阿里云 OCR 返回空响应");

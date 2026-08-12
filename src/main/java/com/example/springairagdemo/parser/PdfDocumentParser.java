@@ -7,10 +7,9 @@ import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.rendering.PDFRenderer;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.reader.pdf.PagePdfDocumentReader;
 import org.springframework.ai.transformer.splitter.TokenTextSplitter;
-import org.springframework.core.io.FileSystemResource;
 import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -59,8 +58,7 @@ public class PdfDocumentParser implements DocumentParser {
         Path tempFile = Files.createTempFile("pdf-upload-", ".pdf");
         try {
             file.transferTo(tempFile.toFile());
-            PagePdfDocumentReader reader = new PagePdfDocumentReader(new FileSystemResource(tempFile));
-            List<Document> documents = reader.read();
+            List<Document> documents = readAllPages(tempFile);
             log.info("从 PDF 中读取到 {} 个文档页面", documents.size());
 
             // OCR 兜底：扫描版 PDF 页面无文本层时渲染图片识别文字（原地替换页内容）
@@ -71,6 +69,32 @@ public class PdfDocumentParser implements DocumentParser {
         } finally {
             Files.deleteIfExists(tempFile);
         }
+    }
+
+    /**
+     * 逐页提取 PDF 文本，空文本页面也保留（供 OCR 兜底）。
+     * <p>
+     * 不直接使用 Spring AI 的 {@code PagePdfDocumentReader}：它内部用 {@code StringUtils.hasText}
+     * 过滤无文本页面，纯图片 PDF（扫描件）会被过滤成空列表，导致后续 OCR 兜底无从触发。
+     */
+    private List<Document> readAllPages(Path tempFile) throws IOException {
+        List<Document> documents = new ArrayList<>();
+        try (PDDocument pdfDocument = Loader.loadPDF(tempFile.toFile())) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            int totalPages = pdfDocument.getNumberOfPages();
+            for (int pageNo = 1; pageNo <= totalPages; pageNo++) {
+                stripper.setStartPage(pageNo);
+                stripper.setEndPage(pageNo);
+                String text = stripper.getText(pdfDocument);
+
+                Map<String, Object> metadata = new HashMap<>();
+                metadata.put("page_number", pageNo);
+                metadata.put("end_page_number", pageNo);
+                metadata.put("file_name", tempFile.getFileName().toString());
+                documents.add(Document.builder().text(text == null ? "" : text).metadata(metadata).build());
+            }
+        }
+        return documents;
     }
 
     /**
@@ -94,6 +118,8 @@ public class PdfDocumentParser implements DocumentParser {
                 log.info("第 {} 页无有效文本层，触发 OCR 识别", i + 1);
                 BufferedImage image = renderer.renderImageWithDPI(i, ocrConfig.getDpi(), ImageType.RGB);
                 String ocrText = ocrService.recognizeImage(toPngBytes(image));
+                log.info("第 {} 页 OCR 返回: 是否为空={}, 识别字符数={}", i + 1,
+                        ocrText == null || ocrText.isBlank(), ocrText == null ? 0 : ocrText.length());
 
                 if (ocrText != null && !ocrText.isBlank()) {
                     // Spring AI 2.0 Document 不可变，重建替换

@@ -178,8 +178,8 @@ public class RagConfigProperties {
         private boolean enabled = true;
         /** 相邻段落余弦相似度阈值，低于该值视为语义断点（值越大切得越碎） */
         private double threshold = 0.55;
-        /** embedding 批量大小 */
-        private int batchSize = 64;
+        /** embedding 批量大小（DashScope text-embedding-v3 单次上限 10 条） */
+        private int batchSize = 10;
         /** 过短段落（字符）并入相邻段落，避免噪声干扰聚类 */
         private int minSegmentChars = 20;
         /** 语义切片失败时是否降级为 token 切分（默认降级） */
