@@ -69,6 +69,9 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected RerankService rerankService;
 
+    @Autowired
+    protected HybridSearchService hybridSearchService;
+
     // ===================== 模板方法：上传文档 =====================
 
     /**
@@ -394,11 +397,17 @@ public abstract class KnowledgeDocumentService {
      * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
      */
     public ChatResult chat(String question, Long knowledgeBaseId) {
-        // 1. 向量检索：召回更多候选（candidateTopK），供后续 Rerank 精排
+        // 1. 检索召回：启用 Hybrid Search 时走「Dense + BM25 + RRF 融合」，否则纯向量检索
+        //    召回 candidateTopK 个候选，供后续 Rerank 精排
         RagConfigProperties.Rerank rerankConfig = ragConfig.getRerank();
-        List<VectorStoreService.SearchResult> searchResults =
-                vectorStoreService.search(knowledgeBaseId, question,
-                        rerankConfig.getCandidateTopK(), rerankConfig.getThreshold());
+        List<VectorStoreService.SearchResult> searchResults;
+        if (ragConfig.getHybrid().isEnabled()) {
+            searchResults = hybridSearchService.search(knowledgeBaseId, question,
+                    rerankConfig.getCandidateTopK(), rerankConfig.getThreshold());
+        } else {
+            searchResults = vectorStoreService.search(knowledgeBaseId, question,
+                    rerankConfig.getCandidateTopK(), rerankConfig.getThreshold());
+        }
 
         if (searchResults.isEmpty()) {
             String answer = chatClient.prompt().user(question).call().content();

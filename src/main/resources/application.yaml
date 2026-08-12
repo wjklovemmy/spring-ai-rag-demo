@@ -52,6 +52,18 @@ rag:
     threshold: 0.3
     # Rerank 调用失败时降级为纯向量排序
     fallback-on-error: true
+  # 混合检索：Dense 向量（Milvus）+ BM25 全文检索（Milvus 内置 analyzer）双路召回，RRF 融合
+  # 需 Milvus 服务端 2.5+（BM25 稀疏向量与 chinese analyzer），SDK 版本见 pom 的 milvus-sdk.version
+  hybrid:
+    enabled: true
+    # 每路（dense / bm25）召回候选数，最终融合取 rerank.candidate-top-k 条
+    route-top-k: 40
+    # 融合结果最低 RRF 分数，低于该值视为噪声丢弃（默认 0 不启用过滤，避免误伤召回）
+    min-score: 0.0
+    # RRF 平滑系数 k：score = Σ 1/(k + rank)
+    rrf-k: 60
+    # Hybrid 检索异常时降级为纯向量检索
+    fallback-on-error: true
   # OCR：扫描版 PDF（无文本层）自动渲染页面并识别文字
   ocr:
     enabled: true

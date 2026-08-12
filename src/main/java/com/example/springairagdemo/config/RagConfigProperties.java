@@ -28,6 +28,9 @@ public class RagConfigProperties {
     /** OCR（扫描版 PDF 文字识别）配置 */
     private Ocr ocr = new Ocr();
 
+    /** 混合检索（Hybrid Search：Dense 向量 + BM25 全文检索 + RRF 融合）配置 */
+    private Hybrid hybrid = new Hybrid();
+
     /** 岗位名称 → 岗位配置 */
     private Map<String, PositionConfig> positions = new HashMap<>();
 
@@ -81,6 +84,20 @@ public class RagConfigProperties {
         private int minTextLength = 20;
         /** 单页 OCR 失败时是否抛异常中断解析（false=记日志并跳过该页） */
         private boolean failOnError = false;
+    }
+
+    @Data
+    public static class Hybrid {
+        /** 是否启用混合检索（false=降级为纯向量检索） */
+        private boolean enabled = true;
+        /** 每路（dense / bm25）召回候选数 */
+        private int routeTopK = 40;
+        /** 融合结果最低 RRF 分数，低于该值视为噪声丢弃（RRF 分通常约 1/(k+rank)，默认 0 不启用过滤） */
+        private double minScore = 0.0;
+        /** RRF 平滑系数 k：score = Σ 1/(k + rank) */
+        private int rrfK = 60;
+        /** Hybrid 检索异常时是否降级为纯向量检索 */
+        private boolean fallbackOnError = true;
     }
 
     @Data

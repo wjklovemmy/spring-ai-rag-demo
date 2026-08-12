@@ -33,7 +33,7 @@
 | 对话模型 | DeepSeek `deepseek-chat` | 问答生成模型 |
 | 向量模型 | DashScope `text-embedding-v3`（1024 维） | 文本向量化（自研 `AbstractEmbeddingModel` 实现） |
 | 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
-| 向量数据库 | Milvus 2.6.0 | 向量存储与相似度检索 |
+| 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
 | 认证 | JWT（jjwt 0.12.6）+ BCrypt | 无状态登录认证 |
@@ -65,7 +65,7 @@ graph TB
 
     subgraph Storage["存储层"]
         MYSQL[("MySQL<br/>文档/Chunk/用户元数据")]
-        MILVUS[("Milvus<br/>向量库 kb_{id}")]
+        MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
         MINIO[("MinIO<br/>原始 PDF 文件")]
     end
 
@@ -144,7 +144,8 @@ spring-ai-rag-demo/
     │   │   └── service/
     │   │       ├── KnowledgeDocumentService.java   # 摄取模板方法 + 问答（抽象类）
     │   │       ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现（岗位分类）
-    │   │       ├── VectorStoreService.java         # Milvus 向量增删查
+    │   │       ├── VectorStoreService.java         # Milvus 增删查（Dense + BM25 Hybrid Search）
+    │   │       ├── HybridSearchService.java        # 混合检索编排（RRF 融合 + 异常降级）
     │   │       ├── RerankService.java              # 重排序接口
     │   │       ├── DashScopeRerankService.java     # 百炼 gte-rerank 实现
     │   │       ├── OcrService.java                 # OCR 接口
@@ -216,8 +217,9 @@ spring-ai-rag-demo/
 ```
 用户问题
   │
-  ├─ ① 向量检索   问题 → DashScope 向量化 → Milvus 相似度检索（召回候选）
-  │       candidateTopK=20，相似度阈值 0.3
+  ├─ ① 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
+  │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
+  │       · rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
   │
   ├─ ② 过滤       过滤已过期版本文档的检索结果
   │
@@ -233,7 +235,7 @@ spring-ai-rag-demo/
   └─ ⑦ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
 ```
 
-**检索增强说明**：采用"先宽后精"的两阶段检索——向量召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。
+**检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
 
 **返回结构**：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
 前端可将 `sources` 渲染为可下载/可跳转的引用来源。
@@ -308,6 +310,11 @@ spring-ai-rag-demo/
 | `rag.rerank.top-n` | 精排后保留片段数（默认 5） |
 | `rag.rerank.threshold` | 向量召回相似度阈值（默认 0.3） |
 | `rag.rerank.fallback-on-error` | Rerank 失败时降级为纯向量排序（默认 true） |
+| `rag.hybrid.enabled` | 是否启用混合检索（Dense + BM25 + RRF，默认 true；false=纯向量） |
+| `rag.hybrid.route-top-k` | 每路（dense / bm25）召回候选数（默认 40，融合取 rerank.candidate-top-k 条） |
+| `rag.hybrid.min-score` | 融合结果最低 RRF 分数，低于该值视为噪声（默认 0 不启用过滤） |
+| `rag.hybrid.rrf-k` | RRF 平滑系数 k（默认 60，score = Σ 1/(k + rank)） |
+| `rag.hybrid.fallback-on-error` | Hybrid 检索异常时降级为纯向量检索（默认 true） |
 | `rag.ocr.enabled` | 是否启用 OCR（默认 true） |
 | `rag.ocr.region-id` | OCR 服务地域（默认 cn-hangzhou） |
 | `rag.ocr.access-key-id/secret` | 阿里云 AccessKey（建议环境变量 `ALIYUN_OCR_AK/SK`） |
@@ -328,6 +335,7 @@ spring-ai-rag-demo/
 > 语义切片复用 `DashScopeEmbeddingModel`（text-embedding-v3），每篇文档按段落批量向量化一次（价格极低），失败自动降级为 TokenTextSplitter。
 
 > 注意：所有大模型 Key（DeepSeek / DashScope）均已从环境变量读取，`application.yaml` 中不再含明文密钥，可安全提交到仓库。
+> Hybrid Search 依赖 Milvus 服务端 2.5+ 的 BM25 稀疏向量与内置 analyzer；项目通过 pom 的 `milvus-sdk.version`（2.6.23）覆盖 Spring AI 传递引入的旧版 SDK（2.5.8，仅 v1 客户端、不支持 BM25）。
 
 ---
 
@@ -376,7 +384,9 @@ export ALIYUN_OCR_SK=xxxx
 - MySQL 连接与账号密码
 - MinIO 连接（默认 `minioadmin/minioadmin`，9002 端口）
 
-> 不需要 OCR / Rerank 时，可分别将 `rag.ocr.enabled`、`rag.rerank.enabled` 置为 `false`。
+> 不需要 OCR / Rerank / Hybrid 时，可分别将 `rag.ocr.enabled`、`rag.rerank.enabled`、`rag.hybrid.enabled` 置为 `false`。
+
+> **重要（已有数据的升级提示）**：升级到 Hybrid Search 后，新创建的知识库 collection 自动包含 BM25 字段（`text`/`sparse`）。由旧版本创建的 collection 缺少这些字段，应用会输出 warn 日志并**自动降级为纯向量检索**；如需启用 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
 
 ### 3. 启动应用
 
@@ -415,7 +425,7 @@ mvnw.cmd spring-boot:run
 1. **模板方法模式**：`KnowledgeDocumentService` 抽象类固化摄取 8 步流程，子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
 2. **文件后置上传**：原始文件仅在解析、切分、向量化全部成功后写入对象存储，避免脏数据。
 3. **版本平滑下线**：同名文档重传自动递增版本，旧版本 TTL 内仍可检索，避免"删旧传新"的中断。
-4. **两阶段检索（Rerank）**："先宽后精"——向量召回 20 条候选，再由百炼 gte-rerank 精排取 5 条，失败自动降级为纯向量排序，兼顾效果与可用性。
+4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。
 5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
 6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
 7. **标题感知注入**：识别数字/中文序数/无序号标题行构建标题链，将所属标题以 `【标题链】正文` 前缀注入 chunk 文本（参与向量化，孤立 chunk 也有上下文）并写 `metadata.heading` 供溯源。
