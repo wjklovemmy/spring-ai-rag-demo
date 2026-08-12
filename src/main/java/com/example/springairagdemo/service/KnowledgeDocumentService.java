@@ -66,6 +66,9 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected TransactionTemplate transactionTemplate;
 
+    @Autowired
+    protected RerankService rerankService;
+
     // ===================== 模板方法：上传文档 =====================
 
     /**
@@ -391,9 +394,11 @@ public abstract class KnowledgeDocumentService {
      * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
      */
     public ChatResult chat(String question, Long knowledgeBaseId) {
-        // 1. 向量检索
+        // 1. 向量检索：召回更多候选（candidateTopK），供后续 Rerank 精排
+        RagConfigProperties.Rerank rerankConfig = ragConfig.getRerank();
         List<VectorStoreService.SearchResult> searchResults =
-                vectorStoreService.search(knowledgeBaseId, question, 5, 0.3);
+                vectorStoreService.search(knowledgeBaseId, question,
+                        rerankConfig.getCandidateTopK(), rerankConfig.getThreshold());
 
         if (searchResults.isEmpty()) {
             String answer = chatClient.prompt().user(question).call().content();
@@ -431,6 +436,33 @@ public abstract class KnowledgeDocumentService {
             docNameMap.putIfAbsent(doc.getId(), doc.getFileName());
         }
         searchResults = validResults;
+
+        // 2.5 召回重排序（Rerank）：对候选片段按 "问题相关性" 精排，取 topN
+        if (rerankService.isEnabled() && searchResults.size() > 1) {
+            List<String> texts = searchResults.stream()
+                    .map(r -> {
+                        KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
+                        return chunk == null ? "" : chunk.getContent();
+                    })
+                    .toList();
+            try {
+                List<RerankService.RerankItem> ranked =
+                        rerankService.rerank(question, texts, rerankConfig.getTopN());
+                if (ranked != null && !ranked.isEmpty()) {
+                    // 按重排分数降序重建检索结果（只保留 topN）
+                    List<VectorStoreService.SearchResult> currentResults = searchResults;
+                    List<VectorStoreService.SearchResult> reranked = ranked.stream()
+                            .map(item -> currentResults.get(item.index()))
+                            .toList();
+                    searchResults = reranked;
+                    log.debug("Rerank 精排完成，保留 {} 条候选", searchResults.size());
+                } else {
+                    log.debug("Rerank 未返回结果，降级为向量排序结果");
+                }
+            } catch (Exception e) {
+                log.warn("Rerank 精排失败，降级为向量排序结果: {}", e.getMessage());
+            }
+        }
 
         // 构建来源信息
         List<SourceInfo> sources = new ArrayList<>();

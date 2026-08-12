@@ -38,6 +38,32 @@ server:
 
 # RAG 配置：按岗位 → 文档类型 → 分块参数 三层结构
 rag:
+  # 召回重排序：向量召回候选后，用百炼 gte-rerank 精排，提升上下文质量
+  rerank:
+    enabled: true
+    model: gte-rerank-v2
+    # 向量召回候选数（先召回更多，再精排）
+    candidate-top-k: 20
+    # 精排后保留的片段数
+    top-n: 5
+    # 向量召回相似度阈值
+    threshold: 0.3
+    # Rerank 调用失败时降级为纯向量排序
+    fallback-on-error: true
+  # OCR：扫描版 PDF（无文本层）自动渲染页面并识别文字
+  ocr:
+    enabled: true
+    # 阿里云 OCR 服务地域
+    region-id: cn-hangzhou
+    # 阿里云 AccessKey（建议用环境变量注入，勿提交到仓库）
+    access-key-id: ${ALIYUN_OCR_AK:}
+    access-key-secret: ${ALIYUN_OCR_SK:}
+    # PDF 页渲染分辨率 DPI（越高识别越准、耗时越长）
+    dpi: 200
+    # 页文本低于该长度（字符）视为无文本层，触发 OCR
+    min-text-length: 20
+    # 单页 OCR 失败时是否抛异常中断（false=记日志跳过该页）
+    fail-on-error: false
   # 文件存储配置：local（本地磁盘）/ minio（MinIO 对象存储）
   storage:
     type: minio

@@ -32,11 +32,13 @@
 | AI 框架 | Spring AI 2.0.0 | 统一抽象 Chat / Embedding / VectorStore |
 | 对话模型 | DeepSeek `deepseek-chat` | 问答生成模型 |
 | 向量模型 | DashScope `text-embedding-v3`（1024 维） | 文本向量化（自研 `AbstractEmbeddingModel` 实现） |
+| 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
 | 向量数据库 | Milvus 2.6.0 | 向量存储与相似度检索 |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
 | 认证 | JWT（jjwt 0.12.6）+ BCrypt | 无状态登录认证 |
-| PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF |
+| PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
+| OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
 | 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面 |
 
 ---
@@ -54,9 +56,10 @@ graph TB
         CTRL["Controller 层<br/>Auth / KnowledgeBase / KnowledgeDocument"]
         AUTH["JWT 认证过滤器<br/>JwtAuthenticationFilter"]
         SVC["Service 层<br/>ingest 模板流程 / chat 问答 / 文档删除"]
-        PARSER["Parser<br/>PagePdfDocumentReader"]
+        PARSER["Parser<br/>PagePdfDocumentReader + OCR 兜底"]
         SPLIT["TokenTextSplitter<br/>按岗位配置分块"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
+        RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
         CHAT["ChatClient<br/>deepseek-chat"]
     end
 
@@ -66,6 +69,7 @@ graph TB
         MINIO[("MinIO<br/>原始 PDF 文件")]
     end
 
+    OCRSVC["阿里云 OCR API"]
     AI["DeepSeek API"]
     DS["DashScope API"]
 
@@ -73,13 +77,16 @@ graph TB
     INDEX --> AUTH --> CTRL
     CTRL --> SVC
     SVC --> PARSER --> SPLIT
+    PARSER -.无文本层.-> OCRSVC
     SPLIT --> MYSQL
     SPLIT --> EMBED --> DS
     EMBED --> MILVUS
     SVC --> CHAT --> AI
+    MILVUS --> SVC
+    SVC --> RERANK --> DS
+    RERANK --> SVC
     SVC --> MINIO
     SVC --> MYSQL
-    SVC --> MILVUS
 ```
 
 **模型分工（Bean 显式限定避免歧义）：**
@@ -88,8 +95,10 @@ graph TB
 |------|------|--------|---------|
 | 对话 / 生成 | `deepseek-chat` | DeepSeek API | `deepSeekChatModel` |
 | 向量化 | `text-embedding-v3` | DashScope（阿里云） | 自定义 `DashScopeEmbeddingModel` |
+| 召回重排序 | `gte-rerank-v2` | 百炼（DashScope） | 自定义 `DashScopeRerankService` |
+| 图片文字识别 | 阿里云 OCR `RecognizeAllText` | 阿里云 OCR | 自定义 `AliyunOcrService` |
 
-> Spring AI 2.0 未内置 DashScope Embedding Starter，项目自研了 `DashScopeEmbeddingModel`（继承 `AbstractEmbeddingModel`），直接调用 DashScope REST API，输出 1024 维向量。
+> Spring AI 2.0 未内置 DashScope Embedding Starter，项目自研了 `DashScopeEmbeddingModel`（继承 `AbstractEmbeddingModel`），直接调用 DashScope REST API，输出 1024 维向量。Rerank 复用同一 DashScope API Key。
 
 ---
 
@@ -131,11 +140,15 @@ spring-ai-rag-demo/
     │   │   │   └── UserMapper.java
     │   │   ├── parser/
     │   │   │   ├── DocumentParser.java             # 解析接口
-    │   │   │   └── PdfDocumentParser.java          # PDF 解析实现
+    │   │   │   └── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
     │   │   └── service/
     │   │       ├── KnowledgeDocumentService.java   # 摄取模板方法 + 问答（抽象类）
     │   │       ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现（岗位分类）
     │   │       ├── VectorStoreService.java         # Milvus 向量增删查
+    │   │       ├── RerankService.java              # 重排序接口
+    │   │       ├── DashScopeRerankService.java     # 百炼 gte-rerank 实现
+    │   │       ├── OcrService.java                 # OCR 接口
+    │   │       ├── AliyunOcrService.java           # 阿里云 OCR 实现
     │   │       ├── FileStorageService.java         # 文件存储接口
     │   │       ├── MinioFileStorageService.java    # MinIO 实现
     │   │       ├── LocalFileStorageService.java    # 本地磁盘实现
@@ -199,19 +212,24 @@ spring-ai-rag-demo/
 ```
 用户问题
   │
-  ├─ ① 向量检索   问题 → DashScope 向量化 → Milvus 相似度检索
-  │       topK=5，相似度阈值 0.3
+  ├─ ① 向量检索   问题 → DashScope 向量化 → Milvus 相似度检索（召回候选）
+  │       candidateTopK=20，相似度阈值 0.3
   │
   ├─ ② 过滤       过滤已过期版本文档的检索结果
   │
   ├─ ③ 取回文本   按 chunk_id 从 MySQL 回查完整 chunk 内容
   │
-  ├─ ④ 组装上下文 按检索顺序拼接，标注 [来源n] 文档名 + 页码
+  ├─ ④ Rerank 精排 百炼 gte-rerank 对 "问题 vs 候选" 逐对打分，
+  │       按相关性降序取 topN=5（失败自动降级为向量排序）
   │
-  ├─ ⑤ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  ├─ ⑤ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
   │
-  └─ ⑥ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
+  ├─ ⑥ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  │
+  └─ ⑦ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
 ```
+
+**检索增强说明**：采用"先宽后精"的两阶段检索——向量召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。
 
 **返回结构**：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
 前端可将 `sources` 渲染为可下载/可跳转的引用来源。
@@ -280,7 +298,21 @@ spring-ai-rag-demo/
 | `rag.document.version-ttl-days` | 旧版本文档共存天数（默认 30） |
 | `rag.document.upload-dir` | 本地存储模式上传目录 |
 | `rag.positions.*` | 按岗位（dev/finance/hr）独立配置分块参数 |
+| `rag.rerank.enabled` | 是否启用召回重排序（默认 true） |
+| `rag.rerank.model` | 重排序模型（默认 `gte-rerank-v2`） |
+| `rag.rerank.candidate-top-k` | 向量召回候选数（默认 20） |
+| `rag.rerank.top-n` | 精排后保留片段数（默认 5） |
+| `rag.rerank.threshold` | 向量召回相似度阈值（默认 0.3） |
+| `rag.rerank.fallback-on-error` | Rerank 失败时降级为纯向量排序（默认 true） |
+| `rag.ocr.enabled` | 是否启用 OCR（默认 true） |
+| `rag.ocr.region-id` | OCR 服务地域（默认 cn-hangzhou） |
+| `rag.ocr.access-key-id/secret` | 阿里云 AccessKey（建议环境变量 `ALIYUN_OCR_AK/SK`） |
+| `rag.ocr.dpi` | PDF 页渲染分辨率（默认 200） |
+| `rag.ocr.min-text-length` | 页文本低于该长度触发 OCR（默认 20） |
 | `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间 |
+
+> Rerank 复用 `spring.ai.dashscope.api-key`，无需单独配置 key；
+> OCR 需在阿里云开通"文字识别 OCR"服务，并配置 AccessKey（建议用环境变量注入）。
 
 > 注意：`application.yaml` 中已配置真实 API Key（DeepSeek / DashScope），请勿提交到公开仓库；生产环境建议改用环境变量。
 
@@ -303,9 +335,12 @@ docker-compose up -d
 
 在 `application.yaml` 中确认：
 - DeepSeek API Key
-- DashScope API Key（`text-embedding-v3`）
+- DashScope API Key（`text-embedding-v3`，同时用于 `gte-rerank-v2` 重排序）
+- 阿里云 OCR AccessKey（如需识别扫描版 PDF，设置环境变量 `ALIYUN_OCR_AK` / `ALIYUN_OCR_SK`，并在[阿里云 OCR 控制台](https://ocr.console.aliyun.com/)开通服务）
 - MySQL 连接与账号密码
 - MinIO 连接（默认 `minioadmin/minioadmin`，9002 端口）
+
+> 不需要 OCR / Rerank 时，可分别将 `rag.ocr.enabled`、`rag.rerank.enabled` 置为 `false`。
 
 ### 3. 启动应用
 
@@ -344,6 +379,8 @@ mvnw.cmd spring-boot:run
 1. **模板方法模式**：`KnowledgeDocumentService` 抽象类固化摄取 8 步流程，子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
 2. **文件后置上传**：原始文件仅在解析、切分、向量化全部成功后写入对象存储，避免脏数据。
 3. **版本平滑下线**：同名文档重传自动递增版本，旧版本 TTL 内仍可检索，避免"删旧传新"的中断。
-4. **来源溯源**：回答中标注 `[来源n]` 并返回引用列表，LLM 未实际引用的来源会被过滤，保证溯源精准。
-5. **三存储独立容错**：删除文档时 MySQL/MinIO/Milvus 各自独立处理，单个失败不阻断整体。
-6. **显式 Bean 限定**：多模型场景下用 `@Qualifier` 明确 Chat 与 Embedding 的装配关系。
+4. **两阶段检索（Rerank）**："先宽后精"——向量召回 20 条候选，再由百炼 gte-rerank 精排取 5 条，失败自动降级为纯向量排序，兼顾效果与可用性。
+5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
+6. **来源溯源**：回答中标注 `[来源n]` 并返回引用列表，LLM 未实际引用的来源会被过滤，保证溯源精准。
+7. **三存储独立容错**：删除文档时 MySQL/MinIO/Milvus 各自独立处理，单个失败不阻断整体。
+8. **显式 Bean 限定**：多模型场景下用 `@Qualifier` 明确 Chat 与 Embedding 的装配关系。

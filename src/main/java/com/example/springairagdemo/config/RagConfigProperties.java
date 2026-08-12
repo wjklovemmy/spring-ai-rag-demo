@@ -22,6 +22,12 @@ public class RagConfigProperties {
     /** 文件存储配置（本地磁盘 / MinIO） */
     private Storage storage = new Storage();
 
+    /** 召回重排序（Rerank）配置 */
+    private Rerank rerank = new Rerank();
+
+    /** OCR（扫描版 PDF 文字识别）配置 */
+    private Ocr ocr = new Ocr();
+
     /** 岗位名称 → 岗位配置 */
     private Map<String, PositionConfig> positions = new HashMap<>();
 
@@ -41,6 +47,40 @@ public class RagConfigProperties {
         private int versionTtlDays = 30;
         /** 上传文件持久化存储目录（相对或绝对路径） */
         private String uploadDir = "./uploads";
+    }
+
+    @Data
+    public static class Rerank {
+        /** 是否启用召回重排序 */
+        private boolean enabled = false;
+        /** 重排序模型：百炼 gte-rerank（gte-rerank / gte-rerank-v2） */
+        private String model = "gte-rerank-v2";
+        /** 向量召回候选数（先召回更多，再由 Rerank 精排） */
+        private int candidateTopK = 20;
+        /** 精排后保留的片段数 */
+        private int topN = 5;
+        /** 向量召回相似度阈值 */
+        private double threshold = 0.3;
+        /** 调用失败时是否降级为纯向量排序（默认降级） */
+        private boolean fallbackOnError = true;
+    }
+
+    @Data
+    public static class Ocr {
+        /** 是否启用 OCR（扫描版 PDF 无文本层时自动识别） */
+        private boolean enabled = false;
+        /** OCR 服务地域，如 cn-hangzhou */
+        private String regionId = "cn-hangzhou";
+        /** 阿里云 AccessKey ID */
+        private String accessKeyId = "";
+        /** 阿里云 AccessKey Secret */
+        private String accessKeySecret = "";
+        /** PDF 页渲染分辨率 DPI */
+        private int dpi = 200;
+        /** 页文本长度低于该值视为无文本层，触发 OCR（字符数） */
+        private int minTextLength = 20;
+        /** 单页 OCR 失败时是否抛异常中断解析（false=记日志并跳过该页） */
+        private boolean failOnError = false;
     }
 
     @Data
