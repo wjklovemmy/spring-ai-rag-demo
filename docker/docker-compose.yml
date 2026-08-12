@@ -85,31 +85,6 @@ services:
       exit 0;
       "
 
-  app:
-    container_name: spring-ai-rag-demo
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      - SPRING_AI_DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-      - SPRING_DATASOURCE_URL=jdbc:mysql://host.docker.internal:3306/knowledge_base?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
-      - SPRING_DATASOURCE_USERNAME=root
-      - SPRING_DATASOURCE_PASSWORD=root
-      - SPRING_AI_VECTORSTORE_MILVUS_CLIENT_HOST=standalone
-      - SPRING_AI_VECTORSTORE_MILVUS_CLIENT_PORT=19530
-      - RAG_STORAGE_TYPE=minio
-      - RAG_STORAGE_MINIO_ENDPOINT=http://doc-minio:9000
-      - RAG_STORAGE_MINIO_ACCESS_KEY=minioadmin
-      - RAG_STORAGE_MINIO_SECRET_KEY=minioadmin
-      - RAG_STORAGE_MINIO_BUCKET=knowledge-documents
-    depends_on:
-      - standalone
-      - doc-minio-init
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-
 networks:
   default:
     name: milvus
