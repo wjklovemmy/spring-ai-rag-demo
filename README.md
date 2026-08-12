@@ -57,7 +57,7 @@ graph TB
         AUTH["JWT 认证过滤器<br/>JwtAuthenticationFilter"]
         SVC["Service 层<br/>ingest 模板流程 / chat 问答 / 文档删除"]
         PARSER["Parser<br/>PagePdfDocumentReader + OCR 兜底"]
-        SPLIT["TokenTextSplitter<br/>按岗位配置分块"]
+        SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
         CHAT["ChatClient<br/>deepseek-chat"]
@@ -183,7 +183,11 @@ spring-ai-rag-demo/
   │
   ├─ ② parseDocument      按页解析 PDF（PagePdfDocumentReader）
   │
-  ├─ ③ splitDocument      按岗位配置分块（TokenTextSplitter）
+  ├─ ③ splitDocument      自研 Chunking：语义切片 + 标题感知注入
+  │       · 段落批量 embedding 聚类 → 相邻相似度 < 0.55 处断点（语义边界）
+  │       · 识别标题行构建标题链（如 "3 考勤制度 > 3.2 请假流程"），
+  │         以 "【标题链】正文" 前缀注入 chunk 文本并写 metadata.heading
+  │       · 超长段 token 二次切分；语义切片失败自动降级 TokenTextSplitter
   │       · 默认 chunk-size 800、min 350 字符、最大 10000 chunk
   │
   ├─ ④ saveChunks         chunk 文本批量写入 MySQL knowledge_chunk
@@ -309,10 +313,19 @@ spring-ai-rag-demo/
 | `rag.ocr.access-key-id/secret` | 阿里云 AccessKey（建议环境变量 `ALIYUN_OCR_AK/SK`） |
 | `rag.ocr.dpi` | PDF 页渲染分辨率（默认 200） |
 | `rag.ocr.min-text-length` | 页文本低于该长度触发 OCR（默认 20） |
+| `rag.positions.*.heading.enabled` | 标题感知切分开关（默认 true） |
+| `rag.positions.*.heading.max-depth` | 标题链最大深度（默认 3） |
+| `rag.positions.*.heading.max-length` | 标题行最大字符数（默认 40） |
+| `rag.positions.*.heading.prefix-template` | 标题前缀注入模板（默认 `【{heading}】`） |
+| `rag.positions.*.semantic.enabled` | 语义切片开关（默认 true） |
+| `rag.positions.*.semantic.threshold` | 相邻段落相似度断点阈值（默认 0.55） |
+| `rag.positions.*.semantic.batch-size` | 段落 embedding 批量大小（默认 64） |
+| `rag.positions.*.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
 | `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间 |
 
 > Rerank 复用 `spring.ai.dashscope.api-key`，无需单独配置 key；
-> OCR 需在阿里云开通"文字识别 OCR"服务，并配置 AccessKey（建议用环境变量注入）。
+> OCR 需在阿里云开通"文字识别 OCR"服务，并配置 AccessKey（建议用环境变量注入）；
+> 语义切片复用 `DashScopeEmbeddingModel`（text-embedding-v3），每篇文档按段落批量向量化一次（价格极低），失败自动降级为 TokenTextSplitter。
 
 > 注意：`application.yaml` 中已配置真实 API Key（DeepSeek / DashScope），请勿提交到公开仓库；生产环境建议改用环境变量。
 
@@ -381,6 +394,8 @@ mvnw.cmd spring-boot:run
 3. **版本平滑下线**：同名文档重传自动递增版本，旧版本 TTL 内仍可检索，避免"删旧传新"的中断。
 4. **两阶段检索（Rerank）**："先宽后精"——向量召回 20 条候选，再由百炼 gte-rerank 精排取 5 条，失败自动降级为纯向量排序，兼顾效果与可用性。
 5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
+6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
+7. **标题感知注入**：识别数字/中文序数/无序号标题行构建标题链，将所属标题以 `【标题链】正文` 前缀注入 chunk 文本（参与向量化，孤立 chunk 也有上下文）并写 `metadata.heading` 供溯源。
 6. **来源溯源**：回答中标注 `[来源n]` 并返回引用列表，LLM 未实际引用的来源会被过滤，保证溯源精准。
 7. **三存储独立容错**：删除文档时 MySQL/MinIO/Milvus 各自独立处理，单个失败不阻断整体。
 8. **显式 Bean 限定**：多模型场景下用 `@Qualifier` 明确 Chat 与 Embedding 的装配关系。

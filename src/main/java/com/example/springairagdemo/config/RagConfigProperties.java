@@ -137,5 +137,35 @@ public class RagConfigProperties {
         private int maxNumChunks = 10000;
         /** 保留分隔符 */
         private boolean keepSeparator = true;
+        /** 标题感知切分配置 */
+        private Heading heading = new Heading();
+        /** 语义切片配置 */
+        private Semantic semantic = new Semantic();
+    }
+
+    @Data
+    public static class Heading {
+        /** 是否启用标题感知：识别标题行并构建标题链，注入到每个 chunk 前缀 */
+        private boolean enabled = true;
+        /** 标题链最大深度（如 "3 考勤制度 > 3.2 请假流程" 为 2 级） */
+        private int maxDepth = 3;
+        /** 标题行最大字符数，超过视为正文 */
+        private int maxLength = 40;
+        /** 标题前缀注入模板，{heading} 会被替换为标题链 */
+        private String prefixTemplate = "【{heading}】";
+    }
+
+    @Data
+    public static class Semantic {
+        /** 是否启用语义切片：段落 embedding 聚类，按相邻相似度找语义断点 */
+        private boolean enabled = true;
+        /** 相邻段落余弦相似度阈值，低于该值视为语义断点（值越大切得越碎） */
+        private double threshold = 0.55;
+        /** embedding 批量大小 */
+        private int batchSize = 64;
+        /** 过短段落（字符）并入相邻段落，避免噪声干扰聚类 */
+        private int minSegmentChars = 20;
+        /** 语义切片失败时是否降级为 token 切分（默认降级） */
+        private boolean fallbackOnError = true;
     }
 }
