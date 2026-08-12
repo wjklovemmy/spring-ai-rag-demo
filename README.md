@@ -293,8 +293,8 @@ spring-ai-rag-demo/
 
 | 配置项 | 说明 |
 |--------|------|
-| `spring.ai.deepseek.*` | DeepSeek base-url / api-key / 模型 / 温度 |
-| `spring.ai.dashscope.*` | DashScope api-key / embedding 模型 |
+| `spring.ai.deepseek.*` | DeepSeek base-url / 模型 / 温度（api-key 从环境变量 `DEEPSEEK_API_KEY` 读取） |
+| `spring.ai.dashscope.*` | DashScope embedding 模型（api-key 从环境变量 `DASHSCOPE_API_KEY` 读取） |
 | `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024 |
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
 | `rag.storage.type` | `minio` / `local` 文件存储切换 |
@@ -327,7 +327,7 @@ spring-ai-rag-demo/
 > OCR 需在阿里云开通"文字识别 OCR"服务，并配置 AccessKey（建议用环境变量注入）；
 > 语义切片复用 `DashScopeEmbeddingModel`（text-embedding-v3），每篇文档按段落批量向量化一次（价格极低），失败自动降级为 TokenTextSplitter。
 
-> 注意：`application.yaml` 中已配置真实 API Key（DeepSeek / DashScope），请勿提交到公开仓库；生产环境建议改用环境变量。
+> 注意：所有大模型 Key（DeepSeek / DashScope）均已从环境变量读取，`application.yaml` 中不再含明文密钥，可安全提交到仓库。
 
 ---
 
@@ -346,10 +346,33 @@ docker-compose up -d
 
 ### 2. 配置环境变量 / 密钥
 
-在 `application.yaml` 中确认：
-- DeepSeek API Key
-- DashScope API Key（`text-embedding-v3`，同时用于 `gte-rerank-v2` 重排序）
-- 阿里云 OCR AccessKey（如需识别扫描版 PDF，设置环境变量 `ALIYUN_OCR_AK` / `ALIYUN_OCR_SK`，并在[阿里云 OCR 控制台](https://ocr.console.aliyun.com/)开通服务）
+大模型 Key 通过环境变量注入（`application.yaml` 中无明文密钥）：
+
+| 环境变量 | 用途 |
+|----------|------|
+| `DEEPSEEK_API_KEY` | DeepSeek 对话模型（`deepseek-chat`） |
+| `DASHSCOPE_API_KEY` | DashScope 向量模型（`text-embedding-v3`）与重排序（`gte-rerank-v2`） |
+| `ALIYUN_OCR_AK` / `ALIYUN_OCR_SK` | 阿里云 OCR AccessKey（仅扫描版 PDF 需要，需在[阿里云 OCR 控制台](https://ocr.console.aliyun.com/)开通服务） |
+
+设置示例（Windows cmd）：
+
+```bat
+set DEEPSEEK_API_KEY=sk-xxxx
+set DASHSCOPE_API_KEY=sk-xxxx
+set ALIYUN_OCR_AK=xxxx
+set ALIYUN_OCR_SK=xxxx
+```
+
+Linux/macOS：
+
+```bash
+export DEEPSEEK_API_KEY=sk-xxxx
+export DASHSCOPE_API_KEY=sk-xxxx
+export ALIYUN_OCR_AK=xxxx
+export ALIYUN_OCR_SK=xxxx
+```
+
+另外在 `application.yaml` 中确认：
 - MySQL 连接与账号密码
 - MinIO 连接（默认 `minioadmin/minioadmin`，9002 端口）
 
