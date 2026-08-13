@@ -187,10 +187,9 @@ spring-ai-rag-demo/
     │       ├── static/
     │       │   ├── login.html                      # 登录/注册页
     │       │   └── index.html                      # 问答/上传仪表盘
-    │       └── sql/init.sql                        # 业务建表语句
     └── test/
 ├── sql/
-│   └── init.sql                              # RBAC 权限表（sys_role/sys_user_role/kb_member/kb_access_log）
+│   └── init.sql                              # 全量初始化脚本（业务表 + RBAC 权限表 + 内置角色/账号）
 ```
 
 ---
@@ -338,15 +337,23 @@ spring-ai-rag-demo/
 - **审计日志**：`kb_access_log` 记录关键访问行为；
 - 默认初始化 `ADMIN` 角色 + `admin/admin123` 账号（见 `DataInitializer`）。
 
-前端 `index.html` 通过 `fetchApi()` 统一在请求头注入 Token，登出时清除 `localStorage`。
+**权限管理（系统管理模块，仅 ADMIN 可见）：**
+
+- **用户管理**：用户列表（含功能角色标签）/ 创建用户 / 启用禁用 / 重置密码 / 删除（自动清理角色与数据授权）；
+- **角色管理**：角色列表（含用户数）/ 创建角色 / 删除角色（内置 `ADMIN` 不可删除）；
+- **分配功能角色**：在用户列表中对指定用户勾选角色（`sys_user_role` 覆盖式重写），并保护"最后一个 ADMIN"不会被降权/禁用/删除；
+- **数据权限**：知识库列表每行「成员」按钮 → 搜索用户 + 选择 `VIEWER/EDITOR/OWNER` 授权，可移除成员（最后一个 OWNER 保护）。
+
+前端 `index.html` 通过 `fetchApi()` 统一在请求头注入 Token，登出时清除 `localStorage`；`/api/user` 返回 `isAdmin`，据此控制「系统管理」菜单显隐。
 
 ---
 
 ## 数据库设计
 
 初始化脚本：
-- `src/main/resources/sql/init.sql` — 业务表（需手动在 MySQL 执行一次）
-- `sql/init.sql` — 权限表 `sys_role` / `sys_user_role` / `kb_member` / `kb_access_log`（需执行；应用启动时 `DataInitializer` 会自动补 `ADMIN` 角色与默认账号，但不建表）
+- `sql/init.sql` — 全量初始化脚本（需手动在 MySQL 执行一次）：
+  业务表 `knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task`，权限表 `sys_user` / `sys_role` / `sys_user_role` / `kb_member` / `kb_access_log`，以及内置 `ADMIN` 角色与 `admin` 账号（均幂等，可重复执行）。
+  应用启动时 `DataInitializer` 也会自动补齐 `ADMIN` 角色与默认账号（仅当 `sys_user` 表为空时）。
 
 | 表 | 用途 | 关键字段 |
 |----|------|----------|
@@ -423,9 +430,8 @@ docker-compose up -d
 
 会启动：Milvus 2.6.0（+ etcd）、MinIO（9002/9003，bucket `knowledge-documents` 自动创建）、Attu 管理界面（http://localhost:8000）。
 
-> 仓库中的 compose 未包含 MySQL 服务，需自行准备 MySQL 8.x，并依次执行：
-> 1. `src/main/resources/sql/init.sql` — 初始化业务表结构；
-> 2. `sql/init.sql` — 初始化权限表（`sys_role` / `sys_user_role` / `kb_member` / `kb_access_log`）。
+> 仓库中的 compose 未包含 MySQL 服务，需自行准备 MySQL 8.x，并执行一次：
+> 1. `sql/init.sql` — 全量初始化：业务表 + 权限表 + 内置 `ADMIN` 角色与 `admin` 账号（幂等，可重复执行）。
 
 ### 1.1 默认账号
 
@@ -510,6 +516,17 @@ mvnw.cmd spring-boot:run
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
 | GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤） |
+| GET | `/api/admin/users?keyword=` | 是 | 用户列表（需 ADMIN，含功能角色） |
+| POST | `/api/admin/users` | 是 | 创建用户（需 ADMIN，body `{username,password,nickname,email}`） |
+| PUT | `/api/admin/users/{id}/status` | 是 | 启用/禁用用户（需 ADMIN，body `{status:0\|1}`） |
+| PUT | `/api/admin/users/{id}/password` | 是 | 重置密码（需 ADMIN，body `{password}`） |
+| DELETE | `/api/admin/users/{id}` | 是 | 删除用户（需 ADMIN，自动清理角色与数据授权） |
+| GET | `/api/admin/users/{id}/roles` | 是 | 查询用户已分配功能角色（需 ADMIN） |
+| PUT | `/api/admin/users/{id}/roles` | 是 | 分配功能角色（需 ADMIN，body `{roleIds:[1,2]}`，覆盖式） |
+| GET | `/api/admin/roles` | 是 | 角色列表（需 ADMIN，含用户数） |
+| POST | `/api/admin/roles` | 是 | 创建角色（需 ADMIN，body `{code,name,remark}`） |
+| PUT | `/api/admin/roles/{id}` | 是 | 更新角色（需 ADMIN） |
+| DELETE | `/api/admin/roles/{id}` | 是 | 删除角色（需 ADMIN，内置 ADMIN 不可删） |
 
 ---
 

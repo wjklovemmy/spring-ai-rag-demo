@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>控制台 - Knowledge Document</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%236366f1'/><text x='50' y='70' font-size='56' font-weight='bold' text-anchor='middle' fill='white'>K</text></svg>">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -328,6 +329,27 @@
         知识库管理
     </button>
 
+    <div style="height:1px;background:rgba(255,255,255,0.06);margin:12px 0;"></div>
+    <div style="font-size:12px;color:#475569;padding:0 16px;margin-bottom:6px;letter-spacing:1px;">系统管理</div>
+
+    <button class="nav-item admin-only" style="display:none;" onclick="switchTab(this, 'users')">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+            <circle cx="9" cy="7" r="4"/>
+            <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+            <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+        用户管理
+    </button>
+
+    <button class="nav-item admin-only" style="display:none;" onclick="switchTab(this, 'roles')">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M9 12l2 2 4-4"/>
+        </svg>
+        角色管理
+    </button>
+
     <div class="sidebar-footer">
         <button class="logout-btn" onclick="logout()">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -466,15 +488,10 @@
             <!-- 创建知识库表单 -->
             <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:24px;margin-bottom:24px;">
                 <h3 style="font-size:18px;margin-bottom:16px;">创建知识库</h3>
-                <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">
+                <div style="display:grid;grid-template-columns:1fr 1fr auto;gap:12px;align-items:end;">
                     <div>
                         <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">知识库名称 *</label>
                         <input type="text" id="kbName" placeholder="请输入知识库名称"
-                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
-                    </div>
-                    <div>
-                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">创建人 *</label>
-                        <input type="text" id="kbCreator" placeholder="请输入创建人"
                                style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
                     </div>
                     <div>
@@ -504,8 +521,161 @@
                 </div>
             </div>
         </div>
+
+        <!-- 用户管理 Tab -->
+        <div id="tab-users" class="tab-content" style="display:none;">
+            <!-- 创建用户表单 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:24px;margin-bottom:24px;">
+                <h3 style="font-size:18px;margin-bottom:16px;">创建用户</h3>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr auto;gap:12px;align-items:end;">
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">用户名 *</label>
+                        <input type="text" id="newUsername" placeholder="登录账号"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">密码 *</label>
+                        <input type="password" id="newPassword" placeholder="初始密码"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">昵称</label>
+                        <input type="text" id="newNickname" placeholder="显示昵称（可选）"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">邮箱</label>
+                        <input type="text" id="newEmail" placeholder="邮箱（可选）"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <button onclick="createUser()"
+                            style="height:42px;padding:0 24px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">
+                        创建
+                    </button>
+                </div>
+                <div id="userCreateResult" style="margin-top:12px;min-height:20px;font-size:14px;"></div>
+            </div>
+
+            <!-- 用户列表 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:24px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;">
+                    <h3 style="font-size:18px;">用户列表</h3>
+                    <div style="display:flex;gap:12px;align-items:center;">
+                        <input type="text" id="userKeyword" placeholder="按用户名/昵称搜索..."
+                               style="width:220px;height:36px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:8px;color:#e2e8f0;font-size:13px;outline:none;"
+                               onkeydown="if(event.key==='Enter') loadUsers()">
+                        <button onclick="loadUsers()"
+                                style="padding:8px 18px;border:1px solid rgba(99,102,241,0.4);border-radius:8px;background:rgba(99,102,241,0.1);color:#a5b4fc;cursor:pointer;font-size:13px;">
+                            搜索
+                        </button>
+                    </div>
+                </div>
+                <div id="userList" style="min-height:100px;overflow-x:auto;">
+                    <div style="text-align:center;color:#64748b;padding:40px 0;">加载中...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 角色管理 Tab -->
+        <div id="tab-roles" class="tab-content" style="display:none;">
+            <!-- 创建角色表单 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:24px;margin-bottom:24px;">
+                <h3 style="font-size:18px;margin-bottom:16px;">创建角色</h3>
+                <div style="display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:12px;align-items:end;">
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">角色编码 *</label>
+                        <input type="text" id="roleCode" placeholder="如 EDITOR（大写）"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">角色名称 *</label>
+                        <input type="text" id="roleName" placeholder="如 编辑者"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <div>
+                        <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">备注</label>
+                        <input type="text" id="roleRemark" placeholder="备注（可选）"
+                               style="width:100%;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;">
+                    </div>
+                    <button onclick="createRole()"
+                            style="height:42px;padding:0 24px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">
+                        创建
+                    </button>
+                </div>
+                <div id="roleCreateResult" style="margin-top:12px;min-height:20px;font-size:14px;"></div>
+            </div>
+
+            <!-- 角色列表 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:24px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                    <h3 style="font-size:18px;">角色列表</h3>
+                    <button onclick="loadRoles()"
+                            style="padding:8px 18px;border:1px solid rgba(99,102,241,0.4);border-radius:8px;background:rgba(99,102,241,0.1);color:#a5b4fc;cursor:pointer;font-size:13px;">
+                        刷新
+                    </button>
+                </div>
+                <div id="roleList" style="min-height:100px;overflow-x:auto;">
+                    <div style="text-align:center;color:#64748b;padding:40px 0;">加载中...</div>
+                </div>
+            </div>
+        </div>
     </div>
 </main>
+
+<!-- 分配角色弹窗 -->
+<div id="roleAssignModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:#151530;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;width:420px;max-width:90vw;">
+        <h3 style="font-size:18px;margin-bottom:6px;">分配功能角色</h3>
+        <div style="color:#94a3b8;font-size:13px;margin-bottom:18px;">为 <span id="roleAssignUser" style="color:#a5b4fc;">用户</span> 设置角色（可多选）</div>
+        <div id="roleAssignList" style="margin-bottom:20px;display:flex;flex-direction:column;gap:10px;max-height:300px;overflow-y:auto;"></div>
+        <div style="display:flex;justify-content:flex-end;gap:12px;">
+            <button onclick="closeRoleAssign()"
+                    style="padding:10px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.04);color:#94a3b8;cursor:pointer;font-size:14px;">
+                取消
+            </button>
+            <button onclick="saveUserRoles()"
+                    style="padding:10px 20px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">
+                保存
+            </button>
+        </div>
+    </div>
+</div>
+
+<!-- 成员授权弹窗（数据权限） -->
+<div id="memberModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:#151530;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;width:560px;max-width:92vw;">
+        <h3 style="font-size:18px;margin-bottom:6px;">成员授权 <span id="memberKbName" style="color:#a5b4fc;"></span></h3>
+        <div style="color:#94a3b8;font-size:13px;margin-bottom:18px;">添加成员并设置其对该知识库的数据权限（VIEWER / EDITOR / OWNER）</div>
+        <div style="display:flex;gap:10px;margin-bottom:20px;">
+            <input type="text" id="memberSearchInput" placeholder="搜索用户（用户名/昵称）"
+                   style="flex:1;height:40px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;"
+                   oninput="searchMemberCandidates()">
+            <select id="memberRoleSelect"
+                    style="width:130px;height:40px;padding:0 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;">
+                <option value="VIEWER">查看者</option>
+                <option value="EDITOR">编辑者</option>
+                <option value="OWNER">所有者</option>
+            </select>
+            <select id="memberCandidateSelect"
+                    style="flex:1;height:40px;padding:0 10px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;">
+                <option value="">请搜索选择用户</option>
+            </select>
+            <button onclick="addMember()"
+                    style="height:40px;padding:0 18px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;white-space:nowrap;">
+                添加
+            </button>
+        </div>
+        <div id="memberList" style="min-height:80px;max-height:300px;overflow-y:auto;">
+            <div style="text-align:center;color:#64748b;padding:30px 0;">加载中...</div>
+        </div>
+        <div style="display:flex;justify-content:flex-end;margin-top:16px;">
+            <button onclick="closeMemberModal()"
+                    style="padding:10px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.04);color:#94a3b8;cursor:pointer;font-size:14px;">
+                关闭
+            </button>
+        </div>
+    </div>
+</div>
 
 <script>
     // ====== Toast 提示 ======
@@ -571,6 +741,10 @@
         const data = await res.json();
         document.getElementById('userName').textContent = data.username;
         document.getElementById('userAvatar').textContent = data.username.charAt(0).toUpperCase();
+        // 仅 ADMIN 显示用户管理 / 角色管理入口
+        if (data.isAdmin) {
+            document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
+        }
     })();
 
     async function logout() {
@@ -585,11 +759,13 @@
         el.classList.add('active');
         document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
         document.getElementById('tab-' + tab).style.display = 'block';
-        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表', kb: '知识库管理' };
+        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表', kb: '知识库管理', users: '用户管理', roles: '角色管理' };
         document.getElementById('pageTitle').textContent = titles[tab];
         if (tab === 'kb') loadKnowledgeBases();
         if (tab === 'chat' || tab === 'upload') loadKbSelectors();
         if (tab === 'docs') loadDocKbFilter();
+        if (tab === 'users') loadUsers();
+        if (tab === 'roles') loadRoles();
     }
 
     // ---- 知识问答 ----
@@ -624,8 +800,8 @@
             let html = '<div style="margin-bottom:12px;"><span style="background:rgba(255,255,255,0.05);padding:10px 16px;border-radius:12px;display:inline-block;max-width:80%;white-space:pre-wrap;">' + (data.answer || data.message) + '</span></div>';
             if (data.sources && data.sources.length > 0) {
                 html += '<div style="margin-top:8px;color:#94a3b8;font-size:12px;padding-left:8px;border-left:2px solid #6366f1;">📖 参考来源：';
-                data.sources.forEach((s, i) => {
-                    html += '<br><span style="color:#6366f1;">[来源' + (i+1) + ']</span> ' + s.documentName + ' 第' + (s.pageNo || '1') + '页';
+                data.sources.forEach(s => {
+                    html += '<br><span style="color:#6366f1;">[来源' + (s.refIndex || 1) + ']</span> ' + s.documentName + ' 第' + (s.pageNo || '1') + '页';
                     html += ' <a href="javascript:void(0)" onclick="downloadFile(' + s.documentId + ', \'' + (s.documentName || 'document').replace(/'/g, "\\'") + '\')" style="color:#818cf8;text-decoration:none;font-size:11px;" title="下载原文">⬇</a>';
                 });
                 html += '</div>';
@@ -701,24 +877,22 @@
 
     async function createKnowledgeBase() {
         const name = document.getElementById('kbName').value.trim();
-        const creator = document.getElementById('kbCreator').value.trim();
         const desc = document.getElementById('kbDesc').value.trim();
         const resultEl = document.getElementById('kbCreateResult');
 
         if (!name) { resultEl.innerHTML = '<span style="color:#f87171;">请输入知识库名称</span>'; return; }
-        if (!creator) { resultEl.innerHTML = '<span style="color:#f87171;">请输入创建人</span>'; return; }
 
         try {
+            // createUser 由后端从登录态自动写入（存用户ID），前端无需也不应传入
             const res = await fetchApi('/api/knowledge-base', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ name, description: desc, createUser: creator })
+                body: JSON.stringify({ name, description: desc })
             });
             const data = await res.json();
             if (data.success) {
                 resultEl.innerHTML = '<span style="color:#34d399;">✅ 知识库「' + name + '」创建成功</span>';
                 document.getElementById('kbName').value = '';
-                document.getElementById('kbCreator').value = '';
                 document.getElementById('kbDesc').value = '';
                 loadKnowledgeBases();
             } else {
@@ -735,21 +909,41 @@
             const res = await fetchApi('/api/knowledge-base');
             const data = await res.json();
             if (data.success && data.data && data.data.length > 0) {
-                listEl.innerHTML = data.data.map(kb => `
+                listEl.innerHTML = data.data.map(kb => {
+                    // 仅 OWNER（admin 视为 OWNER）可删除、可管理成员，否则置灰禁用
+                    const isOwner = kb.myRole === 'OWNER';
+                    const memberBtn = isOwner
+                        ? `<button onclick="openMemberModal(${kb.id}, '${kb.name.replace(/'/g, "\\'")}')"
+                                   style="padding:4px 14px;border:1px solid rgba(99,102,241,0.4);border-radius:6px;background:rgba(99,102,241,0.1);color:#a5b4fc;cursor:pointer;font-size:13px;">
+                               成员
+                           </button>`
+                        : `<button disabled title="仅所有者可管理成员"
+                                   style="padding:4px 14px;border:1px solid rgba(255,255,255,0.08);border-radius:6px;background:rgba(255,255,255,0.02);color:#475569;cursor:not-allowed;font-size:13px;">
+                               成员
+                           </button>`;
+                    const deleteBtn = isOwner
+                        ? `<button onclick="deleteKnowledgeBase(${kb.id})"
+                                   style="padding:4px 14px;border:1px solid rgba(239,68,68,0.3);border-radius:6px;background:rgba(239,68,68,0.1);color:#f87171;cursor:pointer;font-size:13px;">
+                               删除
+                           </button>`
+                        : `<button disabled title="仅所有者可删除"
+                                   style="padding:4px 14px;border:1px solid rgba(255,255,255,0.08);border-radius:6px;background:rgba(255,255,255,0.02);color:#475569;cursor:not-allowed;font-size:13px;">
+                               删除
+                           </button>`;
+                    return `
                     <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
                         <div>
                             <div style="font-weight:600;margin-bottom:4px;">${kb.name}</div>
-                            <div style="color:#64748b;font-size:13px;">${kb.description || '暂无描述'} · 创建人: ${kb.createUser} · ${kb.createTime ? new Date(kb.createTime).toLocaleString('zh-CN') : ''}</div>
+                            <div style="color:#64748b;font-size:13px;">${kb.description || '暂无描述'} · 创建人: ${kb.createUserName || kb.createUser} · ${kb.createTime ? new Date(kb.createTime).toLocaleString('zh-CN') : ''}</div>
                         </div>
                         <div style="display:flex;align-items:center;gap:10px;">
                             <span style="font-size:12px;padding:2px 10px;border-radius:20px;${kb.status === 1 ? 'background:rgba(52,211,153,0.15);color:#34d399;' : 'background:rgba(148,163,184,0.1);color:#94a3b8;'}">${kb.status === 1 ? '启用' : '禁用'}</span>
-                            <button onclick="deleteKnowledgeBase(${kb.id})"
-                                    style="padding:4px 14px;border:1px solid rgba(239,68,68,0.3);border-radius:6px;background:rgba(239,68,68,0.1);color:#f87171;cursor:pointer;font-size:13px;">
-                                删除
-                            </button>
+                            ${memberBtn}
+                            ${deleteBtn}
                         </div>
                     </div>
-                `).join('');
+                    `;
+                }).join('');
             } else {
                 listEl.innerHTML = '<div style="text-align:center;color:#64748b;padding:40px 0;">暂无知识库，请创建一个</div>';
             }
@@ -863,6 +1057,396 @@
             }
         } catch (err) {
             alert('删除失败，请重试');
+        }
+    }
+
+    // ====== 用户管理 ======
+    async function loadUsers() {
+        const keyword = document.getElementById('userKeyword').value.trim();
+        const params = new URLSearchParams();
+        if (keyword) params.append('keyword', keyword);
+        const listEl = document.getElementById('userList');
+        try {
+            const res = await fetchApi('/api/admin/users?' + params.toString());
+            const data = await res.json();
+            if (!data.success) {
+                listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:40px 0;">' + (data.message || '加载失败') + '</div>';
+                return;
+            }
+            if (!data.data || data.data.length === 0) {
+                listEl.innerHTML = '<div style="text-align:center;color:#64748b;padding:40px 0;">暂无用户</div>';
+                return;
+            }
+            const rows = data.data.map(u => {
+                const roleTags = (u.roles || []).map(r =>
+                    '<span style="display:inline-block;font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(99,102,241,0.15);color:#a5b4fc;margin:2px;">' +
+                    (r.code === 'ADMIN' ? '🛡️ ' : '') + (r.name || r.code) + '</span>'
+                ).join('') || '<span style="color:#64748b;font-size:13px;">未分配</span>';
+                const statusTag = u.status === 1
+                    ? '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(52,211,153,0.15);color:#34d399;">启用</span>'
+                    : '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(239,68,68,0.15);color:#f87171;">禁用</span>';
+                const ctime = u.createTime ? new Date(u.createTime).toLocaleString('zh-CN') : '-';
+                const uname = (u.username || '').replace(/'/g, "\\'");
+                return '<tr>' +
+                    '<td style="font-weight:600;">' + (u.username || '-') + '</td>' +
+                    '<td>' + (u.nickname || '-') + '</td>' +
+                    '<td>' + (u.email || '-') + '</td>' +
+                    '<td>' + statusTag + '</td>' +
+                    '<td>' + roleTags + '</td>' +
+                    '<td>' + ctime + '</td>' +
+                    '<td style="text-align:center;white-space:nowrap;">' +
+                        '<button onclick="openRoleAssign(' + u.id + ', \'' + uname + '\')" style="background:none;border:1px solid rgba(99,102,241,0.4);color:#a5b4fc;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;margin:2px;">分配角色</button>' +
+                        '<button onclick="toggleUserStatus(' + u.id + ', ' + (u.status === 1 ? 0 : 1) + ', \'' + uname + '\')" style="background:none;border:1px solid rgba(251,191,36,0.4);color:#fbbf24;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;margin:2px;">' + (u.status === 1 ? '禁用' : '启用') + '</button>' +
+                        '<button onclick="resetUserPassword(' + u.id + ', \'' + uname + '\')" style="background:none;border:1px solid rgba(148,163,184,0.4);color:#94a3b8;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;margin:2px;">重置密码</button>' +
+                        '<button onclick="deleteUser(' + u.id + ', \'' + uname + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;margin:2px;">删除</button>' +
+                    '</td>' +
+                    '</tr>';
+            }).join('');
+            listEl.innerHTML = '<table class="doc-table">' +
+                '<thead><tr>' +
+                '<th>用户名</th><th>昵称</th><th>邮箱</th><th>状态</th><th>功能角色</th><th>创建时间</th><th style="text-align:center;">操作</th>' +
+                '</tr></thead><tbody>' + rows + '</tbody></table>';
+        } catch (err) {
+            listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:40px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    async function createUser() {
+        const username = document.getElementById('newUsername').value.trim();
+        const password = document.getElementById('newPassword').value;
+        const nickname = document.getElementById('newNickname').value.trim();
+        const email = document.getElementById('newEmail').value.trim();
+        const resultEl = document.getElementById('userCreateResult');
+        if (!username || !password) { resultEl.innerHTML = '<span style="color:#f87171;">用户名和密码不能为空</span>'; return; }
+        try {
+            const res = await fetchApi('/api/admin/users', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password, nickname, email })
+            });
+            const data = await res.json();
+            if (data.success) {
+                resultEl.innerHTML = '<span style="color:#34d399;">✅ 用户「' + username + '」创建成功，初始密码请告知用户及时修改</span>';
+                document.getElementById('newUsername').value = '';
+                document.getElementById('newPassword').value = '';
+                document.getElementById('newNickname').value = '';
+                document.getElementById('newEmail').value = '';
+                loadUsers();
+            } else {
+                resultEl.innerHTML = '<span style="color:#f87171;">❌ ' + (data.message || '创建失败') + '</span>';
+            }
+        } catch (err) {
+            resultEl.innerHTML = '<span style="color:#f87171;">❌ 创建失败，请重试</span>';
+        }
+    }
+
+    async function toggleUserStatus(id, status, username) {
+        const action = status === 1 ? '启用' : '禁用';
+        if (!confirm('确定要' + action + '用户「' + username + '」吗？')) return;
+        try {
+            const res = await fetchApi('/api/admin/users/' + id + '/status', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ status })
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('用户「' + username + '」已' + action, 'success');
+                loadUsers();
+            } else {
+                showToast(data.message || action + '失败', 'error');
+            }
+        } catch (err) {
+            showToast(action + '失败，请重试', 'error');
+        }
+    }
+
+    async function resetUserPassword(id, username) {
+        const password = prompt('请输入「' + username + '」的新密码：');
+        if (!password) return;
+        try {
+            const res = await fetchApi('/api/admin/users/' + id + '/password', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ password })
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('「' + username + '」密码已重置', 'success');
+            } else {
+                showToast(data.message || '重置失败', 'error');
+            }
+        } catch (err) {
+            showToast('重置失败，请重试', 'error');
+        }
+    }
+
+    async function deleteUser(id, username) {
+        if (!confirm('确定要删除用户「' + username + '」吗？\n\n将同时清理其功能角色与数据授权，且不可恢复。')) return;
+        try {
+            const res = await fetchApi('/api/admin/users/' + id, { method: 'DELETE' });
+            const data = await res.json();
+            if (data.success) {
+                showToast('用户「' + username + '」已删除', 'success');
+                loadUsers();
+            } else {
+                showToast(data.message || '删除失败', 'error');
+            }
+        } catch (err) {
+            showToast('删除失败，请重试', 'error');
+        }
+    }
+
+    // ---- 分配功能角色 ----
+    let roleAssignUserId = null;
+    let allRolesCache = [];
+
+    async function openRoleAssign(userId, username) {
+        roleAssignUserId = userId;
+        document.getElementById('roleAssignUser').textContent = username;
+        try {
+            // 加载所有角色
+            const roleRes = await fetchApi('/api/admin/roles');
+            const roleData = await roleRes.json();
+            allRolesCache = (roleData.success && roleData.data) ? roleData.data : [];
+            // 加载用户已分配角色
+            const userRoleRes = await fetchApi('/api/admin/users/' + userId + '/roles');
+            const userRoleData = await userRoleRes.json();
+            const assigned = new Set((userRoleData.success && userRoleData.data || []).map(r => r.id));
+            const html = allRolesCache.map(r => {
+                const checked = assigned.has(r.id) ? 'checked' : '';
+                const disabled = r.code === 'ADMIN' && !checked ? ' disabled' : '';
+                return '<label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,0.06);border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.02);">' +
+                    '<input type="checkbox" class="role-check" value="' + r.id + '"' + checked + disabled + ' style="width:16px;height:16px;accent-color:#6366f1;cursor:pointer;">' +
+                    '<div style="flex:1;"><div style="font-weight:600;font-size:14px;">' + (r.name || r.code) + '</div>' +
+                    '<div style="color:#64748b;font-size:12px;">' + r.code + (r.remark ? ' · ' + r.remark : '') + '</div></div>' +
+                    '</label>';
+            }).join('') || '<div style="color:#64748b;text-align:center;padding:20px 0;">暂无可分配的角色，请先在「角色管理」中创建</div>';
+            document.getElementById('roleAssignList').innerHTML = html;
+            document.getElementById('roleAssignModal').style.display = 'flex';
+        } catch (err) {
+            showToast('加载角色失败，请重试', 'error');
+        }
+    }
+
+    function closeRoleAssign() {
+        document.getElementById('roleAssignModal').style.display = 'none';
+    }
+
+    async function saveUserRoles() {
+        if (roleAssignUserId === null) return;
+        const roleIds = Array.from(document.querySelectorAll('.role-check:checked')).map(cb => Number(cb.value));
+        try {
+            const res = await fetchApi('/api/admin/users/' + roleAssignUserId + '/roles', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ roleIds })
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('角色分配成功', 'success');
+                closeRoleAssign();
+                loadUsers();
+            } else {
+                showToast(data.message || '分配失败', 'error');
+            }
+        } catch (err) {
+            showToast('分配失败，请重试', 'error');
+        }
+    }
+
+    // ====== 角色管理 ======
+    async function loadRoles() {
+        const listEl = document.getElementById('roleList');
+        try {
+            const res = await fetchApi('/api/admin/roles');
+            const data = await res.json();
+            if (!data.success) {
+                listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:40px 0;">' + (data.message || '加载失败') + '</div>';
+                return;
+            }
+            if (!data.data || data.data.length === 0) {
+                listEl.innerHTML = '<div style="text-align:center;color:#64748b;padding:40px 0;">暂无角色</div>';
+                return;
+            }
+            const rows = data.data.map(r => {
+                const isAdminRole = r.code === 'ADMIN';
+                const delBtn = isAdminRole
+                    ? '<span style="color:#475569;font-size:12px;">内置</span>'
+                    : '<button onclick="deleteRole(' + r.id + ', \'' + (r.code || '').replace(/'/g, "\\'") + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;">删除</button>';
+                const ctime = r.createTime ? new Date(r.createTime).toLocaleString('zh-CN') : '-';
+                return '<tr>' +
+                    '<td style="font-weight:600;">' + (isAdminRole ? '🛡️ ' : '') + (r.code || '-') + '</td>' +
+                    '<td>' + (r.name || '-') + '</td>' +
+                    '<td>' + (r.remark || '-') + '</td>' +
+                    '<td>' + (r.userCount || 0) + '</td>' +
+                    '<td>' + ctime + '</td>' +
+                    '<td style="text-align:center;">' + delBtn + '</td>' +
+                    '</tr>';
+            }).join('');
+            listEl.innerHTML = '<table class="doc-table">' +
+                '<thead><tr>' +
+                '<th>角色编码</th><th>角色名称</th><th>备注</th><th>用户数</th><th>创建时间</th><th style="text-align:center;">操作</th>' +
+                '</tr></thead><tbody>' + rows + '</tbody></table>';
+        } catch (err) {
+            listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:40px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    async function createRole() {
+        const code = document.getElementById('roleCode').value.trim();
+        const name = document.getElementById('roleName').value.trim();
+        const remark = document.getElementById('roleRemark').value.trim();
+        const resultEl = document.getElementById('roleCreateResult');
+        if (!code || !name) { resultEl.innerHTML = '<span style="color:#f87171;">角色编码和名称不能为空</span>'; return; }
+        try {
+            const res = await fetchApi('/api/admin/roles', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ code, name, remark })
+            });
+            const data = await res.json();
+            if (data.success) {
+                resultEl.innerHTML = '<span style="color:#34d399;">✅ 角色「' + name + '」创建成功</span>';
+                document.getElementById('roleCode').value = '';
+                document.getElementById('roleName').value = '';
+                document.getElementById('roleRemark').value = '';
+                loadRoles();
+            } else {
+                resultEl.innerHTML = '<span style="color:#f87171;">❌ ' + (data.message || '创建失败') + '</span>';
+            }
+        } catch (err) {
+            resultEl.innerHTML = '<span style="color:#f87171;">❌ 创建失败，请重试</span>';
+        }
+    }
+
+    async function deleteRole(id, code) {
+        if (!confirm('确定要删除角色「' + code + '」吗？\n\n将同时解除所有用户与该角色的关联。')) return;
+        try {
+            const res = await fetchApi('/api/admin/roles/' + id, { method: 'DELETE' });
+            const data = await res.json();
+            if (data.success) {
+                showToast('角色「' + code + '」已删除', 'success');
+                loadRoles();
+            } else {
+                showToast(data.message || '删除失败', 'error');
+            }
+        } catch (err) {
+            showToast('删除失败，请重试', 'error');
+        }
+    }
+
+    // ====== 成员授权（数据权限） ======
+    let memberModalKbId = null;
+
+    function openMemberModal(kbId, kbName) {
+        memberModalKbId = kbId;
+        document.getElementById('memberKbName').textContent = kbName;
+        document.getElementById('memberCandidateSelect').innerHTML = '<option value="">请搜索选择用户</option>';
+        document.getElementById('memberSearchInput').value = '';
+        document.getElementById('memberModal').style.display = 'flex';
+        loadMembers();
+    }
+
+    function closeMemberModal() {
+        document.getElementById('memberModal').style.display = 'none';
+        memberModalKbId = null;
+    }
+
+    async function loadMembers() {
+        if (memberModalKbId === null) return;
+        const listEl = document.getElementById('memberList');
+        try {
+            const res = await fetchApi('/api/knowledge-base/' + memberModalKbId + '/members');
+            const data = await res.json();
+            if (!data.success) {
+                listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:30px 0;">' + (data.message || '加载失败') + '</div>';
+                return;
+            }
+            if (!data.data || data.data.length === 0) {
+                listEl.innerHTML = '<div style="text-align:center;color:#64748b;padding:30px 0;">暂无成员，请添加</div>';
+                return;
+            }
+            const roleNameMap = { OWNER: ['所有者', '#fbbf24'], EDITOR: ['编辑者', '#a5b4fc'], VIEWER: ['查看者', '#34d399'] };
+            const rows = data.data.map(m => {
+                const rn = roleNameMap[m.role] || [m.role, '#94a3b8'];
+                const isOwner = m.role === 'OWNER';
+                const uname = (m.username || '').replace(/'/g, "\\'");
+                return '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
+                    '<div><div style="font-weight:600;">' + (m.nickname || m.username || '未知用户') + ' <span style="color:#64748b;font-weight:400;font-size:13px;">@' + (m.username || '') + '</span></div>' +
+                    '<div style="font-size:12px;color:#64748b;margin-top:3px;">授权人: ' + (m.grantUser || '-') + '</div></div>' +
+                    '<div style="display:flex;align-items:center;gap:10px;">' +
+                    '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:' + rn[1] + '20;color:' + rn[1] + ';">' + rn[0] + '</span>' +
+                    (isOwner
+                        ? '<span style="color:#475569;font-size:12px;">所有者</span>'
+                        : '<button onclick="removeMember(' + m.userId + ', \'' + uname + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:12px;">移除</button>') +
+                    '</div></div>';
+            }).join('');
+            listEl.innerHTML = rows;
+        } catch (err) {
+            listEl.innerHTML = '<div style="text-align:center;color:#f87171;padding:30px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    async function searchMemberCandidates() {
+        const keyword = document.getElementById('memberSearchInput').value.trim();
+        const select = document.getElementById('memberCandidateSelect');
+        if (!keyword) {
+            select.innerHTML = '<option value="">请搜索选择用户</option>';
+            return;
+        }
+        try {
+            const res = await fetchApi('/api/users/search?keyword=' + encodeURIComponent(keyword));
+            const data = await res.json();
+            if (data.success && data.data) {
+                select.innerHTML = '<option value="">选择用户</option>' + data.data.map(u =>
+                    '<option value="' + u.id + '">' + (u.nickname || u.username) + ' (@' + u.username + ')</option>'
+                ).join('');
+            } else {
+                select.innerHTML = '<option value="">未找到用户</option>';
+            }
+        } catch (err) {
+            select.innerHTML = '<option value="">搜索失败</option>';
+        }
+    }
+
+    async function addMember() {
+        const userId = document.getElementById('memberCandidateSelect').value;
+        const role = document.getElementById('memberRoleSelect').value;
+        if (!userId) { showToast('请先搜索并选择用户', 'error'); return; }
+        try {
+            const res = await fetchApi('/api/knowledge-base/' + memberModalKbId + '/members', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ userId: Number(userId), role })
+            });
+            const data = await res.json();
+            if (data.success) {
+                showToast('授权成功', 'success');
+                document.getElementById('memberCandidateSelect').innerHTML = '<option value="">请搜索选择用户</option>';
+                document.getElementById('memberSearchInput').value = '';
+                loadMembers();
+            } else {
+                showToast(data.message || '授权失败', 'error');
+            }
+        } catch (err) {
+            showToast('授权失败，请重试', 'error');
+        }
+    }
+
+    async function removeMember(userId, username) {
+        if (!confirm('确定要移除成员「' + username + '」对该知识库的访问权限吗？')) return;
+        try {
+            const res = await fetchApi('/api/knowledge-base/' + memberModalKbId + '/members/' + userId, { method: 'DELETE' });
+            const data = await res.json();
+            if (data.success) {
+                showToast('已移除成员', 'success');
+                loadMembers();
+            } else {
+                showToast(data.message || '移除失败', 'error');
+            }
+        } catch (err) {
+            showToast('移除失败，请重试', 'error');
         }
     }
 </script>

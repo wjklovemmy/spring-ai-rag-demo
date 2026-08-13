@@ -2,10 +2,12 @@ package com.example.springairagdemo.config;
 
 import com.example.springairagdemo.security.ForbiddenException;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.Map;
 
@@ -24,6 +26,27 @@ public class GlobalExceptionHandler {
                 "success", false,
                 "code", 403,
                 "message", e.getMessage()
+        ));
+    }
+
+    /** 静态资源/接口不存在 → 404（不打 ERROR，避免刷日志） */
+    @ExceptionHandler(NoResourceFoundException.class)
+    public ResponseEntity<Map<String, Object>> handleNoResource() {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(Map.of(
+                "success", false,
+                "code", 404,
+                "message", "资源不存在"
+        ));
+    }
+
+    /** 唯一键冲突 → 409（兜底并发窗口下的重名/重复提交） */
+    @ExceptionHandler(DuplicateKeyException.class)
+    public ResponseEntity<Map<String, Object>> handleDuplicateKey(DuplicateKeyException e) {
+        log.warn("唯一键冲突: {}", e.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Map.of(
+                "success", false,
+                "code", 409,
+                "message", "数据已存在，请勿重复创建"
         ));
     }
 

@@ -32,10 +32,10 @@ public class KnowledgeBaseEntity {
     @TableField("status")
     private Integer status;
     /**
-     * 创建人
+     * 创建人（用户ID，关联 sys_user.id）
      */
     @TableField("create_user")
-    private String createUser;
+    private Long createUser;
     /**
      * 创建时间
      */

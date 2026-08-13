@@ -12,6 +12,7 @@ import com.example.springairagdemo.service.UserService;
 import com.example.springairagdemo.service.VectorStoreService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -23,9 +24,11 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -54,7 +57,6 @@ public class KnowledgeBaseController {
         String description = (String) request.get("description");
 
         Long currentUserId = UserContext.getUserId();
-        String createUser = UserContext.getUsername();
         if (currentUserId == null) {
             return ResponseEntity.status(401).body(Map.of("success", false, "message", "未登录"));
         }
@@ -62,11 +64,21 @@ public class KnowledgeBaseController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "知识库名称不能为空"));
         }
 
+        // 名称全局唯一（uk_name）；显式查重，避免触发数据库唯一键异常返回 500
+        name = name.trim();
+        long nameCount = knowledgeBaseService.lambdaQuery()
+                .eq(KnowledgeBaseEntity::getName, name)
+                .count();
+        if (nameCount > 0) {
+            return ResponseEntity.status(HttpStatus.CONFLICT)
+                    .body(Map.of("success", false, "code", 409, "message", "知识库名称已存在"));
+        }
+
         KnowledgeBaseEntity entity = new KnowledgeBaseEntity();
         entity.setName(name);
         entity.setDescription(description != null ? description : "");
         entity.setStatus(1);
-        entity.setCreateUser(createUser);
+        entity.setCreateUser(currentUserId);
         entity.setCreateTime(new Date());
         entity.setUpdateTime(new Date());
 
@@ -74,7 +86,7 @@ public class KnowledgeBaseController {
         // 创建者自动成为 OWNER（授权早于 Milvus 初始化，保证任何情况下创建者都拥有控制权）
         kbAuthorizationService.grant(entity.getId(), currentUserId, KbRole.OWNER, currentUserId);
         kbAuthorizationService.audit("CREATE_KB", entity.getId(), null, "创建知识库 " + name);
-        log.info("知识库创建成功: id={}, name={}, createUser={}", entity.getId(), name, createUser);
+        log.info("知识库创建成功: id={}, name={}, createUserId={}", entity.getId(), name, currentUserId);
 
         // 在 Milvus 中创建对应的向量 collection
         try {
@@ -140,6 +152,14 @@ public class KnowledgeBaseController {
         }
 
         Long currentUserId = UserContext.getUserId();
+        // 解析创建人用户名（create_user 存用户ID；查不到则回退原始值，兼容历史脏数据）
+        Map<Long, String> userNames = new HashMap<>();
+        List<Long> creatorIds = list.stream().map(KnowledgeBaseEntity::getCreateUser)
+                .filter(Objects::nonNull).distinct().toList();
+        if (!creatorIds.isEmpty()) {
+            userService.listByIds(creatorIds).forEach(u ->
+                    userNames.put(u.getId(), u.getNickname() != null ? u.getNickname() : u.getUsername()));
+        }
         List<Map<String, Object>> result = list.stream().map(kb -> {
             Map<String, Object> item = new LinkedHashMap<>();
             item.put("id", kb.getId());
@@ -147,6 +167,8 @@ public class KnowledgeBaseController {
             item.put("description", kb.getDescription());
             item.put("status", kb.getStatus());
             item.put("createUser", kb.getCreateUser());
+            item.put("createUserName", kb.getCreateUser() == null ? null
+                    : userNames.getOrDefault(kb.getCreateUser(), String.valueOf(kb.getCreateUser())));
             item.put("createTime", kb.getCreateTime());
             KbRole myRole = kbAuthorizationService.roleOf(currentUserId, kb.getId());
             item.put("myRole", myRole == null ? null : myRole.name());

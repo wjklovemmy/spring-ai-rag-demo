@@ -66,11 +66,17 @@ public class JwtAuthenticationFilter implements Filter {
             return;
         }
 
-        // 将用户信息注入 Request 属性，供 Controller 使用
-        httpRequest.setAttribute("userId", jwtUtil.getUserId(token));
-        httpRequest.setAttribute("username", jwtUtil.getUsername(token));
-
-        chain.doFilter(request, response);
+        // 将用户信息注入 Request 属性 + UserContext（ThreadLocal），供 Controller / Service / 权限切面使用
+        Long userId = jwtUtil.getUserId(token);
+        String username = jwtUtil.getUsername(token);
+        httpRequest.setAttribute("userId", userId);
+        httpRequest.setAttribute("username", username);
+        try {
+            UserContext.set(new LoginUser(userId, username));
+            chain.doFilter(request, response);
+        } finally {
+            UserContext.clear();
+        }
     }
 
     private boolean isWhitelisted(String path) {

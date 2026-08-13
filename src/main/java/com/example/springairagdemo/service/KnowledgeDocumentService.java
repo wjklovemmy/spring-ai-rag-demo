@@ -20,12 +20,13 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HexFormat;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -395,8 +396,10 @@ public abstract class KnowledgeDocumentService {
 
     /**
      * 引用来源信息
+     *
+     * @param refIndex 原始来源编号（1-based，与回答中 [来源N] 对应）
      */
-    public record SourceInfo(Long documentId, String documentName, Integer pageNo, String snippet) {}
+    public record SourceInfo(Long documentId, String documentName, Integer pageNo, String snippet, Integer refIndex) {}
 
     /**
      * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
@@ -496,11 +499,12 @@ public abstract class KnowledgeDocumentService {
                 snippet = snippet.substring(0, 120) + "...";
             }
 
-            sources.add(new SourceInfo(r.getDocumentId(), docName, r.getPageNo(), snippet));
+            int ref = refIndex++;
+            sources.add(new SourceInfo(r.getDocumentId(), docName, r.getPageNo(), snippet, ref));
 
             // 在上下文中标记来源
             contextBuilder.append(String.format("[来源%d] 文档：%s，第%d页%n%s%n%n",
-                    refIndex++, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
+                    ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
         }
 
         String context = contextBuilder.toString();
@@ -513,6 +517,7 @@ public abstract class KnowledgeDocumentService {
         String systemPrompt = String.format(
                 "你是一个基于知识库的问答助手。请严格根据以下知识库内容回答用户问题。%n"
                 + "回答时，请在引用知识库内容的地方用方括号标注来源编号，例如[来源1]、[来源2]。%n"
+                + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。%n"
                 + "如果知识库中没有相关信息，请如实告知用户\"知识库中暂无相关信息\"。%n"
                 + "%n"
                 + "知识库内容：%n"
@@ -524,16 +529,48 @@ public abstract class KnowledgeDocumentService {
                 .call()
                 .content();
 
-        // 从回答中提取实际引用的来源编号，只保留精准来源
-        Set<Integer> citedRefs = new HashSet<>();
+        // 兜底清理：LLM 偶尔仍会输出 Markdown 加粗/行内代码符号，统一移除，保持纯文本展示
+        if (answer != null) {
+            answer = answer.replace("**", "").replace("`", "");
+        }
+
+        // 从回答中提取实际引用的来源编号，只保留精准来源（TreeSet 保证按来源编号升序返回）
+        Set<Integer> citedRefs = new TreeSet<>();
         Matcher m = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
         while (m.find()) {
             citedRefs.add(Integer.parseInt(m.group(1)));
         }
+
+        // 被引用来源重新编号为从 1 开始的连续编号（旧编号 → 新编号），并同步改写回答中的 [来源N]
+        Map<Integer, Integer> refMap = new HashMap<>();
+        int newRef = 1;
+        for (int idx : citedRefs) {
+            if (idx >= 1 && idx <= sources.size()) {
+                refMap.put(idx, newRef++);
+            }
+        }
+        if (!refMap.isEmpty()) {
+            Matcher rm = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
+            StringBuilder sb = new StringBuilder();
+            while (rm.find()) {
+                int oldRef = Integer.parseInt(rm.group(1));
+                Integer mapped = refMap.get(oldRef);
+                if (mapped != null) {
+                    rm.appendReplacement(sb, Matcher.quoteReplacement("[来源" + mapped + "]"));
+                } else {
+                    rm.appendReplacement(sb, Matcher.quoteReplacement(rm.group()));
+                }
+            }
+            rm.appendTail(sb);
+            answer = sb.toString();
+        }
+
         List<SourceInfo> citedSources = new ArrayList<>();
         for (int idx : citedRefs) {
             if (idx >= 1 && idx <= sources.size()) {
-                citedSources.add(sources.get(idx - 1));
+                SourceInfo s = sources.get(idx - 1);
+                citedSources.add(new SourceInfo(s.documentId(), s.documentName(), s.pageNo(),
+                        s.snippet(), refMap.get(idx)));
             }
         }
 

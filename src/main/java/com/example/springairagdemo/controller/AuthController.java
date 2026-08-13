@@ -2,6 +2,7 @@ package com.example.springairagdemo.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.example.springairagdemo.entity.UserEntity;
+import com.example.springairagdemo.service.KbAuthorizationService;
 import com.example.springairagdemo.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
@@ -21,6 +22,7 @@ import java.util.Map;
 public class AuthController {
 
     private final UserService userService;
+    private final KbAuthorizationService kbAuthorizationService;
 
     /**
      * 用户注册
@@ -85,7 +87,8 @@ public class AuthController {
         return ResponseEntity.ok(Map.of(
                 "success", true,
                 "username", username,
-                "userId", userId
+                "userId", userId,
+                "isAdmin", kbAuthorizationService.isAdmin(userId)
         ));
     }
 

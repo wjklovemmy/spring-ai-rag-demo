@@ -156,6 +156,7 @@ public class KnowledgeDocumentController {
                 src.put("documentName", s.documentName());
                 src.put("pageNo", s.pageNo());
                 src.put("snippet", s.snippet());
+                src.put("refIndex", s.refIndex());
                 return src;
             }).toList();
 

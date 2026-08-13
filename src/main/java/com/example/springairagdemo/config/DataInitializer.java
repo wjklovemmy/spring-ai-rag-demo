@@ -54,28 +54,37 @@ public class DataInitializer implements ApplicationRunner {
     }
 
     private void ensureBootstrapAdmin() {
-        if (userService.count() > 0) {
-            return;
-        }
-        UserEntity admin = new UserEntity();
-        admin.setUsername("admin");
-        admin.setPassword(passwordEncoder.encode("admin123"));
-        admin.setNickname("系统管理员");
-        admin.setStatus(1);
-        admin.setCreateTime(new Date());
-        admin.setUpdateTime(new Date());
-        userService.save(admin);
-
-        SysRoleEntity adminRole = sysRoleService.lambdaQuery()
-                .eq(SysRoleEntity::getCode, "ADMIN")
+        UserEntity admin = userService.lambdaQuery()
+                .eq(UserEntity::getUsername, "admin")
                 .one();
-        if (adminRole != null) {
-            SysUserRoleEntity bind = new SysUserRoleEntity();
-            bind.setUserId(admin.getId());
-            bind.setRoleId(adminRole.getId());
-            bind.setCreateTime(new Date());
-            sysUserRoleService.save(bind);
+        if (admin == null) {
+            admin = new UserEntity();
+            admin.setUsername("admin");
+            admin.setPassword(passwordEncoder.encode("admin123"));
+            admin.setNickname("系统管理员");
+            admin.setStatus(1);
+            admin.setCreateTime(new Date());
+            admin.setUpdateTime(new Date());
+            userService.save(admin);
+            log.info("已创建内置管理员账号 admin（密码 admin123，请尽快修改）");
         }
-        log.info("已创建内置管理员账号 admin（密码 admin123，请尽快修改）");
+        // admin 已存在（如注册页抢注）时，确保其绑定了 ADMIN 角色，避免出现无权限的“假 admin”
+        Long adminId = admin.getId();
+        boolean bound = sysUserRoleService.lambdaQuery()
+                .eq(SysUserRoleEntity::getUserId, adminId)
+                .count() > 0;
+        if (!bound) {
+            SysRoleEntity adminRole = sysRoleService.lambdaQuery()
+                    .eq(SysRoleEntity::getCode, "ADMIN")
+                    .one();
+            if (adminRole != null) {
+                SysUserRoleEntity bind = new SysUserRoleEntity();
+                bind.setUserId(adminId);
+                bind.setRoleId(adminRole.getId());
+                bind.setCreateTime(new Date());
+                sysUserRoleService.save(bind);
+                log.info("已为 admin 用户绑定 ADMIN 角色 (userId={})", adminId);
+            }
+        }
     }
 }

@@ -33,6 +33,12 @@ CREATE TABLE IF NOT EXISTS knowledge_document (
 
     update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
 
+    version INT DEFAULT 1 COMMENT '文档版本号，同名多次上传递增',
+
+    expire_time DATETIME DEFAULT NULL COMMENT '过期时间，旧版本平滑下线用',
+
+    is_active TINYINT DEFAULT 1 COMMENT '是否启用：1-启用 0-禁用',
+
     INDEX idx_knowledge_id (knowledge_id),
 
     CONSTRAINT fk_document_base
@@ -113,10 +119,12 @@ CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
 
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Embedding任务';
 
-ALTER TABLE knowledge_document
-    ADD COLUMN version     INT        DEFAULT 1   COMMENT '文档版本号，同名多次上传递增',
-  ADD COLUMN expire_time DATETIME   DEFAULT NULL COMMENT '过期时间，旧版本平滑下线用',
-  ADD COLUMN is_active   TINYINT    DEFAULT 1   COMMENT '是否启用：1-启用 0-禁用';
+-- version / expire_time / is_active 已并入上方 knowledge_document 建表语句（全新部署无需关心）。
+-- 存量库（表已存在）升级时请手动执行：
+-- ALTER TABLE knowledge_document
+--     ADD COLUMN version     INT        DEFAULT 1   COMMENT '文档版本号，同名多次上传递增',
+--   ADD COLUMN expire_time DATETIME   DEFAULT NULL COMMENT '过期时间，旧版本平滑下线用',
+--   ADD COLUMN is_active   TINYINT    DEFAULT 1   COMMENT '是否启用：1-启用 0-禁用';
 
 
 -- ==================== 用户表 ====================
@@ -194,4 +202,20 @@ CREATE TABLE IF NOT EXISTS `kb_access_log` (
 -- 内置 ADMIN 角色（应用启动时 DataInitializer 也会自动补齐）
 INSERT INTO `sys_role` (`code`, `name`, `remark`) VALUES ('ADMIN', '系统管理员', '可管理所有知识库')
     ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);
+
+-- ============================================================
+-- 内置管理员账号（首次部署引导）
+-- 密码为 admin123（BCrypt 加密），请上线后立即修改
+-- 注意：仅当 sys_user 表为空时由应用 DataInitializer 自动创建；
+--       若表已有数据，可执行下面语句手动补齐（幂等，可重复执行）。
+-- ============================================================
+INSERT INTO `sys_user` (`username`, `password`, `nickname`, `status`)
+VALUES ('admin', '$2b$12$5W5lVdCRZfzsNzb/9XN1keZFrv42O5EtGeFlne3HxqRhOpvVb/mDm', '系统管理员', 1)
+ON DUPLICATE KEY UPDATE `username` = `username`;
+
+-- 绑定 admin -> ADMIN 角色（幂等）
+INSERT INTO `sys_user_role` (`user_id`, `role_id`)
+SELECT u.id, r.id FROM `sys_user` u, `sys_role` r
+WHERE u.username = 'admin' AND r.code = 'ADMIN'
+ON DUPLICATE KEY UPDATE `user_id` = `user_id`;
 
