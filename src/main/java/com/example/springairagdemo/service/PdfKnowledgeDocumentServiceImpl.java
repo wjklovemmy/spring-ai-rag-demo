@@ -23,12 +23,12 @@ public class PdfKnowledgeDocumentServiceImpl extends KnowledgeDocumentService {
     }
 
     @Override
-    protected List<Document> parseDocument(MultipartFile file, String position) throws IOException {
+    protected List<Document> parseDocument(MultipartFile file) throws IOException {
         return documentParser.read(file);
     }
 
     @Override
-    protected List<Document> splitDocument(List<Document> documents, String position) {
-        return documentParser.split(documents, position);
+    protected List<Document> splitDocument(List<Document> documents) {
+        return documentParser.split(documents);
     }
 }

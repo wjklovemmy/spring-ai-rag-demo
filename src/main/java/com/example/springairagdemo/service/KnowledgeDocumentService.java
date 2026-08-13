@@ -2,6 +2,7 @@ package com.example.springairagdemo.service;
 
 import com.example.springairagdemo.config.RagConfigProperties;
 import com.example.springairagdemo.entity.KnowledgeChunkEntity;
+import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -72,6 +73,9 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected HybridSearchService hybridSearchService;
 
+    @Autowired
+    protected KbAuthorizationService kbAuthorizationService;
+
     // ===================== 模板方法：上传文档 =====================
 
     /**
@@ -87,7 +91,9 @@ public abstract class KnowledgeDocumentService {
      * Milvus 向量在失败时主动删除回滚。
      */
     @Transactional(rollbackFor = Exception.class)
-    public IngestResult ingest(MultipartFile file, String position, Long knowledgeBaseId) throws IOException {
+    public IngestResult ingest(MultipartFile file, Long knowledgeBaseId) throws IOException {
+        // 服务层权限守卫（纵深防御）：上传文档需要 EDITOR 及以上
+        kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.EDITOR);
         KnowledgeDocumentEntity docEntity = null;
         List<KnowledgeChunkEntity> chunkEntities = null;
 
@@ -96,14 +102,14 @@ public abstract class KnowledgeDocumentService {
 
         try {
             // 1. 保存新版本文档信息到 MySQL（含版本号推断，不在此处上传文件）
-            docEntity = saveDocumentInfo(file, position, knowledgeBaseId);
+            docEntity = saveDocumentInfo(file, knowledgeBaseId);
 
             // 2. 解析文档
-            List<Document> documents = parseDocument(file, position);
+            List<Document> documents = parseDocument(file);
             log.info("解析完成，共 {} 个文档页面", documents.size());
 
             // 3. 切分文档
-            List<Document> chunks = splitDocument(documents, position);
+            List<Document> chunks = splitDocument(documents);
             log.info("切分完成，共 {} 个文本片段", chunks.size());
 
             // 4. chunk 文本写入 MySQL
@@ -153,7 +159,7 @@ public abstract class KnowledgeDocumentService {
      * 保存文档信息到 MySQL，自动推断版本号（不在此步骤上传文件，
      * 文件仅在整个上游流程成功后由 {@link #persistUploadedFile} 上传）。
      */
-    protected KnowledgeDocumentEntity saveDocumentInfo(MultipartFile file, String position, Long knowledgeBaseId) {
+    protected KnowledgeDocumentEntity saveDocumentInfo(MultipartFile file, Long knowledgeBaseId) {
         String originalFilename = file.getOriginalFilename();
         String extension = "";
         if (originalFilename != null && originalFilename.contains(".")) {
@@ -175,7 +181,6 @@ public abstract class KnowledgeDocumentService {
 
         KnowledgeDocumentEntity entity = new KnowledgeDocumentEntity();
         entity.setKnowledgeId(knowledgeBaseId);
-        entity.setPosition(position);
         entity.setFileName(originalFilename);
         entity.setFilePath(originalFilename);
         entity.setFileSize(file.getSize());
@@ -326,9 +331,9 @@ public abstract class KnowledgeDocumentService {
 
     // ===================== 步骤 2-3：解析与切分（子类实现） =====================
 
-    protected abstract List<Document> parseDocument(MultipartFile file, String position) throws IOException;
+    protected abstract List<Document> parseDocument(MultipartFile file) throws IOException;
 
-    protected abstract List<Document> splitDocument(List<Document> documents, String position);
+    protected abstract List<Document> splitDocument(List<Document> documents);
 
     // ===================== 步骤 4：chunk 写入 MySQL =====================
 
@@ -397,6 +402,9 @@ public abstract class KnowledgeDocumentService {
      * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
      */
     public ChatResult chat(String question, Long knowledgeBaseId) {
+        // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
+        kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
+
         // 1. 检索召回：启用 Hybrid Search 时走「Dense + BM25 + RRF 融合」，否则纯向量检索
         //    召回 candidateTopK 个候选，供后续 Rerank 精排
         RagConfigProperties.Rerank rerankConfig = ragConfig.getRerank();

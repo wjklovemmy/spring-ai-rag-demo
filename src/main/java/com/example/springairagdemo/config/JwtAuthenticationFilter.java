@@ -1,5 +1,7 @@
 package com.example.springairagdemo.config;
 
+import com.example.springairagdemo.security.LoginUser;
+import com.example.springairagdemo.security.UserContext;
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -11,7 +13,8 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * JWT 认证过滤器，拦截所有 /api/** 请求（除 login/register 外）验证 Token
+ * JWT 认证过滤器，拦截所有 /api/** 请求（除 login/register 外）验证 Token。
+ * 认证通过后将当前用户注入 {@link UserContext}（ThreadLocal），请求结束自动清理。
  */
 @Slf4j
 @Component

@@ -20,20 +20,18 @@ public interface DocumentParser {
     List<Document> read(MultipartFile file) throws IOException;
 
     /**
-     * 便捷方法：读取文档内容并按岗位配置分块
+     * 便捷方法：读取文档内容并按全局配置分块
      *
-     * @param file     上传的文档文件
-     * @param position 岗位类型
+     * @param file 上传的文档文件
      * @return 分块后的文档列表
      */
-    List<Document> parse(MultipartFile file, String position) throws IOException;
+    List<Document> parse(MultipartFile file) throws IOException;
 
     /**
-     * 将文档列表按岗位对应的配置切分为适合向量检索的片段
+     * 将文档列表按全局配置切分为适合向量检索的片段
      *
      * @param documents 原始文档列表
-     * @param position  岗位类型
      * @return 分块后的文档列表
      */
-    List<Document> split(List<Document> documents, String position);
+    List<Document> split(List<Document> documents);
 }

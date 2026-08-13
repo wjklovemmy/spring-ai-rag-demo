@@ -20,10 +20,6 @@ public class KnowledgeDocumentEntity {
     @TableField("knowledge_id")
     private Long knowledgeId;
 
-    /** 岗位类型（如 dev、finance、hr），用于分类筛选 */
-    @TableField("position")
-    private String position;
-
     /** 文件名称 */
     @TableField("file_name")
     private String fileName;

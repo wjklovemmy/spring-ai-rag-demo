@@ -25,7 +25,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * PDF 文档解析器：读取 PDF 文件内容，按岗位配置分块后返回文档列表。
+ * PDF 文档解析器：读取 PDF 文件内容，按全局配置分块后返回文档列表。
  * <p>
  * 对扫描版 PDF（无文本层）：自动将页面渲染为图片并调用 OCR 识别，
  * 用识别出的文字替换空白页文本，保证扫描件也能进入 RAG 链路。
@@ -152,17 +152,14 @@ public class PdfDocumentParser implements DocumentParser {
     }
 
     @Override
-    public List<Document> parse(MultipartFile file, String position) throws IOException {
+    public List<Document> parse(MultipartFile file) throws IOException {
         List<Document> documents = read(file);
-        return split(documents, position);
+        return split(documents);
     }
 
     @Override
-    public List<Document> split(List<Document> documents, String position) {
-        RagConfigProperties.PositionConfig posConfig = config.getPositionConfig(position);
-        RagConfigProperties.Chunk chunk = (posConfig != null)
-                ? posConfig.getDocument().getChunkConfig("pdf")
-                : new RagConfigProperties.Chunk();
+    public List<Document> split(List<Document> documents) {
+        RagConfigProperties.Chunk chunk = config.getDocument().getChunk();
         RagConfigProperties.Heading headingCfg = chunk.getHeading();
         RagConfigProperties.Semantic semanticCfg = chunk.getSemantic();
 
@@ -181,10 +178,10 @@ public class PdfDocumentParser implements DocumentParser {
                             chunk.getChunkSize(), chunk.getMinChunkSizeChars());
                 } catch (Exception e) {
                     if (semanticCfg.isFallbackOnError()) {
-                        log.warn("语义切片失败，降级为 token 切分 (岗位: {}): {}", position, e.getMessage());
+                        log.warn("语义切片失败，降级为 token 切分: {}", e.getMessage());
                         pageChunks = tokenSplit(pageDoc, chunk);
                     } else {
-                        throw new RuntimeException("语义切片失败 (岗位: " + position + ")", e);
+                        throw new RuntimeException("语义切片失败", e);
                     }
                 }
             } else {
@@ -197,7 +194,7 @@ public class PdfDocumentParser implements DocumentParser {
             }
         }
 
-        log.info("PDF 文档分割为 {} 个文本片段 (岗位: {})", result.size(), position);
+        log.info("PDF 文档分割为 {} 个文本片段", result.size());
         return result;
     }
 

@@ -408,16 +408,6 @@
                     <option value="">请选择知识库</option>
                 </select>
             </div>
-            <div style="margin-bottom:20px;display:flex;align-items:center;gap:12px;">
-                <label style="color:#94a3b8;font-size:14px;white-space:nowrap;">岗位选择：</label>
-                <select id="positionSelect"
-                        style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;">
-                    <option value="">请选择岗位</option>
-                    <option value="dev">研发</option>
-                    <option value="finance">财务</option>
-                    <option value="hr">人事</option>
-                </select>
-            </div>
             <div style="border:2px dashed rgba(99,102,241,0.3);border-radius:16px;padding:60px;text-align:center;cursor:pointer;transition:all 0.3s;background:rgba(255,255,255,0.01);"
                  id="uploadZone"
                  ondragover="event.preventDefault();this.style.borderColor='#818cf8'"
@@ -445,16 +435,6 @@
                     <select id="docsKbFilter"
                             style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:200px;">
                         <option value="">全部知识库</option>
-                    </select>
-                </div>
-                <div>
-                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">岗位</label>
-                    <select id="docsPosFilter"
-                            style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:160px;">
-                        <option value="">全部岗位</option>
-                        <option value="dev">研发</option>
-                        <option value="finance">财务</option>
-                        <option value="hr">人事</option>
                     </select>
                 </div>
                 <div>
@@ -684,17 +664,10 @@
             return;
         }
 
-        const position = document.getElementById('positionSelect').value;
-        if (!position) {
-            resultEl.innerHTML = '<span style="color:#f87171;">⚠️ 请先选择岗位类型</span>';
-            return;
-        }
-
-        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传并处理 ' + file.name + ' (岗位: ' + position + ')...</span>';
+        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传并处理 ' + file.name + '...</span>';
 
         const formData = new FormData();
         formData.append('file', file);
-        formData.append('position', position);
         formData.append('knowledgeBaseId', kbId);
 
         try {
@@ -804,12 +777,10 @@
         container.innerHTML = '<div style="text-align:center;color:#64748b;padding:60px 0;">⏳ 加载中...</div>';
 
         const kbId = document.getElementById('docsKbFilter').value;
-        const pos = document.getElementById('docsPosFilter').value;
         const keyword = document.getElementById('docsKeyword').value.trim();
 
         const params = new URLSearchParams();
         if (kbId) params.append('knowledgeBaseId', kbId);
-        if (pos) params.append('position', pos);
         if (keyword) params.append('keyword', keyword);
 
         try {
@@ -875,7 +846,6 @@
 
     function resetDocFilter() {
         document.getElementById('docsKbFilter').value = '';
-        document.getElementById('docsPosFilter').value = '';
         document.getElementById('docsKeyword').value = '';
         loadDocList();
     }

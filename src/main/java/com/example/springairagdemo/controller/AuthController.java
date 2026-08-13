@@ -1,5 +1,7 @@
 package com.example.springairagdemo.controller;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.example.springairagdemo.entity.UserEntity;
 import com.example.springairagdemo.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
@@ -7,6 +9,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -92,5 +95,27 @@ public class AuthController {
     @PostMapping("/api/logout")
     public ResponseEntity<Map<String, Object>> logout() {
         return ResponseEntity.ok(Map.of("success", true, "message", "已登出"));
+    }
+
+    /**
+     * 用户搜索（供知识库授权时选择成员），按用户名/昵称模糊匹配
+     */
+    @GetMapping("/api/users/search")
+    public ResponseEntity<Map<String, Object>> searchUsers(@RequestParam String keyword) {
+        if (keyword == null || keyword.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("success", false, "message", "搜索关键字不能为空"));
+        }
+        var wrapper = new LambdaQueryWrapper<UserEntity>()
+                .and(w -> w.like(UserEntity::getUsername, keyword)
+                        .or().like(UserEntity::getNickname, keyword))
+                .last("LIMIT 20");
+        List<Map<String, Object>> result = userService.list(wrapper).stream().map(u -> {
+            Map<String, Object> item = new java.util.LinkedHashMap<>();
+            item.put("id", u.getId());
+            item.put("username", u.getUsername());
+            item.put("nickname", u.getNickname());
+            return item;
+        }).toList();
+        return ResponseEntity.ok(Map.of("success", true, "data", result));
     }
 }

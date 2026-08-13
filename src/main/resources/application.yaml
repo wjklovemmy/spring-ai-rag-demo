@@ -38,7 +38,7 @@ spring:
 server:
   port: 8080
 
-# RAG 配置：按岗位 → 文档类型 → 分块参数 三层结构
+# RAG 配置：文档分块参数（全局统一）
 rag:
   # 召回重排序：向量召回候选后，用百炼 gte-rerank 精排，提升上下文质量
   rerank:
@@ -91,67 +91,32 @@ rag:
     version-ttl-days: 30
     # 上传文件持久化存储目录
     upload-dir: ./uploads
-  positions:
-    dev:
-      document:
-        types:
-          pdf:
-            chunk-size: 800
-            min-chunk-size-chars: 350
-            min-chunk-length-to-embed: 80
-            max-num-chunks: 10000
-            keep-separator: true
-            # 标题感知切分：识别标题行构建标题链，前缀注入 chunk（参与向量化）并写 metadata.heading
-            heading:
-              enabled: true
-              # 标题链最大深度，如 "3 考勤制度 > 3.2 请假流程" 为 2 级
-              max-depth: 3
-              # 超过该字符数的行视为正文而非标题
-              max-length: 40
-              # 注入模板，{heading} 替换为标题链
-              prefix-template: "【{heading}】"
-            # 语义切片：段落 embedding 聚类，按相邻相似度找语义断点（失败自动降级 token 切分）
-            semantic:
-              enabled: true
-              # 相邻段落余弦相似度阈值，低于该值视为语义断点（值越大切得越碎）
-              threshold: 0.55
-              # embedding 批量大小（DashScope text-embedding-v3 单次请求上限 10 条，超出自动分片）
-              batch-size: 10
-              # 过短段落并入相邻段，避免噪声干扰聚类
-              min-segment-chars: 20
-              fallback-on-error: true
-    finance:
-      document:
-        types:
-          pdf:
-            chunk-size: 800
-            min-chunk-size-chars: 350
-            min-chunk-length-to-embed: 80
-            max-num-chunks: 10000
-            keep-separator: true
-            # 标题感知切分：识别标题行构建标题链，前缀注入 chunk（参与向量化）并写 metadata.heading
-            heading:
-              enabled: true
-              max-depth: 3
-              max-length: 40
-              prefix-template: "【{heading}】"
-            # 语义切片：段落 embedding 聚类，按相邻相似度找语义断点（失败自动降级 token 切分）
-            semantic:
-              enabled: true
-              threshold: 0.55
-              # embedding 批量大小（DashScope text-embedding-v3 单次请求上限 10 条，超出自动分片）
-              batch-size: 10
-              min-segment-chars: 20
-              fallback-on-error: true
-    hr:
-      document:
-        types:
-          pdf:
-            chunk-size: 800
-            min-chunk-size-chars: 350
-            min-chunk-length-to-embed: 80
-            max-num-chunks: 10000
-            keep-separator: true
+    # 文档分块配置（全局统一）
+    chunk:
+      chunk-size: 800
+      min-chunk-size-chars: 350
+      min-chunk-length-to-embed: 80
+      max-num-chunks: 10000
+      keep-separator: true
+      # 标题感知切分：识别标题行构建标题链，前缀注入 chunk（参与向量化）并写 metadata.heading
+      heading:
+        enabled: true
+        # 标题链最大深度，如 "3 考勤制度 > 3.2 请假流程" 为 2 级
+        max-depth: 3
+        # 超过该字符数的行视为正文而非标题
+        max-length: 40
+        # 注入模板，{heading} 替换为标题链
+        prefix-template: "【{heading}】"
+      # 语义切片：段落 embedding 聚类，按相邻相似度找语义断点（失败自动降级 token 切分）
+      semantic:
+        enabled: true
+        # 相邻段落余弦相似度阈值，低于该值视为语义断点（值越大切得越碎）
+        threshold: 0.55
+        # embedding 批量大小（DashScope text-embedding-v3 单次请求上限 10 条，超出自动分片）
+        batch-size: 10
+        # 过短段落并入相邻段，避免噪声干扰聚类
+        min-segment-chars: 20
+        fallback-on-error: true
 
 # ==================== JWT 配置 ====================
 jwt:
