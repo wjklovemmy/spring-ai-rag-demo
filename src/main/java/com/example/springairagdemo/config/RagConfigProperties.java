@@ -33,6 +33,9 @@ public class RagConfigProperties {
         private int versionTtlDays = 30;
         /** 上传文件持久化存储目录（相对或绝对路径） */
         private String uploadDir = "./uploads";
+        /** 向量化批处理大小：每批 chunk 数（每批执行一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写），
+         *  分批降低大文档单次 embedding/upsert 的内存与超时风险，并支持进度实时感知 */
+        private int batchSize = 100;
         /** 文档分块配置（全局统一） */
         private Chunk chunk = new Chunk();
     }

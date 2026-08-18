@@ -35,6 +35,39 @@ spring:
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
+    # 连接池参数（自定义，由 DataSourceConfig 绑定到 HikariCP）
+  task:
+    # Embedding 异步任务线程池参数（自定义，由 AsyncTaskConfig 绑定）
+    embedding:
+      # 核心线程数
+      core-pool-size: 2
+      # 最大线程数（执行 PDF 解析 + 向量化，不宜过大，避免打爆上游 API 配额）
+      max-pool-size: 4
+      # 队列容量
+      queue-capacity: 50
+      # 空闲线程存活时间（秒）
+      keep-alive-seconds: 60
+      # 线程名前缀，日志中形如 rag-embedding-1
+      thread-name-prefix: rag-embedding-
+      # 停机时等待任务完成的最长时间（秒）
+      await-termination-seconds: 30
+    pool:
+      # 连接池名称，便于监控与日志区分
+      pool-name: KnowledgeBase-HikariCP
+      # 最大连接数（含空闲与在用）
+      maximum-pool-size: 10
+      # 最小空闲连接数（须 ≤ maximum-pool-size）
+      minimum-idle: 2
+      # 获取连接超时（毫秒）
+      connection-timeout-ms: 30000
+      # 空闲连接回收时间（毫秒，须 < max-lifetime-ms）
+      idle-timeout-ms: 600000
+      # 连接最大存活时间（毫秒，建议小于 MySQL wait_timeout）
+      max-lifetime-ms: 1800000
+      # 连接校验超时（毫秒，须 < connection-timeout-ms）
+      validation-timeout-ms: 5000
+      # 连接校验 SQL，留空则用 Hikari 默认数据库 ping
+      connection-test-query: ""
 
 server:
   port: 8080
@@ -92,6 +125,8 @@ rag:
     version-ttl-days: 30
     # 上传文件持久化存储目录
     upload-dir: ./uploads
+    # 向量化批处理大小：每批 chunk 数（每批：embedding 批量调用一次 + Milvus upsert 一次 + 进度回写一次）
+    batch-size: 100
     # 文档分块配置（全局统一）
     chunk:
       chunk-size: 800

@@ -44,7 +44,7 @@ public class KnowledgeDocumentEntity {
     @TableField("embedding_model")
     private String embeddingModel;
 
-    /** 状态：0上传中 1解析中 2Embedding中 3成功 4失败 */
+    /** 状态：0上传中 1解析中 2向量化中 3成功 4失败 5已废弃(被新版顶替) 6已过期 */
     @TableField("status")
     private Integer status;
 

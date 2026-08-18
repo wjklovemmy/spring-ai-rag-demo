@@ -1,19 +1,27 @@
 package com.example.springairagdemo.service;
 
 import com.example.springairagdemo.config.RagConfigProperties;
+import com.example.springairagdemo.entity.DocumentStatus;
 import com.example.springairagdemo.entity.KnowledgeChunkEntity;
-import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
+import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
+import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
+import com.example.springairagdemo.security.KbRole;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.core.task.TaskExecutor;
+
+import java.util.concurrent.CompletableFuture;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.security.MessageDigest;
@@ -27,6 +35,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -34,12 +43,19 @@ import java.util.stream.Collectors;
 /**
  * 知识文档服务抽象类：定义文档摄取的模板流程和基于知识库的问答能力
  * <p>
- * 模板流程（ingest）：
+ * 上传流程（submitIngest → 异步 processTaskAsync）：
  * 1. 保存原始文档信息到 MySQL knowledge_document
- * 2. 解析文档（子类实现）
- * 3. 切分文档（子类实现）
- * 4. chunk 文本写入 MySQL knowledge_chunk
- * 5. chunk 向量写入 Milvus（仅存向量 + 引用字段）
+ * 2. 原始文件最先持久化到存储后端（MinIO/本地）
+ * 3. 创建 knowledge_embedding_task 任务（0待处理），立即返回任务编号
+ * 4. 异步线程：解析文档（子类实现）
+ * 5. 异步线程：切分文档（子类实现）
+ * 6. 异步线程：chunk 文本写入 MySQL knowledge_chunk（增量：跳过已处理片段）
+ * 7. 异步线程：chunk 向量写入 Milvus（仅存向量 + 引用字段，稳定主键 upsert 幂等）
+ * 8. 任务成功/失败状态回写 knowledge_embedding_task
+ * <p>
+ * 恢复/重跑（resumeInterruptedTask → processTaskAsync）支持增量执行：
+ * 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段；
+ * Milvus 幂等 upsert 兜底并发/重复执行。
  */
 @Slf4j
 public abstract class KnowledgeDocumentService {
@@ -77,88 +93,370 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected KbAuthorizationService kbAuthorizationService;
 
+    @Autowired
+    protected KnowledgeEmbeddingTaskService knowledgeEmbeddingTaskService;
+
+    @Autowired
+    @Qualifier("taskExecutor")
+    protected TaskExecutor taskExecutor;
+
     // ===================== 模板方法：上传文档 =====================
 
     /**
-     * 文档摄取结果
+     * Embedding 任务提交结果
+     *
+     * @param taskId     任务 ID
+     * @param taskNo     任务编号（前端轮询状态用）
+     * @param documentId 文档 ID
+     * @param fileName   文件名
+     * @param version    文档版本
      */
-    public record IngestResult(int chunkCount, int version, boolean isUpdate) {}
+    public record TaskSubmitResult(Long taskId, String taskNo, Long documentId, String fileName, int version) {}
 
     /**
-     * 上传并处理文档文件。
+     * 提交文档上传：保存文档信息 + 持久化原始文件 + 创建 Embedding 任务（0待处理），
+     * 随后异步执行 PDF 解析/切分/向量化，接口立即返回任务编号，前端轮询任务状态。
      * <p>
-     * 使用 {@link Transactional} 保证 MySQL 操作（document + chunk）原子性；
-     * MinIO 文件上传在上游解析/切分/向量化全部成功后才执行，避免脏数据；
-     * Milvus 向量在失败时主动删除回滚。
+     * 原始文件最先持久化到存储后端（MinIO/本地），即使后续处理失败原始文件也已落盘；
+     * 提交阶段任一步失败则补偿删除文件与已插入的 document/task 记录，避免孤儿数据。
      */
-    @Transactional(rollbackFor = Exception.class)
-    public IngestResult ingest(MultipartFile file, Long knowledgeBaseId) throws IOException {
+    public TaskSubmitResult submitIngest(MultipartFile file, Long knowledgeBaseId) throws IOException {
         // 服务层权限守卫（纵深防御）：上传文档需要 EDITOR 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.EDITOR);
-        KnowledgeDocumentEntity docEntity = null;
-        List<KnowledgeChunkEntity> chunkEntities = null;
 
         // 提前将文件读入内存，防止 Tomcat 后续清理临时文件导致 InputStream 失效
         byte[] fileBytes = file.getBytes();
-
+        KnowledgeDocumentEntity docEntity = null;
+        KnowledgeEmbeddingTaskEntity task = null;
         try {
-            // 1. 保存新版本文档信息到 MySQL（含版本号推断，不在此处上传文件）
+            // 1. 保存新版本文档信息到 MySQL（含版本号推断）
             docEntity = saveDocumentInfo(file, knowledgeBaseId);
 
-            // 2. 解析文档
-            List<Document> documents = parseDocument(file);
-            log.info("解析完成，共 {} 个文档页面", documents.size());
-
-            // 3. 切分文档
-            List<Document> chunks = splitDocument(documents);
-            log.info("切分完成，共 {} 个文本片段", chunks.size());
-
-            // 4. chunk 文本写入 MySQL
-            chunkEntities = saveChunks(knowledgeBaseId, docEntity.getId(), chunks);
-
-            // 5. chunk 向量写入 Milvus
-            int vectorCount = storeToVector(knowledgeBaseId, docEntity.getId(), chunkEntities, chunks);
-
-            // 6. 上传文件到存储后端（仅在以上步骤全部成功后执行）
+            // 2. 最先持久化原始文件到存储后端（MinIO/本地）
             persistUploadedFile(fileBytes, docEntity);
 
-            // 7. 更新文档 chunk 数量和状态为成功
-            docEntity.setChunkCount(chunks.size());
-            docEntity.setStatus(3); // 成功
-            docEntity.setUpdateTime(new Date());
-            knowledgeDocumentEntityService.updateById(docEntity);
+            // 3. 创建 Embedding 任务（status=0 待处理）
+            task = new KnowledgeEmbeddingTaskEntity();
+            task.setTaskNo(generateTaskNo());
+            task.setDocumentId(docEntity.getId());
+            task.setStatus(KnowledgeEmbeddingTaskStatus.PENDING);
+            task.setRetryCount(0);
+            task.setCreateTime(new Date());
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.save(task);
+            log.info("Embedding 任务已提交: taskNo={}, documentId={}, fileName={}",
+                    task.getTaskNo(), docEntity.getId(), docEntity.getFileName());
 
-            // 8. 新版本入库成功后，将同名旧版本标记过期时间（平滑下线）
-            deprecateOldVersions(knowledgeBaseId, docEntity);
+            // 4. 异步执行 PDF 解析/切分/向量化，立即返回任务编号
+            final Long taskId = task.getId();
+            CompletableFuture.runAsync(() -> processTaskAsync(taskId), taskExecutor);
 
-            log.info("文档 {} v{} 处理完成，chunk 数量: {}，向量数量: {}",
-                    docEntity.getFileName(), docEntity.getVersion(), chunks.size(), vectorCount);
-            return new IngestResult(vectorCount, docEntity.getVersion(), docEntity.getVersion() > 1);
-
+            return new TaskSubmitResult(task.getId(), task.getTaskNo(), docEntity.getId(),
+                    docEntity.getFileName(), docEntity.getVersion());
         } catch (Exception e) {
-            log.error("文档摄取失败: {}", docEntity != null ? docEntity.getFileName() : "unknown", e);
-
-            // 回滚 Milvus 向量（若已写入）
-            if (chunkEntities != null && !chunkEntities.isEmpty() && docEntity != null) {
+            log.error("提交 Embedding 任务失败: {}", docEntity != null ? docEntity.getFileName() : "unknown", e);
+            // 提交阶段补偿：删除已上传文件 + 已插入的 document/task，避免孤儿数据
+            if (docEntity != null && docEntity.getFilePath() != null) {
                 try {
-                    vectorStoreService.deleteVectorsByDocumentId(knowledgeBaseId, docEntity.getId());
+                    fileStorageService.delete(docEntity.getFilePath());
+                    log.info("已补偿删除存储端文件: {}", docEntity.getFilePath());
                 } catch (Exception ex) {
-                    log.error("回滚 Milvus 向量失败", ex);
+                    log.error("补偿删除存储端文件失败: {}", docEntity.getFilePath(), ex);
+                }
+            }
+            if (docEntity != null && docEntity.getId() != null) {
+                try {
+                    knowledgeDocumentEntityService.removeById(docEntity.getId());
+                } catch (Exception ex) {
+                    log.error("补偿删除文档记录失败: id={}", docEntity.getId(), ex);
+                }
+            }
+            if (task != null && task.getId() != null) {
+                try {
+                    knowledgeEmbeddingTaskService.removeById(task.getId());
+                } catch (Exception ex) {
+                    log.error("补偿删除任务记录失败: id={}", task.getId(), ex);
+                }
+            }
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new RuntimeException("提交 Embedding 任务失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 服务重启后恢复中断的 Embedding 任务（增量执行）：
+     * 1. 重置任务计数与错误信息，累加重试次数
+     * 2. 重新入队 {@link #processTaskAsync}，由增量逻辑查缺补漏：
+     *    已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段
+     * <p>
+     * 不再删除半成品数据 —— 已写入的 chunk/向量作为增量线索保留（milvus_id 标记"向量已写入"），
+     * 恢复时跳过，避免重复解析/切分/embedding/写入。
+     */
+    public void resumeInterruptedTask(Long taskId) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            log.warn("恢复中断任务失败：任务不存在 taskId={}", taskId);
+            return;
+        }
+        long start = System.currentTimeMillis();
+        KnowledgeDocumentEntity docEntity = knowledgeDocumentEntityService.getById(task.getDocumentId());
+        if (docEntity == null) {
+            log.error("恢复中断任务失败：文档不存在 taskNo={}", task.getTaskNo());
+            failTask(task, "重启恢复失败：文档不存在", start);
+            return;
+        }
+
+        // 1. 重置任务字段（processTaskAsync 会重新置为处理中并增量补齐）
+        task.setTotalChunk(0);
+        task.setSuccessChunk(0);
+        task.setFailChunk(0);
+        task.setRetryCount(task.getRetryCount() == null ? 1 : task.getRetryCount() + 1);
+        task.setErrorMessage(null);
+        task.setFinishTime(null);
+        task.setCostTime(null);
+        task.setUpdateTime(new Date());
+        knowledgeEmbeddingTaskService.updateById(task);
+
+        // 2. 重新入队执行（增量补齐：已处理过的 chunk 直接跳过）
+        final Long finalTaskId = task.getId();
+        CompletableFuture.runAsync(() -> processTaskAsync(finalTaskId), taskExecutor);
+        log.info("重启恢复：任务 {} 已重新入队执行（增量补齐） documentId={}",
+                task.getTaskNo(), docEntity.getId());
+    }
+
+    /**
+     * 异步执行 Embedding 任务：解析 PDF → 切分 → chunk 写 MySQL → 向量写 Milvus。
+     * 支持增量执行（恢复/重跑）：已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，
+     * 只补齐缺失或内容变化的片段。
+     * 任务状态逐阶段推进（PENDING → PROCESSING → SUCCESS/FAILED），
+     * 文档状态同步推进（0上传中 → 1解析中 → 2向量化中 → 3成功/4失败），
+     * 处理进度在文档列表与任务表均可感知。
+     * <p>
+     * 该线程不持有 HTTP 请求上下文（UserContext 已清理），处理流程不依赖登录用户。
+     */
+    public void processTaskAsync(Long taskId) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            log.error("Embedding 任务不存在: taskId={}", taskId);
+            return;
+        }
+        long start = System.currentTimeMillis();
+        KnowledgeDocumentEntity docEntity = knowledgeDocumentEntityService.getById(task.getDocumentId());
+        if (docEntity == null) {
+            log.error("任务对应文档不存在: documentId={}", task.getDocumentId());
+            failTask(task, "文档不存在", start);
+            return;
+        }
+        try {
+            // 1. 任务置为处理中
+            task.setStatus(KnowledgeEmbeddingTaskStatus.PROCESSING);
+            task.setStartTime(new Date(start));
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+
+            // 2. 从存储读取原始文件并解析（原始文件在提交阶段已最先持久化），文档状态推进为解析中
+            updateDocumentStatus(docEntity, DocumentStatus.PARSING);
+            List<Document> documents;
+            try (InputStream inputStream = fileStorageService.getInputStream(docEntity.getFilePath())) {
+                documents = parseDocument(inputStream);
+            }
+            log.info("任务 {} 解析完成，共 {} 个文档页面", task.getTaskNo(), documents.size());
+            task.setParseProgress(100);
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+
+            // 3. 切分（纯计算、确定性：同输入重跑时 chunkIndex 从 0 稳定编号）
+            List<Document> chunks = splitDocument(documents);
+            log.info("任务 {} 切分完成，共 {} 个文本片段", task.getTaskNo(), chunks.size());
+
+            // 4. 记录 chunk 总数（同时标记切片阶段完成）
+            task.setTotalChunk(chunks.size());
+            task.setSuccessChunk(0);
+            task.setFailChunk(0);
+            task.setSplitProgress(100);
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+
+            // 5. 增量查缺：按 (chunk_index, content_hash, milvus_id) 分类已有 chunk
+            List<KnowledgeChunkEntity> existing = knowledgeChunkEntityService.lambdaQuery()
+                    .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
+                    .list();
+            Map<Integer, KnowledgeChunkEntity> existingByIndex = existing.stream()
+                    .collect(Collectors.toMap(KnowledgeChunkEntity::getChunkIndex, e -> e, (a, b) -> a));
+
+            List<KnowledgeChunkEntity> toSave = new ArrayList<>();       // 新 / 内容变化：写 MySQL + 向量
+            List<KnowledgeChunkEntity> toVectorOnly = new ArrayList<>(); // 已写 MySQL、仅缺向量
+            List<KnowledgeChunkEntity> stale = new ArrayList<>();        // 作废/多余旧 chunk（删 MySQL + 向量）
+            int skipCount = 0;                                          // 已完整处理，直接跳过
+
+            for (int i = 0; i < chunks.size(); i++) {
+                Document chunk = chunks.get(i);
+                String content = chunk.getText() != null ? chunk.getText() : "";
+                String hash = sha256(content);
+                KnowledgeChunkEntity old = existingByIndex.get(i);
+                if (old == null || !hash.equals(old.getContentHash())) {
+                    // 新增或内容变化（如切分逻辑升级）：旧行（若有）作废删除；Milvus 主键按 index 相同，upsert 自动覆盖
+                    if (old != null) {
+                        stale.add(old);
+                    }
+                    toSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(chunk, i)));
+                } else if (old.getMilvusId() == null) {
+                    // MySQL 已写但向量缺失（上次失败在写向量阶段）：只补向量
+                    toVectorOnly.add(old);
+                } else {
+                    // MySQL + 向量均已写入：跳过（省写库 / embedding / 向量写入）
+                    skipCount++;
+                }
+            }
+            // 新切分数量变少时，尾部残留旧 chunk（index >= 新数量）需清理
+            for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingByIndex.entrySet()) {
+                if (entry.getKey() >= chunks.size()) {
+                    stale.add(entry.getValue());
+                }
+            }
+            // 删除作废/多余的旧 chunk（MySQL 行 + Milvus 向量）
+            if (!stale.isEmpty()) {
+                List<Long> staleIds = stale.stream().map(KnowledgeChunkEntity::getId).toList();
+                knowledgeChunkEntityService.removeByIds(staleIds);
+                // 覆盖删除该文档 index >= 新切分数的向量（含未回填 milvus_id 的残留）
+                vectorStoreService.deleteVectorsByChunkIndexFrom(
+                        docEntity.getKnowledgeId(), docEntity.getId(), chunks.size());
+                log.info("增量清理 {} 个作废/多余旧 chunk (documentId={})", stale.size(), docEntity.getId());
+            }
+
+            // 6. 需要写 MySQL 的 chunk 批量写入（插入后 id 回填，供 Milvus chunkId 字段引用）
+            if (!toSave.isEmpty()) {
+                knowledgeChunkEntityService.saveBatch(toSave);
+                task.setChunkProgress(100);
+                task.setUpdateTime(new Date());
+                knowledgeEmbeddingTaskService.updateById(task);
+                log.info("新增 {} 个 chunk 已写入 MySQL knowledge_chunk (documentId={})", toSave.size(), docEntity.getId());
+            }
+
+            // 7. 向量化（Batch 流水线，拆两阶段分别推进，前端可分别展示 Embedding / Milvus 进度）
+            //    7a. Embedding：按 batch-size 分批向量化，实时更新 embed_progress
+            //    7b. Milvus：按 batch-size 分批 upsert，实时更新 milvus_progress + 回填 milvus_id + 任务成功数
+            //    每批 = 一次 embedding 批量调用 / 一次 Milvus upsert，避免超大文档单次调用内存与超时风险
+            int vectorCount = 0;
+            if (!toSave.isEmpty() || !toVectorOnly.isEmpty()) {
+                updateDocumentStatus(docEntity, DocumentStatus.EMBEDDING);
+                List<KnowledgeChunkEntity> vectorEntities = new ArrayList<>(toSave);
+                vectorEntities.addAll(toVectorOnly);
+                int batchSize = ragConfig.getDocument().getBatchSize();
+                int total = vectorEntities.size();
+                int totalBatches = (total + batchSize - 1) / batchSize;
+
+                // 7a. Embedding 阶段：向量暂存内存（总量 ≈ total×1024×4B，10000 chunks 上限时约 40MB，可控）
+                List<float[]> allEmbeddings = new ArrayList<>(total);
+                for (int i = 0; i < total; i += batchSize) {
+                    List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
+                    allEmbeddings.addAll(vectorStoreService.embedChunks(
+                            toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks)));
+                    task.setEmbedProgress((int) ((i + batch.size()) * 100L / total));
+                    task.setUpdateTime(new Date());
+                    knowledgeEmbeddingTaskService.updateById(task);
+                    log.info("Embedding 批次 {}/{}: 已向量化 {} 个文本 (documentId={}, 进度 {}%)",
+                            (i / batchSize) + 1, totalBatches, batch.size(), docEntity.getId(), task.getEmbedProgress());
+                }
+
+                // 7b. Milvus 阶段：按批 upsert + 回填 milvus_id + 更新成功数
+                int processed = 0;
+                for (int i = 0; i < total; i += batchSize) {
+                    List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
+                    List<float[]> embeddings = allEmbeddings.subList(i, Math.min(i + batchSize, total));
+                    vectorCount += vectorStoreService.upsertVectors(docEntity.getKnowledgeId(),
+                            toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks), embeddings);
+                    // 回填 milvus_id：作为"向量已写入"的增量判定依据（下次恢复时跳过）
+                    for (KnowledgeChunkEntity entity : batch) {
+                        entity.setMilvusId(VectorStoreService.buildVectorId(docEntity.getId(), entity.getChunkIndex()));
+                    }
+                    knowledgeChunkEntityService.updateBatchById(batch);
+                    processed += batch.size();
+                    // 每批完成后回写任务进度，便于前端实时展示（成功数 = 增量跳过 + 已写入）
+                    task.setMilvusProgress((int) (processed * 100L / total));
+                    task.setSuccessChunk(skipCount + processed);
+                    task.setUpdateTime(new Date());
+                    knowledgeEmbeddingTaskService.updateById(task);
+                    log.info("Milvus 批次 {}/{}: 已写入 {} 个 chunk 并回填 (documentId={}, 累计 {}/{}, 进度 {}%)",
+                            (i / batchSize) + 1, totalBatches, batch.size(),
+                            docEntity.getId(), skipCount + processed, chunks.size(), task.getMilvusProgress());
                 }
             }
 
-            // 标记文档失败状态（独立事务，不随主事务回滚）
-            markDocumentFailed(docEntity);
+            // 8. 更新文档状态为成功
+            docEntity.setChunkCount(chunks.size());
+            updateDocumentStatus(docEntity, DocumentStatus.SUCCESS);
 
-            throw new RuntimeException("文档摄取失败: " + e.getMessage(), e);
+            // 9. 新版本入库成功后，将同名旧版本标记过期时间（平滑下线）
+            deprecateOldVersions(docEntity.getKnowledgeId(), docEntity);
+
+            // 10. 更新任务为成功（successChunk 含增量跳过数）
+            task.setStatus(KnowledgeEmbeddingTaskStatus.SUCCESS);
+            task.setSuccessChunk(skipCount + vectorCount);
+            task.setFailChunk(Math.max(0, chunks.size() - skipCount - vectorCount));
+            task.setFinishTime(new Date());
+            task.setCostTime(System.currentTimeMillis() - start);
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+            log.info("任务 {} 处理完成: 总chunk={}, 新增/补齐={}, 跳过={}, 向量={}, 耗时 {}ms",
+                    task.getTaskNo(), chunks.size(), toSave.size() + toVectorOnly.size(),
+                    skipCount, vectorCount, task.getCostTime());
+        } catch (Exception e) {
+            log.error("Embedding 任务执行失败: taskNo={}, documentId={}",
+                    task.getTaskNo(), task.getDocumentId(), e);
+            // 回滚未完成的向量：已回填 milvus_id 的视为已完成保留，供下次恢复增量跳过；仅删除未完成的残留
+            try {
+                List<Long> doneMilvusIds = knowledgeChunkEntityService.lambdaQuery()
+                        .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
+                        .isNotNull(KnowledgeChunkEntity::getMilvusId)
+                        .list().stream()
+                        .map(KnowledgeChunkEntity::getMilvusId)
+                        .toList();
+                vectorStoreService.deleteVectorsByDocumentIdExcept(
+                        docEntity.getKnowledgeId(), docEntity.getId(), doneMilvusIds);
+            } catch (Exception ex) {
+                log.error("任务失败后清理未完成 Milvus 向量失败", ex);
+            }
+            // 标记文档失败状态
+            markDocumentFailed(docEntity);
+            failTask(task, e.getMessage(), start);
         }
+    }
+
+    /**
+     * 将任务标记为失败（含错误信息与耗时）
+     */
+    private void failTask(KnowledgeEmbeddingTaskEntity task, String error, long start) {
+        try {
+            int total = task.getTotalChunk() == null ? 0 : task.getTotalChunk();
+            int success = task.getSuccessChunk() == null ? 0 : task.getSuccessChunk();
+            task.setStatus(KnowledgeEmbeddingTaskStatus.FAILED);
+            task.setFailChunk(Math.max(0, total - success));
+            task.setErrorMessage(error != null && error.length() > 2000 ? error.substring(0, 2000) : error);
+            task.setFinishTime(new Date());
+            task.setCostTime(System.currentTimeMillis() - start);
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+            log.warn("任务 {} 已标记为失败", task.getTaskNo());
+        } catch (Exception ex) {
+            log.error("更新任务失败状态异常: taskNo={}", task.getTaskNo(), ex);
+        }
+    }
+
+    /**
+     * 生成任务编号：EMB + 时间戳 + 随机串
+     */
+    private String generateTaskNo() {
+        return "EMB" + System.currentTimeMillis() + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     }
 
     // ===================== 步骤 1：保存原始文档信息（含版本号推断） =====================
 
     /**
-     * 保存文档信息到 MySQL，自动推断版本号（不在此步骤上传文件，
-     * 文件仅在整个上游流程成功后由 {@link #persistUploadedFile} 上传）。
+     * 保存文档信息到 MySQL，自动推断版本号；
+     * 原始文件由调用方在后续步骤最先通过 {@link #persistUploadedFile} 持久化。
      */
     protected KnowledgeDocumentEntity saveDocumentInfo(MultipartFile file, Long knowledgeBaseId) {
         String originalFilename = file.getOriginalFilename();
@@ -167,17 +465,16 @@ public abstract class KnowledgeDocumentService {
             extension = originalFilename.substring(originalFilename.lastIndexOf('.') + 1).toLowerCase();
         }
 
-        // 查找同一知识库下同名文档的已有版本（仅成功状态的），确定新版本号
+        // 查找同一知识库下同名文档的所有版本（不限状态，避免失败版本导致版本号重号），确定新版本号
         int newVersion = 1;
         List<KnowledgeDocumentEntity> existingDocs = knowledgeDocumentEntityService.lambdaQuery()
                 .eq(KnowledgeDocumentEntity::getKnowledgeId, knowledgeBaseId)
                 .eq(KnowledgeDocumentEntity::getFileName, originalFilename)
-                .eq(KnowledgeDocumentEntity::getStatus, 3)   // 仅成功入库的
                 .orderByDesc(KnowledgeDocumentEntity::getVersion)
                 .list();
         if (!existingDocs.isEmpty()) {
             newVersion = existingDocs.get(0).getVersion() + 1;
-            log.info("检测到同名文档已有 {} 个版本，新版本号: {}", existingDocs.size(), newVersion);
+            log.info("检测到同名文档已有 {} 条版本记录，新版本号: {}", existingDocs.size(), newVersion);
         }
 
         KnowledgeDocumentEntity entity = new KnowledgeDocumentEntity();
@@ -187,7 +484,7 @@ public abstract class KnowledgeDocumentService {
         entity.setFileSize(file.getSize());
         entity.setFileType(extension);
         entity.setChunkCount(0);
-        entity.setStatus(0);
+        entity.setStatus(DocumentStatus.UPLOADING.getCode());
         entity.setVersion(newVersion);
         entity.setIsActive(1);
         entity.setCreateTime(new Date());
@@ -215,6 +512,16 @@ public abstract class KnowledgeDocumentService {
         }
 
         log.info("开始删除文档: id={}, fileName={}, knowledgeBaseId={}", documentId, doc.getFileName(), doc.getKnowledgeId());
+
+        // 0. MySQL：删除关联的 Embedding 任务记录（先于 document，满足外键约束）
+        try {
+            knowledgeEmbeddingTaskService.lambdaUpdate()
+                    .eq(KnowledgeEmbeddingTaskEntity::getDocumentId, documentId)
+                    .remove();
+            log.info("MySQL Embedding 任务记录已删除: documentId={}", documentId);
+        } catch (Exception e) {
+            log.error("删除 Embedding 任务记录失败: documentId={}", documentId, e);
+        }
 
         // 1. MySQL：删除 chunk 记录
         boolean chunkDeleted = knowledgeChunkEntityService.lambdaUpdate()
@@ -248,9 +555,12 @@ public abstract class KnowledgeDocumentService {
 
     /**
      * 将上传文件持久化到存储后端（本地磁盘或 MinIO），按 年/月/日 分层存储。
-     * 仅在解析、切分、向量化全部成功后调用。
+     * <p>在摄取流程中最先调用：优先落盘原始文件，避免后续步骤失败产生"孤儿索引"
+     * （有索引/向量但原始文件缺失）。失败时由 {@link #submitIngest} 补偿删除。
+     *
+     * @return 对象存储路径
      */
-    private void persistUploadedFile(byte[] fileBytes, KnowledgeDocumentEntity entity) throws Exception {
+    private String persistUploadedFile(byte[] fileBytes, KnowledgeDocumentEntity entity) throws Exception {
         String extension = entity.getFileType();
         LocalDate now = LocalDate.now();
         String datePath = String.format("%04d/%02d/%02d", now.getYear(), now.getMonthValue(), now.getDayOfMonth());
@@ -262,6 +572,7 @@ public abstract class KnowledgeDocumentService {
         entity.setFilePath(objectName);
         knowledgeDocumentEntityService.updateById(entity);
         log.info("文件已持久化: {}", objectName);
+        return objectName;
     }
 
     // ===================== 辅助方法 =====================
@@ -293,7 +604,7 @@ public abstract class KnowledgeDocumentService {
             transactionTemplate.executeWithoutResult(status -> {
                 KnowledgeDocumentEntity latest = knowledgeDocumentEntityService.getById(entity.getId());
                 if (latest != null) {
-                    latest.setStatus(4); // 失败
+                    latest.setStatus(DocumentStatus.FAILED.getCode());
                     latest.setUpdateTime(new Date());
                     knowledgeDocumentEntityService.updateById(latest);
                     log.error("文档 {} v{} 已标记为失败", latest.getFileName(), latest.getVersion());
@@ -305,8 +616,9 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 新版本入库成功后，为同名旧版本设置过期时间（平滑下线）。
-     * 旧版本在 TTL 天数内仍然可检索，超期后在问答中自动过滤。
+     * 新版本入库成功后，为同名旧版本标记已废弃（DEPRECATED）并设置过期时间（平滑下线）。
+     * 问答检索默认新版优先（同名只召回最高版本），TTL 作为兜底安全网：
+     * 最新版本被删除后，TTL 内旧版本可自动接管服务；超期后懒标记为 EXPIRED 并在问答中过滤。
      */
     private void deprecateOldVersions(Long knowledgeBaseId, KnowledgeDocumentEntity newDoc) {
         int ttlDays = ragConfig.getDocument().getVersionTtlDays();
@@ -315,18 +627,52 @@ public abstract class KnowledgeDocumentService {
         List<KnowledgeDocumentEntity> oldActiveDocs = knowledgeDocumentEntityService.lambdaQuery()
                 .eq(KnowledgeDocumentEntity::getKnowledgeId, knowledgeBaseId)
                 .eq(KnowledgeDocumentEntity::getFileName, newDoc.getFileName())
-                .eq(KnowledgeDocumentEntity::getStatus, 3)
+                .eq(KnowledgeDocumentEntity::getStatus, DocumentStatus.SUCCESS.getCode())
                 .eq(KnowledgeDocumentEntity::getIsActive, 1)
                 .ne(KnowledgeDocumentEntity::getId, newDoc.getId())  // 排除新版本自身
                 .isNull(KnowledgeDocumentEntity::getExpireTime)      // 尚未设置过期时间的
                 .list();
 
         for (KnowledgeDocumentEntity oldDoc : oldActiveDocs) {
+            oldDoc.setStatus(DocumentStatus.DEPRECATED.getCode());
             oldDoc.setExpireTime(expireTime);
             oldDoc.setUpdateTime(new Date());
             knowledgeDocumentEntityService.updateById(oldDoc);
-            log.info("旧版本 {} v{} 已设置过期时间: {}（{}天后下线）",
+            log.info("旧版本 {} v{} 已置为已废弃（DEPRECATED），过期时间: {}（{}天后过期）",
                     oldDoc.getFileName(), oldDoc.getVersion(), expireTime, ttlDays);
+        }
+    }
+
+    /**
+     * 更新文档处理状态（进度感知：0上传中 → 1解析中 → 2向量化中 → 3成功/4失败）
+     */
+    private void updateDocumentStatus(KnowledgeDocumentEntity docEntity, DocumentStatus status) {
+        docEntity.setStatus(status.getCode());
+        docEntity.setUpdateTime(new Date());
+        knowledgeDocumentEntityService.updateById(docEntity);
+        log.info("文档 {} v{} 状态推进为 {}（{}）",
+                docEntity.getFileName(), docEntity.getVersion(), status.getText(), status.getCode());
+    }
+
+    /**
+     * 懒标记过期文档：将 TTL 到期（expire_time &lt; now）的 SUCCESS/DEPRECATED 版本置为 EXPIRED。
+     * 幂等、可重复执行，由 chat 检索前触发，无需定时任务。
+     */
+    private void expireOverdueDocuments() {
+        try {
+            boolean updated = knowledgeDocumentEntityService.lambdaUpdate()
+                    .in(KnowledgeDocumentEntity::getStatus,
+                            DocumentStatus.SUCCESS.getCode(), DocumentStatus.DEPRECATED.getCode())
+                    .isNotNull(KnowledgeDocumentEntity::getExpireTime)
+                    .lt(KnowledgeDocumentEntity::getExpireTime, new Date())
+                    .set(KnowledgeDocumentEntity::getStatus, DocumentStatus.EXPIRED.getCode())
+                    .set(KnowledgeDocumentEntity::getUpdateTime, new Date())
+                    .update();
+            if (updated) {
+                log.info("已执行过期文档懒标记（存在 TTL 到期的版本被置为 EXPIRED）");
+            }
+        } catch (Exception e) {
+            log.warn("懒标记过期文档失败: {}", e.getMessage());
         }
     }
 
@@ -334,49 +680,39 @@ public abstract class KnowledgeDocumentService {
 
     protected abstract List<Document> parseDocument(MultipartFile file) throws IOException;
 
+    protected abstract List<Document> parseDocument(InputStream inputStream) throws IOException;
+
     protected abstract List<Document> splitDocument(List<Document> documents);
 
-    // ===================== 步骤 4：chunk 写入 MySQL =====================
+    // ===================== 步骤 4/5：chunk 写入 MySQL + 向量写入 Milvus =====================
 
     /**
-     * 将切分后的 chunk 批量写入 MySQL knowledge_chunk 表
+     * 构建单个 chunk 实体（增量分类后按需写入，插入后 id 由 MyBatis-Plus 回填）
      */
-    protected List<KnowledgeChunkEntity> saveChunks(Long knowledgeBaseId, Long documentId, List<Document> chunks) {
-        List<KnowledgeChunkEntity> entities = new ArrayList<>();
-        for (int i = 0; i < chunks.size(); i++) {
-            Document chunk = chunks.get(i);
-            String content = chunk.getText() != null ? chunk.getText() : "";
-            Integer pageNo = parsePageNo(chunk, i);
-
-            KnowledgeChunkEntity entity = new KnowledgeChunkEntity();
-            entity.setDocumentId(documentId);
-            entity.setChunkIndex(i);
-            entity.setContent(content);
-            entity.setContentHash(sha256(content));
-            entity.setTokenCount(0);
-            entity.setPageNo(pageNo);
-            entity.setCreateTime(new Date());
-            entities.add(entity);
-        }
-        knowledgeChunkEntityService.saveBatch(entities);
-
-        // 批量插入后 ID 会自动回填到实体
-        log.info("{} 个 chunk 已写入 MySQL knowledge_chunk (documentId={})", entities.size(), documentId);
-        return entities;
+    protected KnowledgeChunkEntity buildChunkEntity(Long documentId, int chunkIndex,
+                                                    String content, String contentHash, Integer pageNo) {
+        KnowledgeChunkEntity entity = new KnowledgeChunkEntity();
+        entity.setDocumentId(documentId);
+        entity.setChunkIndex(chunkIndex);
+        entity.setContent(content);
+        entity.setContentHash(contentHash);
+        entity.setTokenCount(0);
+        entity.setPageNo(pageNo);
+        entity.setCreateTime(new Date());
+        return entity;
     }
 
-    // ===================== 步骤 5：向量写入 Milvus =====================
-
     /**
-     * 构建 ChunkVectorData 并写入 Milvus
+     * 构建 ChunkVectorData 列表（纯内存，供 Embedding / Milvus 两阶段分批使用）
+     * <p>增量场景下 chunkEntities 的 chunkIndex 可能不连续（已完成的被跳过），
+     * 故按 entity.chunkIndex 从切分结果中取对应文本（hash 一致时内容相同）。
      */
-    protected int storeToVector(Long knowledgeBaseId, Long documentId,
-                                 List<KnowledgeChunkEntity> chunkEntities,
-                                 List<Document> chunks) {
+    protected List<VectorStoreService.ChunkVectorData> toChunkVectorData(Long knowledgeBaseId, Long documentId,
+                                                                         List<KnowledgeChunkEntity> chunkEntities,
+                                                                         List<Document> chunks) {
         List<VectorStoreService.ChunkVectorData> dataList = new ArrayList<>();
-        for (int i = 0; i < chunkEntities.size(); i++) {
-            KnowledgeChunkEntity entity = chunkEntities.get(i);
-            Document chunk = chunks.get(i);
+        for (KnowledgeChunkEntity entity : chunkEntities) {
+            Document chunk = chunks.get(entity.getChunkIndex());
             dataList.add(new VectorStoreService.ChunkVectorData(
                     entity.getId(),
                     documentId,
@@ -384,7 +720,7 @@ public abstract class KnowledgeDocumentService {
                     entity.getChunkIndex(),
                     chunk.getText() != null ? chunk.getText() : ""));
         }
-        return vectorStoreService.insertVectors(knowledgeBaseId, dataList);
+        return dataList;
     }
 
     // ===================== 知识问答 =====================
@@ -407,6 +743,9 @@ public abstract class KnowledgeDocumentService {
     public ChatResult chat(String question, Long knowledgeBaseId) {
         // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
+
+        // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
+        expireOverdueDocuments();
 
         // 1. 检索召回：启用 Hybrid Search 时走「Dense + BM25 + RRF 融合」，否则纯向量检索
         //    召回 candidateTopK 个候选，供后续 Rerank 精排
@@ -435,7 +774,7 @@ public abstract class KnowledgeDocumentService {
         Map<Long, KnowledgeChunkEntity> chunkMap = chunks.stream()
                 .collect(Collectors.toMap(KnowledgeChunkEntity::getId, c -> c, (a, b) -> a));
 
-        // 获取文档信息，并过滤已过期的版本（过期文档在问答中不可见）
+        // 获取文档信息，过滤已过期版本，且同名文档多版本只保留最高版本（新版优先，避免混入旧内容）
         Date now = new Date();
         List<Long> docIds = searchResults.stream()
                 .map(VectorStoreService.SearchResult::getDocumentId)
@@ -444,14 +783,33 @@ public abstract class KnowledgeDocumentService {
         Map<Long, KnowledgeDocumentEntity> docMap = knowledgeDocumentEntityService.listByIds(docIds).stream()
                 .collect(Collectors.toMap(KnowledgeDocumentEntity::getId, d -> d, (a, b) -> a));
 
-        // 过滤掉已过期文档的检索结果
+        // 过滤：只允许 SUCCESS(生效) 与 DEPRECATED(TTL 兜底) 版本参与问答，
+        // 排除处理中(0/1/2)、失败(4)、已过期(6) 的残留向量
         Map<Long, String> docNameMap = new LinkedHashMap<>();
         List<VectorStoreService.SearchResult> validResults = new ArrayList<>();
+        // 第一遍：按状态过滤，收集活跃文档，并统计同名文档的最高版本
+        Map<Long, KnowledgeDocumentEntity> activeDocs = new HashMap<>();
+        Map<String, Integer> maxVersionByFileName = new HashMap<>();
         for (VectorStoreService.SearchResult r : searchResults) {
             KnowledgeDocumentEntity doc = docMap.get(r.getDocumentId());
             if (doc == null) continue;
-            // 已过期的跳过
+            Integer st = doc.getStatus();
+            // 仅成功/已废弃版本可参与（处理中、失败、已过期一律排除）
+            if (st == null
+                    || (st != DocumentStatus.SUCCESS.getCode() && st != DocumentStatus.DEPRECATED.getCode())) continue;
+            // 兜底：expire_time 已到但尚未懒标记的按过期处理
             if (doc.getExpireTime() != null && doc.getExpireTime().before(now)) continue;
+            activeDocs.putIfAbsent(doc.getId(), doc);
+            String fileName = doc.getFileName();
+            int ver = doc.getVersion() != null ? doc.getVersion() : 0;
+            maxVersionByFileName.merge(fileName, ver, Math::max);
+        }
+        // 第二遍：同名文档只保留版本最高的检索结果（旧版本不再召回；最新版本被删除后旧版本自动接管）
+        for (VectorStoreService.SearchResult r : searchResults) {
+            KnowledgeDocumentEntity doc = activeDocs.get(r.getDocumentId());
+            if (doc == null) continue;
+            int ver = doc.getVersion() != null ? doc.getVersion() : 0;
+            if (ver < maxVersionByFileName.getOrDefault(doc.getFileName(), ver)) continue;
             validResults.add(r);
             docNameMap.putIfAbsent(doc.getId(), doc.getFileName());
         }

@@ -62,7 +62,7 @@ public class HybridSearchService {
                     log.warn("Hybrid 检索失败，降级为 BM25 全文检索: {}", e.getMessage());
                     return vectorStoreService.bm25Search(knowledgeBaseId, query, topK);
                 } catch (Exception bm25Ex) {
-                    log.warn("BM25 全文检索失败（可能为旧版 collection），降级为纯向量检索: {}", bm25Ex.getMessage());
+                    log.warn("BM25 全文检索失败，降级为纯向量检索: {}", bm25Ex.getMessage());
                     return vectorStoreService.search(knowledgeBaseId, query, topK, threshold);
                 }
             }

@@ -1,8 +1,11 @@
 package com.example.springairagdemo.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.example.springairagdemo.entity.DocumentStatus;
 import com.example.springairagdemo.entity.KnowledgeBaseEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
+import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
+import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
 import com.example.springairagdemo.security.ForbiddenException;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.RequireKbRole;
@@ -11,6 +14,7 @@ import com.example.springairagdemo.service.KbAuthorizationService;
 import com.example.springairagdemo.service.KnowledgeBaseService;
 import com.example.springairagdemo.service.KnowledgeDocumentEntityService;
 import com.example.springairagdemo.service.KnowledgeDocumentService;
+import com.example.springairagdemo.service.KnowledgeEmbeddingTaskService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.InputStreamResource;
@@ -56,6 +60,7 @@ public class KnowledgeDocumentController {
     private final KnowledgeBaseService knowledgeBaseService;
     private final FileStorageService fileStorageService;
     private final KbAuthorizationService kbAuthorizationService;
+    private final KnowledgeEmbeddingTaskService knowledgeEmbeddingTaskService;
 
     /**
      * 上传文档文件并建立知识库索引（需要 EDITOR 及以上）
@@ -82,20 +87,20 @@ public class KnowledgeDocumentController {
         }
 
         try {
-            KnowledgeDocumentService.IngestResult result =
-                    knowledgeDocumentService.ingest(file, knowledgeBaseId);
-            log.info("文件 {} v{} 上传处理成功（知识库: {}），共 {} 个文本片段入库",
-                    originalFilename, result.version(), knowledgeBaseId, result.chunkCount());
+            KnowledgeDocumentService.TaskSubmitResult result =
+                    knowledgeDocumentService.submitIngest(file, knowledgeBaseId);
+            log.info("文件 {} v{} 上传提交成功（知识库: {}），任务号: {}",
+                    originalFilename, result.version(), knowledgeBaseId, result.taskNo());
             return ResponseEntity.ok(Map.of(
                     "success", true,
-                    "message", result.isUpdate()
-                            ? "文件上传并处理成功，已更新为 v" + result.version()
-                            : "文件上传并处理成功",
+                    "message", "文件上传成功，正在异步生成向量索引（任务号 " + result.taskNo() + "）",
                     "fileName", originalFilename,
                     "knowledgeBaseId", knowledgeBaseId,
-                    "chunkCount", result.chunkCount(),
+                    "taskId", result.taskId(),
+                    "taskNo", result.taskNo(),
+                    "documentId", result.documentId(),
                     "version", result.version(),
-                    "isUpdate", result.isUpdate()
+                    "isUpdate", result.version() > 1
             ));
         } catch (IOException e) {
             log.error("文件处理失败: {} (知识库: {})", originalFilename, knowledgeBaseId, e);
@@ -117,6 +122,50 @@ public class KnowledgeDocumentController {
             return null;
         }
         return filename.substring(filename.lastIndexOf('.') + 1).toLowerCase();
+    }
+
+    /**
+     * 查询 Embedding 任务状态（前端上传后轮询进度）
+     */
+    @GetMapping("/task/{taskNo}")
+    public ResponseEntity<Map<String, Object>> taskStatus(@PathVariable String taskNo) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.lambdaQuery()
+                .eq(KnowledgeEmbeddingTaskEntity::getTaskNo, taskNo)
+                .one();
+        if (task == null) {
+            return ResponseEntity.status(404).body(Map.of("success", false, "message", "任务不存在"));
+        }
+        Map<String, Object> item = new LinkedHashMap<>();
+        item.put("taskId", task.getId());
+        item.put("taskNo", task.getTaskNo());
+        item.put("documentId", task.getDocumentId());
+        item.put("status", task.getStatus() == null ? null : task.getStatus().getCode());
+        item.put("statusText", statusText(task.getStatus()));
+        item.put("totalChunk", task.getTotalChunk());
+        item.put("successChunk", task.getSuccessChunk());
+        item.put("failChunk", task.getFailChunk());
+        // 分阶段进度（0-100）：PDF解析 / 文本切片 / Chunk入库 / Embedding / Milvus
+        item.put("parseProgress", nvl(task.getParseProgress()));
+        item.put("splitProgress", nvl(task.getSplitProgress()));
+        item.put("chunkProgress", nvl(task.getChunkProgress()));
+        item.put("embedProgress", nvl(task.getEmbedProgress()));
+        item.put("milvusProgress", nvl(task.getMilvusProgress()));
+        item.put("retryCount", task.getRetryCount());
+        item.put("errorMessage", task.getErrorMessage());
+        item.put("costTime", task.getCostTime());
+        item.put("startTime", task.getStartTime());
+        item.put("finishTime", task.getFinishTime());
+        item.put("createTime", task.getCreateTime());
+        return ResponseEntity.ok(Map.of("success", true, "data", item));
+    }
+
+    private String statusText(KnowledgeEmbeddingTaskStatus status) {
+        return status == null ? "未知" : status.getText();
+    }
+
+    /** 阶段进度字段空值兜底（存量任务未初始化时为 0） */
+    private int nvl(Integer value) {
+        return value == null ? 0 : value;
     }
 
     /**
@@ -272,6 +321,8 @@ public class KnowledgeDocumentController {
             item.put("fileSize", doc.getFileSize());
             item.put("chunkCount", doc.getChunkCount());
             item.put("status", doc.getStatus());
+            DocumentStatus st = DocumentStatus.fromCode(doc.getStatus());
+            item.put("statusText", st == null ? "未知" : st.getText());
             item.put("version", doc.getVersion());
             item.put("createTime", doc.getCreateTime());
             item.put("updateTime", doc.getUpdateTime());

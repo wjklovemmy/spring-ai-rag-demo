@@ -49,7 +49,7 @@
 graph TB
     subgraph Frontend["前端（静态页面）"]
         LOGIN["login.html<br/>登录 / 注册"]
-        INDEX["index.html<br/>问答 & 上传"]
+        INDEX["index.html<br/>问答 / 上传 / 任务进度"]
     end
 
     subgraph Backend["Spring Boot 应用"]
@@ -57,7 +57,7 @@ graph TB
         AUTH["JWT 认证过滤器<br/>JwtAuthenticationFilter"]
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
-        SVC["Service 层<br/>ingest 模板流程 / chat 问答 / 文档删除"]
+        SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
         PARSER["Parser<br/>PagePdfDocumentReader + OCR 兜底"]
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
@@ -122,29 +122,43 @@ spring-ai-rag-demo/
     │   │   ├── config/
     │   │   │   ├── AiConfig.java                  # ChatClient / 模型装配
     │   │   │   ├── MilvusConfig.java              # Milvus 客户端
-    │   │   │   ├── RagConfigProperties.java       # rag.* 配置绑定
+    │   │   │   ├── RagConfigProperties.java       # rag.* 配置绑定（含 batch-size）
     │   │   │   ├── JwtUtil.java                   # JWT 生成/解析
     │   │   │   ├── JwtConfig.java                 # JWT 配置属性
-    │   │   │   └── JwtAuthenticationFilter.java   # 认证过滤器
+    │   │   │   ├── JwtAuthenticationFilter.java   # 认证过滤器
+    │   │   │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
+    │   │   │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
+    │   │   │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
+    │   │   │   ├── DataSourceConfig.java          # HikariCP 连接池显式装配
+    │   │   │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
+    │   │   │   ├── DataInitializer.java           # 启动初始化（ADMIN 角色/账号/恢复中断任务）
+    │   │   │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
     │   │   ├── controller/
     │   │   │   ├── AuthController.java            # 注册/登录/登出/当前用户/用户搜索
     │   │   │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-    │   │   │   └── KnowledgeDocumentController.java # 上传/问答/删除/下载
-    │   │   ├── security/                          # 防越权（RBAC + 数据授权）
+    │   │   │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
+    │   │   │   ├── AdminUserController.java       # 系统管理-用户（需 ADMIN）
+    │   │   │   └── AdminRoleController.java       # 系统管理-角色（需 ADMIN）
+    │   │   ├── security/                          # 防越权（RBAC + 数据授权 + 管理员切面）
     │   │   │   ├── LoginUser.java                 # 登录用户模型（id/username/nickname）
     │   │   │   ├── UserContext.java               # ThreadLocal 当前用户上下文
-    │   │   │   ├── KbRole.java                    # 角色枚举 VIEWER < EDITOR < OWNER
+    │   │   │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
     │   │   │   ├── ForbiddenException.java        # 403 业务异常
-    │   │   │   ├── RequireKbRole.java             # 方法级权限注解
-    │   │   │   └── KbAccessAspect.java            # AOP 切面：自动解析 kbId 并鉴权
+    │   │   │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
+    │   │   │   ├── RequireAdmin.java              # ADMIN 功能角色注解（方法级）
+    │   │   │   ├── KbAccessAspect.java            # @RequireKbRole AOP 切面
+    │   │   │   └── AdminAccessAspect.java         # @RequireAdmin AOP 切面
     │   │   ├── embedding/
     │   │   │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型
-    │   │   ├── entity/                            # MyBatis-Plus 实体
+    │   │   ├── entity/                            # MyBatis-Plus 实体 + 枚举
     │   │   │   ├── KnowledgeBaseEntity.java
-    │   │   │   ├── KnowledgeDocumentEntity.java   # 含 version 等
+    │   │   │   ├── KnowledgeDocumentEntity.java   # 含 version / status(7态) / expire_time
     │   │   │   ├── KnowledgeChunkEntity.java
+    │   │   │   ├── KnowledgeEmbeddingTaskEntity.java # 任务 + 5 个阶段进度字段
+    │   │   │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
+    │   │   │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
     │   │   │   ├── UserEntity.java
-    │   │   │   ├── SysRoleEntity.java             # RBAC 角色
+    │   │   │   ├── SysRoleEntity.java             # RBAC 功能角色
     │   │   │   ├── SysUserRoleEntity.java         # 用户-角色关联
     │   │   │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
     │   │   │   └── KbAccessLogEntity.java         # 访问审计日志
@@ -152,6 +166,7 @@ spring-ai-rag-demo/
     │   │   │   ├── KnowledgeBaseMapper.java
     │   │   │   ├── KnowledgeDocumentMapper.java
     │   │   │   ├── KnowledgeChunkMapper.java
+    │   │   │   ├── KnowledgeEmbeddingTaskMapper.java
     │   │   │   ├── UserMapper.java
     │   │   │   ├── SysRoleMapper.java
     │   │   │   ├── SysUserRoleMapper.java
@@ -159,34 +174,30 @@ spring-ai-rag-demo/
     │   │   │   └── KbAccessLogMapper.java
     │   │   ├── parser/
     │   │   │   ├── DocumentParser.java             # 解析接口
-    │   │   │   └── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
+    │   │   │   ├── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
+    │   │   │   ├── HeadingExtractor.java           # 标题行识别 / 标题链构建
+    │   │   │   └── SemanticSplitter.java           # 语义切片（段落聚类 + 断点）
     │   │   └── service/
-    │   │       ├── KnowledgeDocumentService.java   # 摄取模板方法 + 问答（抽象类）
+    │   │       ├── KnowledgeDocumentService.java   # 摄取异步流水线 + 问答（抽象类）
     │   │       ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
-    │   │       ├── VectorStoreService.java         # Milvus 增删查（Dense + BM25 Hybrid Search）
+    │   │       ├── VectorStoreService.java         # Milvus 增删查（embedChunks / upsertVectors）
     │   │       ├── HybridSearchService.java        # 混合检索编排（RRF 融合 + 异常降级）
-    │   │       ├── RerankService.java              # 重排序接口
-    │   │       ├── DashScopeRerankService.java     # 百炼 gte-rerank 实现
-    │   │       ├── OcrService.java                 # OCR 接口
-    │   │       ├── AliyunOcrService.java           # 阿里云 OCR 实现
-    │   │       ├── FileStorageService.java         # 文件存储接口
-    │   │       ├── MinioFileStorageService.java    # MinIO 实现
-    │   │       ├── LocalFileStorageService.java    # 本地磁盘实现
+    │   │       ├── RerankService.java / DashScopeRerankService.java   # 重排序接口与实现
+    │   │       ├── OcrService.java / AliyunOcrService.java            # OCR 接口与实现
+    │   │       ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
+    │   │       ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
     │   │       ├── KnowledgeBaseService.java       # 知识库服务接口
     │   │       ├── KnowledgeDocumentEntityService.java
     │   │       ├── KnowledgeChunkEntityService.java
     │   │       ├── UserService.java                # 注册/登录（JWT + BCrypt）
     │   │       ├── KbAuthorizationService.java     # 权限判定中枢（assertRole/visibleKbIds/授权）
-    │   │       ├── KbMemberService.java            # 知识库成员授权服务
-    │   │       ├── KbAccessLogService.java         # 访问审计日志服务
-    │   │       ├── SysRoleService.java             # RBAC 角色服务
-    │   │       ├── SysUserRoleService.java         # 用户-角色关联服务
+    │   │       ├── KbMemberService.java / KbAccessLogService.java / SysRoleService.java / SysUserRoleService.java
     │   │       └── impl/                           # Service 实现类
     │   └── resources/
     │       ├── application.yaml                    # 全局配置
     │       ├── static/
     │       │   ├── login.html                      # 登录/注册页
-    │       │   └── index.html                      # 问答/上传仪表盘
+    │       │   └── index.html                      # 问答/上传/任务分阶段进度仪表盘
     └── test/
 ├── sql/
 │   └── init.sql                              # 全量初始化脚本（业务表 + RBAC 权限表 + 内置角色/账号）
@@ -196,44 +207,62 @@ spring-ai-rag-demo/
 
 ## 核心业务流程
 
-### 1. 文档上传与摄取（Ingestion）
+### 1. 文档上传与摄取（异步任务流水线）
 
-`KnowledgeDocumentService.ingest()` 是摄取流程的**模板方法**（`@Transactional(rollbackFor = Exception.class)`），由子类 `PdfKnowledgeDocumentServiceImpl` 实现解析/切分细节。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）：
+摄取采用**异步任务制**：`submitIngest` 快速返回 `taskNo`，实际处理在自定义线程池（`rag-embedding-N`）中执行 `processTaskAsync`。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）。
+
+文档状态机（`status`，7 态）：
 
 ```
-上传 PDF
-  │
-  ├─ ① saveDocumentInfo   写入 MySQL knowledge_document
-  │       · 同知识库同名文件 → 自动推断递增版本号 v1/v2/v3...
-  │       · 状态置为 0（上传中）
-  │
-  ├─ ② parseDocument      按页解析 PDF（PagePdfDocumentReader）
-  │
-  ├─ ③ splitDocument      自研 Chunking：语义切片 + 标题感知注入
-  │       · 段落批量 embedding 聚类 → 相邻相似度 < 0.55 处断点（语义边界）
-  │       · 识别标题行构建标题链（如 "3 考勤制度 > 3.2 请假流程"），
-  │         以 "【标题链】正文" 前缀注入 chunk 文本并写 metadata.heading
-  │       · 超长段 token 二次切分；语义切片失败自动降级 TokenTextSplitter
-  │       · 默认 chunk-size 800、min 350 字符、最大 10000 chunk
-  │
-  ├─ ④ saveChunks         chunk 文本批量写入 MySQL knowledge_chunk
-  │       · 记录 chunk_index / content_hash(SHA-256) / page_no
-  │
-  ├─ ⑤ storeToVector      chunk 文本 → DashScope 向量化 → 写入 Milvus kb_{id}
-  │
-  ├─ ⑥ persistUploadedFile  以上全部成功后才把原始文件存入 MinIO/本地
-  │       · 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.pdf
-  │
-  ├─ ⑦ 更新文档状态为成功（status=3），回填 chunk_count
-  │
-  └─ ⑧ deprecateOldVersions  为新版设置旧版本过期时间（平滑下线）
-          · 旧版本 TTL（默认 30 天）内仍可检索，超期自动过滤
+ 0 UPLOADING ──→ 1 PARSING ──→ 2 EMBEDDING ──→ 3 SUCCESS
+     上传中         解析中         向量化中         成功
+                    │                              │
+                    │                              ├─→ 5 DEPRECATED（被新版顶替，TTL 内仍可检索）
+                    │                              │       └─→ 6 EXPIRED（TTL 到期懒标记过滤）
+                    └─→ 4 FAILED（失败，保留半成品供增量恢复）
 ```
 
-**失败兜底：**
-- 任何步骤异常 → 主事务回滚 MySQL 写入；
-- 若 Milvus 已写入向量则主动删除回滚；
-- 文档状态通过独立事务标记为失败（status=4），不随主事务回滚。
+```
+上传 PDF（multipart）
+  │
+  ├─ ① 提交阶段（submitIngest，接口立即返回 taskNo）
+  │       · saveDocumentInfo   写入 MySQL knowledge_document
+  │           - 同知识库同名文件 → 自动推断递增版本号 v1/v2/v3...
+  │             （版本号取同名文档全部状态中的最大版本 +1，防重号）
+  │           - 状态置 0（UPLOADING 上传中）
+  │       · persistUploadedFile 最先持久化原始文件（MinIO/本地），失败可恢复
+  │           - 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.pdf
+  │       · 创建 Embedding 任务（status=0 待处理），提交线程池执行
+  │       · 提交阶段失败 → 补偿删除文件 + document/task 记录（防孤儿）
+  │
+  └─ ② 异步处理（processTaskAsync，任务状态 0待处理→1处理中→2成功/3失败）
+        │  文档状态 0上传中 → 1解析中 → 2向量化中 → 3成功 / 4失败
+        │
+        ├─ 解析       PagePdfDocumentReader 按页解析（无文本层 OCR 兜底）
+        │             → parse_progress = 100%
+        ├─ 切分       SemanticSplitter：语义切片 + 标题感知注入
+        │             · 段落批量 embedding 聚类 → 相邻相似度 < 0.55 处断点
+        │             · 标题链注入（如 "3 考勤制度 > 3.2 请假流程"）写 metadata.heading
+        │             · 超长段 token 二次切分；失败自动降级 TokenTextSplitter
+        │             · 默认 chunk-size 800、min 350 字符、最大 10000 chunk
+        │             → split_progress = 100%
+        ├─ 增量分类    与已有 chunk 对比（chunk_index + content_hash）
+        │             toSave(新增/变化) / toVectorOnly(缺向量) / skip(已完整) / stale(删除)
+        ├─ Chunk 入库  saveBatch 批量写 MySQL knowledge_chunk（主键回填）
+        │             → chunk_progress = 100%
+        ├─ Embedding  按 batch-size 分批向量化（embed_progress 0→100%，逐批回写）
+        ├─ Milvus     按 batch-size 分批 upsert 到 kb_{id}（milvus_progress 0→100%）
+        │             · 回填 milvus_id：作为"向量已写入"的增量判定标记
+        │             · 每批更新任务 success_chunk，前端 5 行进度条实时展示
+        ├─ 置成功      文档状态 3（SUCCESS），回填 chunk_count
+        └─ 旧版下线    deprecateOldVersions：同名旧版置 5（DEPRECATED）+ 设 expire_time
+                      （TTL 默认 30 天，到期后懒标记为 6 EXPIRED 并过滤）
+```
+
+**失败兜底（增量执行，不整批回滚）：**
+- 任何步骤异常 → 任务标记失败（status=3），文档置 4（FAILED），记录 error_message；
+- 半成品保留：已写 MySQL chunk / 已写 Milvus 向量按 `milvus_id` 判空标记，作为恢复线索；
+- 重启恢复：启动时扫描中断任务 → 重新入队增量补齐（解析/切分/embedding 幂等，仅处理未回填 milvus_id 的 chunk）。
 
 ### 2. 知识问答（Q&A）
 
@@ -246,7 +275,9 @@ spring-ai-rag-demo/
   │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
   │       · rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
   │
-  ├─ ② 过滤       过滤已过期版本文档的检索结果
+  ├─ ② 过滤       状态白名单：仅 SUCCESS(3) / DEPRECATED(5) 参与问答（排除处理中/失败/过期）
+  │       · 懒标记过期：chat 开头将 TTL 到期的旧版本标记为 EXPIRED(6) 并过滤
+  │       · 同名多版本只保留版本号最高的检索结果（新版优先，防止新旧混召）
   │
   ├─ ③ 取回文本   按 chunk_id 从 MySQL 回查完整 chunk 内容
   │
@@ -308,7 +339,7 @@ spring-ai-rag-demo/
    → KbAuthorizationService.assertRole(kbId, role)
 
 ② Service 层守卫（核心业务兜底）
-   ingest()  → assertRole(kbId, EDITOR)   # 上传文档
+   submitIngest() → assertRole(kbId, EDITOR)  # 上传文档
    chat()    → assertRole(kbId, VIEWER)   # 问答检索
    deleteDocument() → 对象级：先查文档所属 kbId 再校验
 
@@ -358,9 +389,9 @@ spring-ai-rag-demo/
 | 表 | 用途 | 关键字段 |
 |----|------|----------|
 | `knowledge_base` | 知识库 | name(唯一)、description、status、create_user |
-| `knowledge_document` | 文档元数据 | knowledge_id(FK)、file_name、file_path、file_size、file_type、chunk_count、embedding_model、status(0上传中/1解析中/2Embedding中/3成功/4失败)、**version**、**expire_time**（旧版本下线时间）、**is_active** |
+| `knowledge_document` | 文档元数据 | knowledge_id(FK)、file_name、file_path、file_size、file_type、chunk_count、embedding_model、status(**0上传中/1解析中/2向量化中/3成功/4失败/5已废弃/6已过期**)、**version**、**expire_time**（旧版本下线时间）、**is_active** |
 | `knowledge_chunk` | 文本分块 | document_id(FK)、chunk_index、content(LONGTEXT)、content_hash(SHA-256)、token_count、page_no、milvus_id |
-| `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status、total/success/fail_chunk、retry_count、error_message、cost_time |
+| `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status(0待处理/1处理中/2成功/3失败)、total/success/fail_chunk、**parse/split/chunk/embed/milvus_progress（阶段进度 0-100）**、retry_count、error_message、cost_time |
 | `sys_user` | 系统用户 | username(唯一)、password(BCrypt)、nickname、email、status |
 | `sys_role` | 全局角色（RBAC） | role_code(唯一)、role_name、description |
 | `sys_user_role` | 用户-角色关联 | user_id(FK)、role_id(FK) |
@@ -379,10 +410,13 @@ spring-ai-rag-demo/
 | `spring.ai.dashscope.*` | DashScope embedding 模型（api-key 从环境变量 `DASHSCOPE_API_KEY` 读取） |
 | `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024 |
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
+| `spring.datasource.pool.*` | HikariCP 连接池（max/min/空闲/超时/存活等，默认 max=50） |
+| `spring.task.embedding.*` | 摄取异步任务线程池（core=2/max=4/queue=100/命名 rag-embedding-N/CallerRuns 饱和策略/优雅停机等待） |
 | `rag.storage.type` | `minio` / `local` 文件存储切换 |
 | `rag.storage.minio.*` | MinIO endpoint / 密钥 / bucket |
 | `rag.document.version-ttl-days` | 旧版本文档共存天数（默认 30） |
 | `rag.document.upload-dir` | 本地存储模式上传目录 |
+| `rag.document.batch-size` | 向量化批处理大小（默认 100：每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写，降低超大文档内存/超时风险） |
 | `rag.document.chunk.*` | 全局文档分块参数（chunk-size、heading、semantic 等，见下表） |
 | `rag.rerank.enabled` | 是否启用召回重排序（默认 true） |
 | `rag.rerank.model` | 重排序模型（默认 `gte-rerank-v2`） |
@@ -477,7 +511,7 @@ export ALIYUN_OCR_SK=xxxx
 
 > 不需要 OCR / Rerank / Hybrid 时，可分别将 `rag.ocr.enabled`、`rag.rerank.enabled`、`rag.hybrid.enabled` 置为 `false`。
 
-> **重要（已有数据的升级提示）**：升级到 Hybrid Search 后，新创建的知识库 collection 自动包含 BM25 字段（`text`/`sparse`）。由旧版本创建的 collection 缺少这些字段，应用会输出 warn 日志并**自动降级为纯向量检索**；如需启用 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
+> **重要（已有数据的升级提示）**：collection 按知识库**动态创建**（`kb_{id}`），已存在时直接复用跳过，无需手工清理。由旧版本创建的 collection 若缺少 BM25 字段（`text`/`sparse`），BM25 检索路会失败并**自动降级为纯向量检索**（不再有旧 collection 兼容适配代码）；如需完整 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
 
 ### 3. 启动应用
 
@@ -511,11 +545,13 @@ mvnw.cmd spring-boot:run
 | GET | `/api/knowledge-base/{id}/members` | 是 | 成员列表（需 OWNER） |
 | POST | `/api/knowledge-base/{id}/members` | 是 | 授权/调整成员角色（需 OWNER，body `{userId, role}`） |
 | DELETE | `/api/knowledge-base/{id}/members/{userId}` | 是 | 移除成员（需 OWNER，最后一个 OWNER 不可移除） |
-| POST | `/api/knowledge-document/upload` | 是 | 上传 PDF（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`） |
-| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId"}`） |
+| POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
+| GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
+| GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
+| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId"}`，返回 answer + sources 来源列表） |
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
-| GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤） |
+| GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤，含 statusText/version/进度等） |
 | GET | `/api/admin/users?keyword=` | 是 | 用户列表（需 ADMIN，含功能角色） |
 | POST | `/api/admin/users` | 是 | 创建用户（需 ADMIN，body `{username,password,nickname,email}`） |
 | PUT | `/api/admin/users/{id}/status` | 是 | 启用/禁用用户（需 ADMIN，body `{status:0\|1}`） |
@@ -532,9 +568,9 @@ mvnw.cmd spring-boot:run
 
 ## 关键设计决策
 
-1. **模板方法模式**：`KnowledgeDocumentService` 抽象类固化摄取 8 步流程，子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
-2. **文件后置上传**：原始文件仅在解析、切分、向量化全部成功后写入对象存储，避免脏数据。
-3. **版本平滑下线**：同名文档重传自动递增版本，旧版本 TTL 内仍可检索，避免"删旧传新"的中断。
+1. **异步任务 + 增量执行**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，`processTaskAsync` 在线程池执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。文档处理流水线经 `processTaskAsync` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
+2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
+3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。
 5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
 6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
@@ -545,3 +581,5 @@ mvnw.cmd spring-boot:run
 11. **纵深防御防越权**：① `@RequireKbRole` AOP 注解拦截入口；② Service 层 `assertRole` 守卫核心业务（含对象级——先查文档所属知识库再校验）；③ 列表/下拉强制按可见知识库集合过滤。三层任一独立可拦截越权。
 12. **数据授权为唯一权威**：`kb_member` 表（用户×知识库×角色）是知识库访问的唯一判定依据，`ADMIN` 全局放行；不信任前端传参（创建人取自登录态），并保护最后一个 OWNER 不可被移除。
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
+14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
+15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。

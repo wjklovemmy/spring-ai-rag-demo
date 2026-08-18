@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS knowledge_document (
 
     embedding_model VARCHAR(100) DEFAULT NULL COMMENT 'Embedding模型',
 
-    status TINYINT NOT NULL DEFAULT 0 COMMENT '0上传中 1解析中 2Embedding中 3成功 4失败',
+    status TINYINT NOT NULL DEFAULT 0 COMMENT '状态：0上传中 1解析中 2向量化中 3成功 4失败 5已废弃(被新版顶替) 6已过期',
 
     create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 
@@ -91,6 +91,16 @@ CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
     success_chunk INT DEFAULT 0 COMMENT '成功Chunk数',
 
     fail_chunk INT DEFAULT 0 COMMENT '失败Chunk数',
+
+    parse_progress TINYINT DEFAULT 0 COMMENT '阶段进度-PDF解析(0-100)',
+
+    split_progress TINYINT DEFAULT 0 COMMENT '阶段进度-文本切片(0-100)',
+
+    chunk_progress TINYINT DEFAULT 0 COMMENT '阶段进度-Chunk入库MySQL(0-100)',
+
+    embed_progress TINYINT DEFAULT 0 COMMENT '阶段进度-Embedding向量化(0-100)',
+
+    milvus_progress TINYINT DEFAULT 0 COMMENT '阶段进度-Milvus写入(0-100)',
 
     retry_count INT DEFAULT 0 COMMENT '重试次数',
 

@@ -8,17 +8,15 @@ import io.milvus.v2.common.DataType;
 import io.milvus.v2.common.IndexParam;
 import io.milvus.v2.service.collection.request.AddFieldReq;
 import io.milvus.v2.service.collection.request.CreateCollectionReq;
-import io.milvus.v2.service.collection.request.DescribeCollectionReq;
 import io.milvus.v2.service.collection.request.DropCollectionReq;
 import io.milvus.v2.service.collection.request.HasCollectionReq;
 import io.milvus.v2.service.collection.request.LoadCollectionReq;
 import io.milvus.v2.service.collection.request.ReleaseCollectionReq;
-import io.milvus.v2.service.collection.response.DescribeCollectionResp;
 import io.milvus.v2.service.index.request.CreateIndexReq;
 import io.milvus.v2.service.vector.request.AnnSearchReq;
 import io.milvus.v2.service.vector.request.DeleteReq;
 import io.milvus.v2.service.vector.request.HybridSearchReq;
-import io.milvus.v2.service.vector.request.InsertReq;
+import io.milvus.v2.service.vector.request.UpsertReq;
 import io.milvus.v2.service.vector.request.SearchReq;
 import io.milvus.v2.service.vector.request.data.EmbeddedText;
 import io.milvus.v2.service.vector.request.data.FloatVec;
@@ -47,7 +45,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p>
  * 使用 Milvus v2 客户端（MilvusClientV2），collection 字段（文本落库，Milvus 侧同时存 BM25 全文索引字段）：
  * <pre>
- *   id          INT64                 主键（自增）
+ *   id          INT64                 主键（业务主键：documentId * ID_BASE + chunkIndex，幂等 upsert 覆盖）
  *   knowledgeId INT64                 知识库 ID
  *   documentId  INT64                 文档 ID
  *   chunkId     INT64                 knowledge_chunk.id
@@ -59,7 +57,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * </pre>
  * 检索支持两种模式：
  * <ul>
- *   <li>{@link #search} 纯向量检索（dense，兼容旧 collection）</li>
+ *   <li>{@link #search} 纯向量检索（dense）</li>
  *   <li>{@link #hybridSearch} 混合检索（dense + BM25 全文，RRF 融合，Milvus 服务端 2.5+）</li>
  * </ul>
  */
@@ -72,6 +70,28 @@ public class VectorStoreService {
 
     /** 向量维度，须与 EmbeddingModel 输出一致 */
     private static final int EMBEDDING_DIM = 1024;
+
+    /**
+     * 业务主键基数：Milvus 主键 = documentId * ID_BASE + chunkIndex。
+     * <p>同一文档恢复重跑时 documentId 与 chunkIndex 不变 → 主键稳定 → upsert 覆盖旧行，杜绝重复向量。
+     * chunkIndex 上限 10,000（TokenTextSplitter），远小于基数，无溢出风险。
+     */
+    private static final long ID_BASE = 1_000_000L;
+
+    /**
+     * 计算 Milvus 业务主键：documentId * ID_BASE + chunkIndex。
+     * <p>同一文档恢复重跑时 documentId 与 chunkIndex 不变 → 主键稳定 → upsert 覆盖旧行，杜绝重复向量。
+     * 同时用于 knowledge_chunk.milvus_id 回填，作为增量执行判定"向量已写入"的依据。
+     *
+     * @param documentId 文档 ID
+     * @param chunkIndex chunk 序号（0 起）
+     */
+    public static long buildVectorId(long documentId, int chunkIndex) {
+        if (chunkIndex < 0 || chunkIndex >= ID_BASE) {
+            throw new IllegalArgumentException("chunkIndex 超出业务主键编码范围: " + chunkIndex);
+        }
+        return documentId * ID_BASE + chunkIndex;
+    }
 
     /** VarChar 字段最大字节数（Milvus 上限），中文按 UTF-8 3 字节/字符估算 */
     private static final int TEXT_MAX_LENGTH = 65535;
@@ -159,25 +179,19 @@ public class VectorStoreService {
         String collectionName = getCollectionName(knowledgeBaseId);
 
         if (hasCollection(knowledgeBaseId)) {
-            if (!isHybridReady(collectionName)) {
-                log.warn("Milvus collection [{}] 由旧版本创建，缺少 BM25 全文检索字段（text/sparse）。"
-                        + "如需启用 Hybrid Search，请删除该 collection（或删除知识库后重建）并重新上传文档，"
-                        + "当前将降级为纯向量检索。", collectionName);
-            } else {
-                log.info("Milvus collection [{}] 已存在，跳过创建", collectionName);
-            }
+            log.info("Milvus collection [{}] 已存在，跳过创建", collectionName);
             collectionReady.put(knowledgeBaseId, true);
             return;
         }
 
         // addField / addFunction 为 CollectionSchema 实例方法，需先构建空 schema 再链式添加
         CreateCollectionReq.CollectionSchema schema = CreateCollectionReq.CollectionSchema.builder().build();
-        schema.addField(scalarField(FIELD_ID, DataType.Int64, true))
-                .addField(scalarField(FIELD_KNOWLEDGE_ID, DataType.Int64, false))
-                .addField(scalarField(FIELD_DOCUMENT_ID, DataType.Int64, false))
-                .addField(scalarField(FIELD_CHUNK_ID, DataType.Int64, false))
-                .addField(scalarField(FIELD_PAGE_NO, DataType.Int32, false))
-                .addField(scalarField(FIELD_CHUNK_INDEX, DataType.Int32, false))
+        schema.addField(scalarField(FIELD_ID, DataType.Int64, true, false))
+                .addField(scalarField(FIELD_KNOWLEDGE_ID, DataType.Int64, false, false))
+                .addField(scalarField(FIELD_DOCUMENT_ID, DataType.Int64, false, false))
+                .addField(scalarField(FIELD_CHUNK_ID, DataType.Int64, false, false))
+                .addField(scalarField(FIELD_PAGE_NO, DataType.Int32, false, false))
+                .addField(scalarField(FIELD_CHUNK_INDEX, DataType.Int32, false, false))
                 .addField(AddFieldReq.builder()
                         .fieldName(FIELD_EMBEDDING)
                         .dataType(DataType.FloatVector)
@@ -240,7 +254,9 @@ public class VectorStoreService {
     // ===================== 向量写入 =====================
 
     /**
-     * 将 chunk 向量批量写入 Milvus（文本同时写入 BM25 全文检索字段）
+     * 将 chunk 向量批量写入 Milvus（文本同时写入 BM25 全文检索字段），写入幂等：
+     * <p>新版 schema 主键为稳定业务主键（documentId * {@link #ID_BASE} + chunkIndex），使用 upsert 按主键覆盖写入 ——
+     * 同一文档恢复重跑/并发双跑时主键不变，重复写入直接覆盖旧行，不产生重复向量。
      *
      * @param knowledgeBaseId 知识库 ID
      * @param chunks          chunk 数据列表（含文本，用于生成 embedding 与 BM25 索引）
@@ -250,17 +266,44 @@ public class VectorStoreService {
         if (chunks == null || chunks.isEmpty()) {
             return 0;
         }
+        // 组合实现：先批量向量化，再按向量写入 Milvus（便于复用，进度追踪场景请拆分调用两阶段）
+        List<float[]> embeddings = embedChunks(chunks);
+        return upsertVectors(knowledgeBaseId, chunks, embeddings);
+    }
+
+    /**
+     * 批量向量化（仅调用 embedding，不写库）：用于分阶段进度追踪（Embedding / Milvus 拆开推进）
+     *
+     * @param chunks chunk 数据列表（含文本）
+     * @return 与 chunks 一一对应的向量列表
+     */
+    public List<float[]> embedChunks(List<ChunkVectorData> chunks) {
+        if (chunks == null || chunks.isEmpty()) {
+            return List.of();
+        }
+        List<String> texts = chunks.stream().map(ChunkVectorData::getContent).toList();
+        EmbeddingResponse embeddingResponse = embeddingModel.call(new EmbeddingRequest(texts, null));
+        return embeddingResponse.getResults().stream()
+                .map(Embedding::getOutput)
+                .toList();
+    }
+
+    /**
+     * 将 chunk 向量批量 upsert 写入 Milvus（文本同时写入 BM25 全文检索字段），写入幂等
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param chunks          chunk 数据列表
+     * @param embeddings      与 chunks 一一对应的向量列表（由 {@link #embedChunks} 产出）
+     * @return 写入条数
+     */
+    public int upsertVectors(Long knowledgeBaseId, List<ChunkVectorData> chunks, List<float[]> embeddings) {
+        if (chunks == null || chunks.isEmpty()) {
+            return 0;
+        }
         String collectionName = getCollectionName(knowledgeBaseId);
         ensureReady(knowledgeBaseId);
 
-        // 1. 批量向量化
-        List<String> texts = chunks.stream().map(ChunkVectorData::getContent).toList();
-        EmbeddingResponse embeddingResponse = embeddingModel.call(new EmbeddingRequest(texts, null));
-        List<float[]> embeddings = embeddingResponse.getResults().stream()
-                .map(Embedding::getOutput)
-                .toList();
-
-        // 2. 构建插入数据（id 自增无需提供，sparse 由 BM25 函数自动生成）
+        // 构建插入数据（sparse 由 BM25 函数自动生成）
         List<JsonObject> data = new ArrayList<>();
         for (int i = 0; i < chunks.size(); i++) {
             ChunkVectorData c = chunks.get(i);
@@ -269,6 +312,9 @@ public class VectorStoreService {
             for (float v : emb) vec.add(v);
 
             JsonObject row = new JsonObject();
+            Integer chunkIndex = c.getChunkIndex() != null ? c.getChunkIndex() : 0;
+            // 稳定业务主键：同一文档同一 chunkIndex 重跑时主键不变，upsert 覆盖不产生重复向量
+            row.addProperty(FIELD_ID, buildVectorId(c.getDocumentId(), chunkIndex));
             row.addProperty(FIELD_KNOWLEDGE_ID, knowledgeBaseId);
             row.addProperty(FIELD_DOCUMENT_ID, c.getDocumentId());
             row.addProperty(FIELD_CHUNK_ID, c.getChunkId());
@@ -279,20 +325,19 @@ public class VectorStoreService {
             data.add(row);
         }
 
-        InsertReq insertReq = InsertReq.builder()
+        UpsertReq upsertReq = UpsertReq.builder()
                 .collectionName(collectionName)
                 .data(data)
                 .build();
-        milvusClient.insert(insertReq);
-
-        log.info("{} 个 chunk 向量已写入 Milvus collection [{}]", chunks.size(), collectionName);
+        milvusClient.upsert(upsertReq);
+        log.info("{} 个 chunk 向量已幂等写入（upsert）Milvus collection [{}]", chunks.size(), collectionName);
         return chunks.size();
     }
 
     // ===================== 向量删除 =====================
 
     /**
-     * 按文档 ID 删除向量（回滚用）
+     * 按文档 ID 删除向量（文档删除 / 兜底全删用）
      *
      * @param knowledgeBaseId 知识库 ID
      * @param documentId      文档 ID
@@ -308,6 +353,53 @@ public class VectorStoreService {
                 .build();
         milvusClient.delete(deleteReq);
         log.info("已删除文档 ID={} 的 Milvus 向量", documentId);
+    }
+
+    /**
+     * 按文档 ID 删除 chunkIndex >= startIndex 的向量（清理新切分数量减少后的尾部残留）
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param documentId      文档 ID
+     * @param startIndex      起始 chunk 序号（含），删除该序号及其之后的向量
+     */
+    public void deleteVectorsByChunkIndexFrom(Long knowledgeBaseId, Long documentId, int startIndex) {
+        String collectionName = getCollectionName(knowledgeBaseId);
+        ensureReady(knowledgeBaseId);
+
+        String expr = FIELD_DOCUMENT_ID + " == " + documentId + " && " + FIELD_CHUNK_INDEX + " >= " + startIndex;
+        DeleteReq deleteReq = DeleteReq.builder()
+                .collectionName(collectionName)
+                .filter(expr)
+                .build();
+        milvusClient.delete(deleteReq);
+        log.info("已删除文档 ID={} 的 Milvus 向量（chunkIndex >= {}）", documentId, startIndex);
+    }
+
+    /**
+     * 按文档 ID 删除向量，但保留指定主键集合内的"已完成"向量（失败回滚用）。
+     * <p>增量执行语义：已回填 milvus_id 的 chunk 视为"向量已写入"的完成品，失败回滚时保留，
+     * 供恢复任务增量跳过；仅删除未回填（未写入或可能部分写入）的向量，避免残留脏向量污染检索。
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param documentId      文档 ID
+     * @param keepMilvusIds   需保留的 Milvus 主键集合（null/空时等价于全删）
+     */
+    public void deleteVectorsByDocumentIdExcept(Long knowledgeBaseId, Long documentId, List<Long> keepMilvusIds) {
+        if (keepMilvusIds == null || keepMilvusIds.isEmpty()) {
+            deleteVectorsByDocumentId(knowledgeBaseId, documentId);
+            return;
+        }
+        String collectionName = getCollectionName(knowledgeBaseId);
+        ensureReady(knowledgeBaseId);
+
+        // Milvus 表达式支持 in / not in；List.toString() 形如 [1, 2, 3] 与 Milvus 语法一致
+        String expr = FIELD_DOCUMENT_ID + " == " + documentId + " && " + FIELD_ID + " not in " + keepMilvusIds;
+        DeleteReq deleteReq = DeleteReq.builder()
+                .collectionName(collectionName)
+                .filter(expr)
+                .build();
+        milvusClient.delete(deleteReq);
+        log.info("已删除文档 ID={} 的 Milvus 向量（保留 {} 条已完成）", documentId, keepMilvusIds.size());
     }
 
     // ===================== 向量检索 =====================
@@ -345,7 +437,7 @@ public class VectorStoreService {
     /**
      * 混合检索（Hybrid Search）：Dense 向量 + BM25 全文检索双路召回，Milvus 端 RRF 融合
      * <p>
-     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建），旧版 collection 不支持。
+     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建）。
      *
      * @param knowledgeBaseId 知识库 ID
      * @param query           查询文本
@@ -396,7 +488,7 @@ public class VectorStoreService {
      * 纯 BM25 全文检索：仅用关键词路召回，不依赖 embedding
      * <p>
      * 用于 embedding 服务异常时的兜底检索（HybridSearchService 降级链的一环），
-     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建），旧版 collection 不支持。
+     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建）。
      *
      * @param knowledgeBaseId 知识库 ID
      * @param query           查询文本（由 Milvus 内置 analyzer 分词）
@@ -461,18 +553,6 @@ public class VectorStoreService {
                 HasCollectionReq.builder().collectionName(getCollectionName(knowledgeBaseId)).build()));
     }
 
-    /** 检查 collection 是否为含 BM25 字段的新版 schema */
-    private boolean isHybridReady(String collectionName) {
-        try {
-            DescribeCollectionResp resp = milvusClient.describeCollection(
-                    DescribeCollectionReq.builder().collectionName(collectionName).build());
-            return resp.getFieldNames() != null && resp.getFieldNames().contains(FIELD_SPARSE);
-        } catch (Exception e) {
-            log.warn("检查 collection [{}] schema 失败: {}", collectionName, e.getMessage());
-            return false;
-        }
-    }
-
     private void ensureReady(Long knowledgeBaseId) {
         if (Boolean.TRUE.equals(collectionReady.get(knowledgeBaseId))) {
             return;
@@ -501,12 +581,17 @@ public class VectorStoreService {
                 .build());
     }
 
-    private static AddFieldReq scalarField(String fieldName, DataType dataType, boolean primaryKey) {
+    /**
+     * @param primaryKey 是否主键
+     * @param autoId     是否自增。幂等写入要求主键非自增（业务侧提供稳定主键），
+     *                   仅 id 字段创建时传 false，其余字段传 false
+     */
+    private static AddFieldReq scalarField(String fieldName, DataType dataType, boolean primaryKey, boolean autoId) {
         AddFieldReq.AddFieldReqBuilder builder = AddFieldReq.builder()
                 .fieldName(fieldName)
                 .dataType(dataType);
         if (primaryKey) {
-            builder.isPrimaryKey(true).autoID(true);
+            builder.isPrimaryKey(true).autoID(autoId);
         }
         return builder.build();
     }

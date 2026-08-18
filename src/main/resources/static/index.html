@@ -840,7 +840,7 @@
             return;
         }
 
-        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传并处理 ' + file.name + '...</span>';
+        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传 ' + file.name + '...</span>';
 
         const formData = new FormData();
         formData.append('file', file);
@@ -851,13 +851,67 @@
             const data = await res.json();
             if (data.success) {
                 const verInfo = data.isUpdate ? ' <span style="color:#fbbf24;">(已更新为 v' + data.version + ')</span>' : ' <span style="color:#64748b;">(v' + data.version + ')</span>';
-                resultEl.innerHTML = '<span style="color:#34d399;">✅ ' + file.name + verInfo + ' 成功，共 ' + data.chunkCount + ' 个片段已入库</span>';
+                resultEl.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + file.name + verInfo + ' 已提交，正在生成向量索引（任务号 ' + data.taskNo + '）…</span>';
+                fileInput.value = '';
+                pollTaskStatus(data.taskNo, resultEl, file.name, verInfo);
             } else {
                 resultEl.innerHTML = '<span style="color:#f87171;">❌ ' + data.message + '</span>';
             }
         } catch (err) {
             resultEl.innerHTML = '<span style="color:#f87171;">❌ 上传失败，请重试</span>';
         }
+    }
+
+    // 上传后轮询 Embedding 任务状态，直至成功/失败（每 2 秒）
+    function pollTaskStatus(taskNo, el, fileName, verInfo) {
+        setTimeout(async () => {
+            try {
+                const res = await fetchApi('/api/knowledge-document/task/' + taskNo);
+                const data = await res.json();
+                if (!data.success || !data.data) {
+                    el.innerHTML = '<span style="color:#f87171;">❌ 查询任务状态失败：' + (data.message || '未知错误') + '</span>';
+                    return;
+                }
+                const t = data.data;
+                if (t.status === 2) {
+                    el.innerHTML = '<span style="color:#34d399;">✅ ' + fileName + verInfo + ' 处理成功，共 ' + (t.successChunk || 0) + ' 个片段已入库' + (t.costTime != null ? '，耗时 ' + (t.costTime / 1000).toFixed(1) + 's' : '') + '</span>';
+                    loadDocList();
+                } else if (t.status === 3) {
+                    el.innerHTML = '<span style="color:#f87171;">❌ ' + fileName + ' 处理失败：' + (t.errorMessage || '未知错误') + '</span>';
+                } else {
+                    const label = t.status === 0 ? '待处理' : '处理中';
+                    const progress = (t.status === 1 && t.totalChunk > 0) ? '（' + (t.successChunk || 0) + '/' + t.totalChunk + '）' : '';
+                    el.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + fileName + verInfo + ' ' + label + progress + '…</span>'
+                        + renderStageBars(t);
+                    pollTaskStatus(taskNo, el, fileName, verInfo);
+                }
+            } catch (err) {
+                el.innerHTML = '<span style="color:#f87171;">❌ 查询任务状态失败：' + err.message + '</span>';
+            }
+        }, 2000);
+    }
+
+    // 分阶段进度条渲染（PDF解析 / 文本切片 / Chunk入库 / Embedding / Milvus）
+    function renderStageBars(t) {
+        const stages = [
+            ['PDF解析', t.parseProgress],
+            ['文本切片', t.splitProgress],
+            ['Chunk入库', t.chunkProgress],
+            ['Embedding', t.embedProgress],
+            ['Milvus', t.milvusProgress]
+        ];
+        let html = '<div style="font-family:Consolas,Menlo,monospace;font-size:12px;line-height:1.8;margin-top:8px;">';
+        for (const [label, pctRaw] of stages) {
+            const pct = Math.max(0, Math.min(100, pctRaw || 0));
+            const filled = Math.round(pct / 10);
+            const bar = '█'.repeat(filled) + '░'.repeat(10 - filled);
+            const pctText = String(pct).padStart(3, ' ');
+            html += '<div><span style="display:inline-block;width:72px;text-align:right;margin-right:10px;color:#94a3b8;">' + label + '</span>'
+                + '<span style="color:' + (pct >= 100 ? '#34d399' : '#e2e8f0') + ';">' + bar + '</span>'
+                + ' <span style="color:#a5b4fc;">' + pctText + '%</span></div>';
+        }
+        html += '</div>';
+        return html;
     }
 
     // ---- 知识库管理 ----
@@ -991,9 +1045,20 @@
                 return;
             }
 
-            const statusMap = { 0: ['处理中', '#fbbf24'], 3: ['成功', '#34d399'], 4: ['失败', '#f87171'] };
+            const statusMap = {
+                0: ['上传中', '#93c5fd'],
+                1: ['解析中', '#a5b4fc'],
+                2: ['向量化中', '#fbbf24'],
+                3: ['成功', '#34d399'],
+                4: ['失败', '#f87171'],
+                5: ['已废弃', '#94a3b8'],
+                6: ['已过期', '#64748b']
+            };
             const rows = data.data.map(doc => {
-                const st = statusMap[doc.status] || ['未知', '#94a3b8'];
+                // 优先使用后端返回的状态文案
+                const st = (doc.statusText && statusMap[doc.status])
+                    ? [doc.statusText, statusMap[doc.status][1]]
+                    : (statusMap[doc.status] || ['未知', '#94a3b8']);
                 const ctime = doc.createTime ? new Date(doc.createTime).toLocaleString('zh-CN') : '-';
                 const utime = doc.updateTime ? new Date(doc.updateTime).toLocaleString('zh-CN') : '-';
                 const size = doc.fileSize ? (doc.fileSize / 1024).toFixed(1) + ' KB' : '-';

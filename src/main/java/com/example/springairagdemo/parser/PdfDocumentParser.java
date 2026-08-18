@@ -17,8 +17,10 @@ import javax.imageio.ImageIO;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -58,17 +60,35 @@ public class PdfDocumentParser implements DocumentParser {
         Path tempFile = Files.createTempFile("pdf-upload-", ".pdf");
         try {
             file.transferTo(tempFile.toFile());
-            List<Document> documents = readAllPages(tempFile);
-            log.info("从 PDF 中读取到 {} 个文档页面", documents.size());
-
-            // OCR 兜底：扫描版 PDF 页面无文本层时渲染图片识别文字（原地替换页内容）
-            if (ocrService.isEnabled() && !documents.isEmpty()) {
-                ocrFallback(tempFile, documents);
-            }
-            return documents;
+            return readFromTemp(tempFile);
         } finally {
             Files.deleteIfExists(tempFile);
         }
+    }
+
+    @Override
+    public List<Document> read(InputStream inputStream) throws IOException {
+        Path tempFile = Files.createTempFile("pdf-async-", ".pdf");
+        try {
+            Files.copy(inputStream, tempFile, StandardCopyOption.REPLACE_EXISTING);
+            return readFromTemp(tempFile);
+        } finally {
+            Files.deleteIfExists(tempFile);
+        }
+    }
+
+    /**
+     * 统一读取临时 PDF 文件：逐页提取文本 + OCR 兜底
+     */
+    private List<Document> readFromTemp(Path tempFile) throws IOException {
+        List<Document> documents = readAllPages(tempFile);
+        log.info("从 PDF 中读取到 {} 个文档页面", documents.size());
+
+        // OCR 兜底：扫描版 PDF 页面无文本层时渲染图片识别文字（原地替换页内容）
+        if (ocrService.isEnabled() && !documents.isEmpty()) {
+            ocrFallback(tempFile, documents);
+        }
+        return documents;
     }
 
     /**

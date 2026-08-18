@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 
 /**
@@ -25,6 +26,11 @@ public class PdfKnowledgeDocumentServiceImpl extends KnowledgeDocumentService {
     @Override
     protected List<Document> parseDocument(MultipartFile file) throws IOException {
         return documentParser.read(file);
+    }
+
+    @Override
+    protected List<Document> parseDocument(InputStream inputStream) throws IOException {
+        return documentParser.read(inputStream);
     }
 
     @Override

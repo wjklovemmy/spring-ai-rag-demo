@@ -4,6 +4,7 @@ import org.springframework.ai.document.Document;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.util.List;
 
 /**
@@ -18,6 +19,14 @@ public interface DocumentParser {
      * @return 原始文档列表（如 PDF 按页）
      */
     List<Document> read(MultipartFile file) throws IOException;
+
+    /**
+     * 从输入流读取文档内容（不含切分），用于异步任务从存储后端读取原始文件
+     *
+     * @param inputStream 文档输入流
+     * @return 原始文档列表（如 PDF 按页）
+     */
+    List<Document> read(InputStream inputStream) throws IOException;
 
     /**
      * 便捷方法：读取文档内容并按全局配置分块
