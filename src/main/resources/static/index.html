@@ -797,6 +797,32 @@
         }
     }
 
+    // ---- 字符串转义（防 XSS） ----
+    // escapeHtml：HTML 文本/属性值转义，用于 innerHTML 拼接动态数据
+    function escapeHtml(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+    // jsEscape：JS 字符串字面量转义，用于 onclick 内嵌字符串参数
+    function jsEscape(str) {
+        if (str === null || str === undefined) return '';
+        return String(str)
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'")
+            .replace(/\r/g, '\\r')
+            .replace(/\n/g, '\\n');
+    }
+    // attrFor：onclick 等 HTML 属性内的 JS 字符串参数，需先 JS 转义再 HTML 转义
+    // （浏览器先做 HTML 实体解码还原出 JS 源码，JS 再解析字符串字面量）
+    function attrFor(str) {
+        return escapeHtml(jsEscape(str));
+    }
+
     // ---- JWT Token 管理 ----
     function getToken() { return localStorage.getItem('token'); }
 
@@ -866,7 +892,7 @@
         }
 
         const msgs = document.getElementById('chatMessages');
-        msgs.innerHTML += '<div style="text-align:right;margin-bottom:12px;"><span style="background:rgba(99,102,241,0.2);padding:10px 16px;border-radius:12px;display:inline-block;max-width:80%;">' + question + '</span></div>';
+        msgs.innerHTML += '<div style="text-align:right;margin-bottom:12px;"><span style="background:rgba(99,102,241,0.2);padding:10px 16px;border-radius:12px;display:inline-block;max-width:80%;">' + escapeHtml(question) + '</span></div>';
 
         const loadingDiv = document.createElement('div');
         loadingDiv.innerHTML = '<span style="color:#64748b;">⏳ 思考中...</span>';
@@ -881,12 +907,12 @@
                 body: JSON.stringify({ question, knowledgeBaseId: Number(kbId) })
             });
             const data = await res.json();
-            let html = '<div style="margin-bottom:12px;"><span style="background:rgba(255,255,255,0.05);padding:10px 16px;border-radius:12px;display:inline-block;max-width:80%;white-space:pre-wrap;">' + (data.answer || data.message) + '</span></div>';
+            let html = '<div style="margin-bottom:12px;"><span style="background:rgba(255,255,255,0.05);padding:10px 16px;border-radius:12px;display:inline-block;max-width:80%;white-space:pre-wrap;">' + escapeHtml(data.answer || data.message) + '</span></div>';
             if (data.sources && data.sources.length > 0) {
                 html += '<div style="margin-top:8px;color:#94a3b8;font-size:12px;padding-left:8px;border-left:2px solid #6366f1;">📖 参考来源：';
                 data.sources.forEach(s => {
-                    html += '<br><span style="color:#6366f1;">[来源' + (s.refIndex || 1) + ']</span> ' + s.documentName + ' 第' + (s.pageNo || '1') + '页';
-                    html += ' <a href="javascript:void(0)" onclick="downloadFile(' + s.documentId + ', \'' + (s.documentName || 'document').replace(/'/g, "\\'") + '\')" style="color:#818cf8;text-decoration:none;font-size:11px;" title="下载原文">⬇</a>';
+                    html += '<br><span style="color:#6366f1;">[来源' + (s.refIndex || 1) + ']</span> ' + escapeHtml(s.documentName) + ' 第' + (s.pageNo || '1') + '页';
+                    html += ' <a href="javascript:void(0)" onclick="downloadFile(' + s.documentId + ', \'' + attrFor(s.documentName || 'document') + '\')" style="color:#818cf8;text-decoration:none;font-size:11px;" title="下载原文">⬇</a>';
                 });
                 html += '</div>';
             }
@@ -924,7 +950,7 @@
             return;
         }
 
-        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传 ' + file.name + '...</span>';
+        resultEl.innerHTML = '<span style="color:#64748b;">⏳ 正在上传 ' + escapeHtml(file.name) + '...</span>';
 
         const formData = new FormData();
         formData.append('file', file);
@@ -935,7 +961,7 @@
             const data = await res.json();
             if (data.success) {
                 const verInfo = data.isUpdate ? ' <span style="color:#fbbf24;">(已更新为 v' + data.version + ')</span>' : ' <span style="color:#64748b;">(v' + data.version + ')</span>';
-                resultEl.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + file.name + verInfo + ' 已提交，正在生成向量索引（任务号 ' + data.taskNo + '）…</span>';
+                resultEl.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + escapeHtml(file.name) + verInfo + ' 已提交，正在生成向量索引（任务号 ' + escapeHtml(data.taskNo) + '）…</span>';
                 fileInput.value = '';
                 pollTaskStatus(data.taskNo, resultEl, file.name, verInfo);
             } else {
@@ -958,14 +984,14 @@
                 }
                 const t = data.data;
                 if (t.status === 2) {
-                    el.innerHTML = '<span style="color:#34d399;">✅ ' + fileName + verInfo + ' 处理成功，共 ' + (t.successChunk || 0) + ' 个片段已入库' + (t.costTime != null ? '，耗时 ' + (t.costTime / 1000).toFixed(1) + 's' : '') + '</span>';
+                    el.innerHTML = '<span style="color:#34d399;">✅ ' + escapeHtml(fileName) + verInfo + ' 处理成功，共 ' + (t.successChunk || 0) + ' 个片段已入库' + (t.costTime != null ? '，耗时 ' + (t.costTime / 1000).toFixed(1) + 's' : '') + '</span>';
                     loadDocList();
                 } else if (t.status === 3) {
-                    el.innerHTML = '<span style="color:#f87171;">❌ ' + fileName + ' 处理失败：' + (t.errorMessage || '未知错误') + '</span>';
+                    el.innerHTML = '<span style="color:#f87171;">❌ ' + escapeHtml(fileName) + ' 处理失败：' + escapeHtml(t.errorMessage || '未知错误') + '</span>';
                 } else {
                     const label = t.status === 0 ? '待处理' : '处理中';
                     const progress = (t.status === 1 && t.totalChunk > 0) ? '（' + (t.successChunk || 0) + '/' + t.totalChunk + '）' : '';
-                    el.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + fileName + verInfo + ' ' + label + progress + '…</span>'
+                    el.innerHTML = '<span style="color:#a5b4fc;">⏳ ' + escapeHtml(fileName) + verInfo + ' ' + label + progress + '…</span>'
                         + renderStageBars(t);
                     pollTaskStatus(taskNo, el, fileName, verInfo);
                 }
@@ -1004,7 +1030,7 @@
             const res = await fetchApi('/api/knowledge-base');
             const data = await res.json();
             if (data.success && data.data) {
-                const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + (kb.status === 1 ? '' : ' [已禁用]') + '</option>').join('');
+                const options = data.data.map(kb => '<option value="' + kb.id + '">' + escapeHtml(kb.name) + (kb.status === 1 ? '' : ' [已禁用]') + '</option>').join('');
                 document.getElementById('chatKbSelect').innerHTML = '<option value="">请选择知识库</option>' + options;
                 document.getElementById('uploadKbSelect').innerHTML = '<option value="">请选择知识库</option>' + options;
             }
@@ -1051,7 +1077,7 @@
                     // 仅 OWNER（admin 视为 OWNER）可删除、可管理成员，否则置灰禁用
                     const isOwner = kb.myRole === 'OWNER';
                     const memberBtn = isOwner
-                        ? `<button onclick="openMemberModal(${kb.id}, '${kb.name.replace(/'/g, "\\'")}')"
+                        ? `<button onclick="openMemberModal(${kb.id}, '${attrFor(kb.name)}')"
                                    style="padding:4px 14px;border:1px solid rgba(99,102,241,0.4);border-radius:6px;background:rgba(99,102,241,0.1);color:#a5b4fc;cursor:pointer;font-size:13px;">
                                成员
                            </button>`
@@ -1071,8 +1097,8 @@
                     return `
                     <div style="display:flex;justify-content:space-between;align-items:center;padding:14px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
                         <div>
-                            <div style="font-weight:600;margin-bottom:4px;">${kb.name}</div>
-                            <div style="color:#64748b;font-size:13px;">${kb.description || '暂无描述'} · 创建人: ${kb.createUserName || kb.createUser} · ${kb.createTime ? new Date(kb.createTime).toLocaleString('zh-CN') : ''}</div>
+                            <div style="font-weight:600;margin-bottom:4px;">${escapeHtml(kb.name)}</div>
+                            <div style="color:#64748b;font-size:13px;">${escapeHtml(kb.description || '暂无描述')} · 创建人: ${escapeHtml(kb.createUserName || kb.createUser)} · ${kb.createTime ? new Date(kb.createTime).toLocaleString('zh-CN') : ''}</div>
                         </div>
                         <div style="display:flex;align-items:center;gap:10px;">
                             <span style="font-size:12px;padding:2px 10px;border-radius:20px;${kb.status === 1 ? 'background:rgba(52,211,153,0.15);color:#34d399;' : 'background:rgba(148,163,184,0.1);color:#94a3b8;'}">${kb.status === 1 ? '启用' : '禁用'}</span>
@@ -1096,7 +1122,7 @@
             const res = await fetchApi('/api/knowledge-document/knowledge-bases');
             const data = await res.json();
             if (data.success && data.data) {
-                const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + '</option>').join('');
+                const options = data.data.map(kb => '<option value="' + kb.id + '">' + escapeHtml(kb.name) + '</option>').join('');
                 document.getElementById('docsKbFilter').innerHTML = '<option value="">全部知识库</option>' + options;
             }
         } catch (err) {
@@ -1147,15 +1173,15 @@
                 const utime = doc.updateTime ? new Date(doc.updateTime).toLocaleString('zh-CN') : '-';
                 const size = doc.fileSize ? (doc.fileSize / 1024).toFixed(1) + ' KB' : '-';
                 return '<tr>' +
-                    '<td style="min-width:200px;"><a class="doc-name" href="javascript:void(0)" onclick="downloadFile(' + doc.id + ',\'' + (doc.fileName || 'document').replace(/'/g, "\\'") + '\')" title="点击下载">' + (doc.fileName || '-') + '</a></td>' +
-                    '<td>' + (doc.fileType || '-') + '</td>' +
+                    '<td style="min-width:200px;"><a class="doc-name" href="javascript:void(0)" onclick="downloadFile(' + doc.id + ',\'' + attrFor(doc.fileName || 'document') + '\')" title="点击下载">' + escapeHtml(doc.fileName || '-') + '</a></td>' +
+                    '<td>' + escapeHtml(doc.fileType || '-') + '</td>' +
                     '<td>' + size + '</td>' +
                     '<td>' + (doc.chunkCount || 0) + '</td>' +
                     '<td><span class="status-badge" style="background:' + st[1] + '20;color:' + st[1] + ';">' + st[0] + '</span></td>' +
                     '<td>' + (doc.version || 1) + '</td>' +
                     '<td>' + ctime + '</td>' +
                     '<td>' + utime + '</td>' +
-                    '<td style="text-align:center;"><button onclick="deleteDocument(' + doc.id + ',\'' + (doc.fileName || '文档').replace(/'/g, "\\'") + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(239,68,68,0.15)\'" onmouseout="this.style.background=\'none\'">删除</button></td>' +
+                    '<td style="text-align:center;"><button onclick="deleteDocument(' + doc.id + ',\'' + attrFor(doc.fileName || '文档') + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(239,68,68,0.15)\'" onmouseout="this.style.background=\'none\'">删除</button></td>' +
                     '</tr>';
             }).join('');
 
@@ -1207,7 +1233,7 @@
             const res = await fetchApi('/api/knowledge-document/knowledge-bases');
             const data = await res.json();
             if (data.success && data.data) {
-                const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + '</option>').join('');
+                const options = data.data.map(kb => '<option value="' + kb.id + '">' + escapeHtml(kb.name) + '</option>').join('');
                 document.getElementById('taskKbFilter').innerHTML = '<option value="">全部知识库</option>' + options;
             }
         } catch (err) {
@@ -1263,8 +1289,9 @@
             const st = taskStatusMap[t.status] || ['未知', '#94a3b8'];
             const ctime = t.createTime ? new Date(t.createTime).toLocaleString('zh-CN') : '-';
             const cost = t.costTime != null ? (t.costTime / 1000).toFixed(1) + 's' : '-';
-            const docName = (t.documentName || '-').replace(/'/g, "\\'");
-            const taskNo = (t.taskNo || '').replace(/'/g, "\\'");
+            const docName = escapeHtml(t.documentName || '-');
+            const taskNoText = escapeHtml(t.taskNo || '-');
+            const taskNoAttr = attrFor(t.taskNo || '');
 
             // 整体进度列：成功=100%；待处理=-；其余显示成功/总 + 进度条
             let progCell;
@@ -1282,16 +1309,16 @@
             }
 
             return '<tr>' +
-                '<td style="font-family:Consolas,Menlo,monospace;font-size:13px;color:#818cf8;white-space:nowrap;">' + (t.taskNo || '-') + '</td>' +
+                '<td style="font-family:Consolas,Menlo,monospace;font-size:13px;color:#818cf8;white-space:nowrap;">' + taskNoText + '</td>' +
                 '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + docName + '">' + docName + '</td>' +
-                '<td>' + (t.kbName || '-') + '</td>' +
+                '<td>' + escapeHtml(t.kbName || '-') + '</td>' +
                 '<td>' + (t.version || 1) + '</td>' +
                 '<td><span class="status-badge" style="background:' + st[1] + '20;color:' + st[1] + ';">' + st[0] + '</span></td>' +
                 '<td>' + (t.successChunk || 0) + ' / ' + (t.totalChunk || 0) + '</td>' +
                 '<td>' + progCell + '</td>' +
                 '<td>' + cost + '</td>' +
                 '<td>' + ctime + '</td>' +
-                '<td style="text-align:center;"><button onclick="showTaskDetail(\'' + taskNo + '\')" style="background:none;border:1px solid rgba(99,102,241,0.4);color:#a5b4fc;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(99,102,241,0.15)\'" onmouseout="this.style.background=\'none\'">详情</button></td>' +
+                '<td style="text-align:center;"><button onclick="showTaskDetail(\'' + taskNoAttr + '\')" style="background:none;border:1px solid rgba(99,102,241,0.4);color:#a5b4fc;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(99,102,241,0.15)\'" onmouseout="this.style.background=\'none\'">详情</button></td>' +
                 '</tr>';
         }).join('');
 
@@ -1336,7 +1363,7 @@
             html += '</div>';
             html += '<div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:6px;">' + renderStageBars(t) + '</div>';
             if (t.errorMessage) {
-                html += '<div style="margin-top:14px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;font-size:13px;word-break:break-all;">错误信息：' + t.errorMessage + '</div>';
+                html += '<div style="margin-top:14px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;font-size:13px;word-break:break-all;">错误信息：' + escapeHtml(t.errorMessage) + '</div>';
             }
             body.innerHTML = html;
         } catch (err) {
@@ -1384,17 +1411,20 @@
             const rows = data.data.map(u => {
                 const roleTags = (u.roles || []).map(r =>
                     '<span style="display:inline-block;font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(99,102,241,0.15);color:#a5b4fc;margin:2px;">' +
-                    (r.code === 'ADMIN' ? '🛡️ ' : '') + (r.name || r.code) + '</span>'
+                    (r.code === 'ADMIN' ? '🛡️ ' : '') + escapeHtml(r.name || r.code) + '</span>'
                 ).join('') || '<span style="color:#64748b;font-size:13px;">未分配</span>';
                 const statusTag = u.status === 1
                     ? '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(52,211,153,0.15);color:#34d399;">启用</span>'
                     : '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:rgba(239,68,68,0.15);color:#f87171;">禁用</span>';
                 const ctime = u.createTime ? new Date(u.createTime).toLocaleString('zh-CN') : '-';
-                const uname = (u.username || '').replace(/'/g, "\\'");
+                const uname = attrFor(u.username || '');
+                const unameDisplay = escapeHtml(u.username || '-');
+                const nicknameDisplay = escapeHtml(u.nickname || '-');
+                const emailDisplay = escapeHtml(u.email || '-');
                 return '<tr>' +
-                    '<td style="font-weight:600;">' + (u.username || '-') + '</td>' +
-                    '<td>' + (u.nickname || '-') + '</td>' +
-                    '<td>' + (u.email || '-') + '</td>' +
+                    '<td style="font-weight:600;">' + unameDisplay + '</td>' +
+                    '<td>' + nicknameDisplay + '</td>' +
+                    '<td>' + emailDisplay + '</td>' +
                     '<td>' + statusTag + '</td>' +
                     '<td>' + roleTags + '</td>' +
                     '<td>' + ctime + '</td>' +
@@ -1430,7 +1460,7 @@
             });
             const data = await res.json();
             if (data.success) {
-                resultEl.innerHTML = '<span style="color:#34d399;">✅ 用户「' + username + '」创建成功，初始密码请告知用户及时修改</span>';
+                resultEl.innerHTML = '<span style="color:#34d399;">✅ 用户「' + escapeHtml(username) + '」创建成功，初始密码请告知用户及时修改</span>';
                 document.getElementById('newUsername').value = '';
                 document.getElementById('newPassword').value = '';
                 document.getElementById('newNickname').value = '';
@@ -1522,8 +1552,8 @@
                 const disabled = r.code === 'ADMIN' && !checked ? ' disabled' : '';
                 return '<label style="display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid rgba(255,255,255,0.06);border-radius:10px;cursor:pointer;background:rgba(255,255,255,0.02);">' +
                     '<input type="checkbox" class="role-check" value="' + r.id + '"' + checked + disabled + ' style="width:16px;height:16px;accent-color:#6366f1;cursor:pointer;">' +
-                    '<div style="flex:1;"><div style="font-weight:600;font-size:14px;">' + (r.name || r.code) + '</div>' +
-                    '<div style="color:#64748b;font-size:12px;">' + r.code + (r.remark ? ' · ' + r.remark : '') + '</div></div>' +
+                    '<div style="flex:1;"><div style="font-weight:600;font-size:14px;">' + escapeHtml(r.name || r.code) + '</div>' +
+                    '<div style="color:#64748b;font-size:12px;">' + escapeHtml(r.code) + (r.remark ? ' · ' + escapeHtml(r.remark) : '') + '</div></div>' +
                     '</label>';
             }).join('') || '<div style="color:#64748b;text-align:center;padding:20px 0;">暂无可分配的角色，请先在「角色管理」中创建</div>';
             document.getElementById('roleAssignList').innerHTML = html;
@@ -1577,12 +1607,12 @@
                 const isAdminRole = r.code === 'ADMIN';
                 const delBtn = isAdminRole
                     ? '<span style="color:#475569;font-size:12px;">内置</span>'
-                    : '<button onclick="deleteRole(' + r.id + ', \'' + (r.code || '').replace(/'/g, "\\'") + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;">删除</button>';
+                    : '<button onclick="deleteRole(' + r.id + ', \'' + attrFor(r.code || '') + '\')" style="background:none;border:1px solid rgba(239,68,68,0.4);color:#f87171;padding:4px 10px;border-radius:6px;cursor:pointer;font-size:13px;">删除</button>';
                 const ctime = r.createTime ? new Date(r.createTime).toLocaleString('zh-CN') : '-';
                 return '<tr>' +
-                    '<td style="font-weight:600;">' + (isAdminRole ? '🛡️ ' : '') + (r.code || '-') + '</td>' +
-                    '<td>' + (r.name || '-') + '</td>' +
-                    '<td>' + (r.remark || '-') + '</td>' +
+                    '<td style="font-weight:600;">' + (isAdminRole ? '🛡️ ' : '') + escapeHtml(r.code || '-') + '</td>' +
+                    '<td>' + escapeHtml(r.name || '-') + '</td>' +
+                    '<td>' + escapeHtml(r.remark || '-') + '</td>' +
                     '<td>' + (r.userCount || 0) + '</td>' +
                     '<td>' + ctime + '</td>' +
                     '<td style="text-align:center;">' + delBtn + '</td>' +
@@ -1611,7 +1641,7 @@
             });
             const data = await res.json();
             if (data.success) {
-                resultEl.innerHTML = '<span style="color:#34d399;">✅ 角色「' + name + '」创建成功</span>';
+                resultEl.innerHTML = '<span style="color:#34d399;">✅ 角色「' + escapeHtml(name) + '」创建成功</span>';
                 document.getElementById('roleCode').value = '';
                 document.getElementById('roleName').value = '';
                 document.getElementById('roleRemark').value = '';
@@ -1675,10 +1705,13 @@
             const rows = data.data.map(m => {
                 const rn = roleNameMap[m.role] || [m.role, '#94a3b8'];
                 const isOwner = m.role === 'OWNER';
-                const uname = (m.username || '').replace(/'/g, "\\'");
+                const uname = attrFor(m.username || '');
+                const memberName = escapeHtml(m.nickname || m.username || '未知用户');
+                const memberUser = escapeHtml(m.username || '');
+                const grantUser = escapeHtml(m.grantUser || '-');
                 return '<div style="display:flex;justify-content:space-between;align-items:center;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.05);">' +
-                    '<div><div style="font-weight:600;">' + (m.nickname || m.username || '未知用户') + ' <span style="color:#64748b;font-weight:400;font-size:13px;">@' + (m.username || '') + '</span></div>' +
-                    '<div style="font-size:12px;color:#64748b;margin-top:3px;">授权人: ' + (m.grantUser || '-') + '</div></div>' +
+                    '<div><div style="font-weight:600;">' + memberName + ' <span style="color:#64748b;font-weight:400;font-size:13px;">@' + memberUser + '</span></div>' +
+                    '<div style="font-size:12px;color:#64748b;margin-top:3px;">授权人: ' + grantUser + '</div></div>' +
                     '<div style="display:flex;align-items:center;gap:10px;">' +
                     '<span style="font-size:12px;padding:2px 10px;border-radius:20px;background:' + rn[1] + '20;color:' + rn[1] + ';">' + rn[0] + '</span>' +
                     (isOwner

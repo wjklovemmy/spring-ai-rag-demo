@@ -487,6 +487,12 @@ public class KnowledgeDocumentController {
             knowledgeDocumentService.deleteDocument(id);
             kbAuthorizationService.audit("DELETE_DOC", doc.getKnowledgeId(), id, "删除文档 " + doc.getFileName());
             return ResponseEntity.ok(Map.of("success", true, "message", "文档已删除"));
+        } catch (IllegalStateException e) {
+            // 业务冲突：文档仍有待处理/处理中的 Embedding 任务，拒绝删除（409 而非 500）
+            log.warn("删除文档被拒绝: id={}, 原因={}", id, e.getMessage());
+            return ResponseEntity.status(409).body(Map.of(
+                    "success", false, "message", e.getMessage()
+            ));
         } catch (Exception e) {
             log.error("删除文档失败: id={}", id, e);
             return ResponseEntity.internalServerError().body(Map.of(

@@ -392,8 +392,13 @@ public abstract class KnowledgeDocumentService {
             // 9. 新版本入库成功后，将同名旧版本标记过期时间（平滑下线）
             deprecateOldVersions(docEntity.getKnowledgeId(), docEntity);
 
-            // 10. 更新任务为成功（successChunk 含增量跳过数）
+            // 10. 更新任务为成功（successChunk 含增量跳过数）。
+            //     分阶段进度统一置 100：即使本次全增量跳过（无新增/补齐 chunk），
+            //     各阶段实际已完成，避免"任务成功但进度条全 0"的困惑展示。
             task.setStatus(KnowledgeEmbeddingTaskStatus.SUCCESS);
+            task.setChunkProgress(100);
+            task.setEmbedProgress(100);
+            task.setMilvusProgress(100);
             task.setSuccessChunk(skipCount + vectorCount);
             task.setFailChunk(Math.max(0, chunks.size() - skipCount - vectorCount));
             task.setFinishTime(new Date());
@@ -509,6 +514,20 @@ public abstract class KnowledgeDocumentService {
         if (doc == null) {
             log.warn("删除文档时未找到记录: id={}", documentId);
             return;
+        }
+
+        // 0. 防幽灵数据：存在待处理/处理中的 Embedding 任务时拒绝删除。
+        //    异步摄取线程已持有内存中的任务对象，删除记录并不能中止它，
+        //    它仍可能在删除后重新插入 chunk 并写入 Milvus 向量，
+        //    产生无法从文档维度回收的残留数据。
+        long runningTaskCount = knowledgeEmbeddingTaskService.lambdaQuery()
+                .eq(KnowledgeEmbeddingTaskEntity::getDocumentId, documentId)
+                .in(KnowledgeEmbeddingTaskEntity::getStatus,
+                        KnowledgeEmbeddingTaskStatus.PENDING, KnowledgeEmbeddingTaskStatus.PROCESSING)
+                .count();
+        if (runningTaskCount > 0) {
+            log.warn("拒绝删除文档: id={}, 存在处理中的 Embedding 任务数={}", documentId, runningTaskCount);
+            throw new IllegalStateException("文档正在处理中，无法删除，请稍后再试");
         }
 
         log.info("开始删除文档: id={}, fileName={}, knowledgeBaseId={}", documentId, doc.getFileName(), doc.getKnowledgeId());

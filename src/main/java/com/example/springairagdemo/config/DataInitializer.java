@@ -46,14 +46,18 @@ public class DataInitializer implements ApplicationRunner {
     }
 
     /**
-     * 服务重启后，恢复上次中断的"处理中"（status=1）任务：
-     * 以增量方式重新入队执行 —— 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，
-     * 只补齐缺失或内容变化的片段，避免重复解析/切分/embedding/写入；
-     * 恢复失败（如解析异常）则标记为失败，避免任务永远卡在中间状态。
+     * 服务重启后，恢复上次中断的任务：
+     * 同时覆盖"待处理"（status=0）与"处理中"（status=1）——
+     * 若 JVM 在任务保存为 PENDING 后、异步线程实际开始前崩溃，仅恢复 PROCESSING 会漏掉它，
+     * 导致任务永远卡在"待处理"。恢复以增量方式重新入队执行：
+     * 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段，
+     * 避免重复解析/切分/embedding/写入；恢复失败（如解析异常）则标记为失败，
+     * 避免任务永远卡在中间状态。
      */
     private void recoverInterruptedTasks() {
         List<KnowledgeEmbeddingTaskEntity> interrupted = knowledgeEmbeddingTaskService.lambdaQuery()
-                .eq(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PROCESSING)
+                .in(KnowledgeEmbeddingTaskEntity::getStatus,
+                        KnowledgeEmbeddingTaskStatus.PENDING, KnowledgeEmbeddingTaskStatus.PROCESSING)
                 .list();
         if (interrupted.isEmpty()) {
             return;
