@@ -321,6 +321,14 @@
         文档列表
     </button>
 
+    <button class="nav-item" onclick="switchTab(this, 'tasks')">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 6 12 12 16 14"/>
+        </svg>
+        任务列表
+    </button>
+
     <button class="nav-item" onclick="switchTab(this, 'kb')">
         <svg viewBox="0 0 24 24" fill="none" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
             <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
@@ -479,6 +487,57 @@
             <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;overflow:auto;">
                 <div id="docListContainer" style="min-height:200px;padding:16px;">
                     <div style="text-align:center;color:#64748b;padding:60px 0;">点击"查询"加载文档列表</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 任务列表 Tab -->
+        <div id="tab-tasks" class="tab-content" style="display:none;">
+            <!-- 筛选条件 -->
+            <div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin-bottom:20px;">
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">知识库</label>
+                    <select id="taskKbFilter"
+                            style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:200px;">
+                        <option value="">全部知识库</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">状态</label>
+                    <select id="taskStatusFilter"
+                            style="height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;cursor:pointer;min-width:130px;">
+                        <option value="">全部状态</option>
+                        <option value="0">待处理</option>
+                        <option value="1">处理中</option>
+                        <option value="2">成功</option>
+                        <option value="3">失败</option>
+                    </select>
+                </div>
+                <div>
+                    <label style="display:block;color:#94a3b8;font-size:13px;margin-bottom:6px;">关键词</label>
+                    <input type="text" id="taskKeyword" placeholder="任务号 / 文档名..."
+                           style="width:260px;height:42px;padding:0 14px;background:rgba(255,255,255,0.04);border:1px solid rgba(255,255,255,0.08);border-radius:10px;color:#e2e8f0;font-size:14px;outline:none;"
+                           onkeydown="if(event.key==='Enter') loadTaskList()">
+                </div>
+                <button onclick="loadTaskList()"
+                        style="height:42px;padding:0 24px;border:none;border-radius:10px;background:linear-gradient(135deg,#6366f1,#8b5cf6);color:#fff;font-size:14px;font-weight:600;cursor:pointer;">
+                    查询
+                </button>
+                <button onclick="resetTaskFilter()"
+                        style="height:42px;padding:0 18px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.04);color:#94a3b8;cursor:pointer;font-size:14px;">
+                    重置
+                </button>
+                <label style="display:flex;align-items:center;gap:6px;color:#94a3b8;font-size:13px;height:42px;cursor:pointer;white-space:nowrap;"
+                       title="有进行中的任务时每 2 秒自动刷新">
+                    <input type="checkbox" id="taskAutoRefresh" checked style="width:15px;height:15px;accent-color:#6366f1;cursor:pointer;">
+                    自动刷新
+                </label>
+            </div>
+
+            <!-- 结果表格 -->
+            <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;overflow:auto;">
+                <div id="taskListContainer" style="min-height:200px;padding:16px;">
+                    <div style="text-align:center;color:#64748b;padding:60px 0;">加载中...</div>
                 </div>
             </div>
         </div>
@@ -677,6 +736,23 @@
     </div>
 </div>
 
+<!-- 任务详情弹窗 -->
+<div id="taskDetailModal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:1000;align-items:center;justify-content:center;">
+    <div style="background:#151530;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;width:560px;max-width:92vw;max-height:85vh;overflow-y:auto;">
+        <h3 style="font-size:18px;margin-bottom:6px;">任务详情 <span id="taskDetailNo" style="color:#a5b4fc;font-family:Consolas,monospace;"></span></h3>
+        <div style="color:#94a3b8;font-size:13px;margin-bottom:16px;">各阶段处理进度与任务执行信息</div>
+        <div id="taskDetailBody" style="min-height:100px;">
+            <div style="text-align:center;color:#64748b;padding:30px 0;">加载中...</div>
+        </div>
+        <div style="display:flex;justify-content:flex-end;margin-top:20px;">
+            <button onclick="closeTaskDetail()"
+                    style="padding:10px 20px;border:1px solid rgba(255,255,255,0.1);border-radius:10px;background:rgba(255,255,255,0.04);color:#94a3b8;cursor:pointer;font-size:14px;">
+                关闭
+            </button>
+        </div>
+    </div>
+</div>
+
 <script>
     // ====== Toast 提示 ======
     function showToast(msg, type) {
@@ -754,16 +830,24 @@
     }
 
     // ---- Tab 切换 ----
+    let taskPollTimer = null; // 任务列表自动刷新定时器
+
     function switchTab(el, tab) {
+        // 离开任务列表时停止轮询
+        if (tab !== 'tasks' && taskPollTimer) {
+            clearTimeout(taskPollTimer);
+            taskPollTimer = null;
+        }
         document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
         el.classList.add('active');
         document.querySelectorAll('.tab-content').forEach(t => t.style.display = 'none');
         document.getElementById('tab-' + tab).style.display = 'block';
-        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表', kb: '知识库管理', users: '用户管理', roles: '角色管理' };
+        const titles = { home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表', tasks: '任务列表', kb: '知识库管理', users: '用户管理', roles: '角色管理' };
         document.getElementById('pageTitle').textContent = titles[tab];
         if (tab === 'kb') loadKnowledgeBases();
         if (tab === 'chat' || tab === 'upload') loadKbSelectors();
         if (tab === 'docs') loadDocKbFilter();
+        if (tab === 'tasks') { loadTaskKbFilter(); loadTaskList(); }
         if (tab === 'users') loadUsers();
         if (tab === 'roles') loadRoles();
     }
@@ -1109,6 +1193,161 @@
         loadDocList();
     }
     // ====== 文档列表 END ======
+
+    // ====== 任务列表 ======
+    const taskStatusMap = {
+        0: ['待处理', '#94a3b8'],
+        1: ['处理中', '#fbbf24'],
+        2: ['成功', '#34d399'],
+        3: ['失败', '#f87171']
+    };
+
+    async function loadTaskKbFilter() {
+        try {
+            const res = await fetchApi('/api/knowledge-document/knowledge-bases');
+            const data = await res.json();
+            if (data.success && data.data) {
+                const options = data.data.map(kb => '<option value="' + kb.id + '">' + kb.name + '</option>').join('');
+                document.getElementById('taskKbFilter').innerHTML = '<option value="">全部知识库</option>' + options;
+            }
+        } catch (err) {
+            console.error('加载任务知识库筛选失败', err);
+        }
+    }
+
+    async function loadTaskList() {
+        const container = document.getElementById('taskListContainer');
+        if (taskPollTimer) {
+            clearTimeout(taskPollTimer);
+            taskPollTimer = null;
+        }
+
+        const kbId = document.getElementById('taskKbFilter').value;
+        const status = document.getElementById('taskStatusFilter').value;
+        const keyword = document.getElementById('taskKeyword').value.trim();
+
+        const params = new URLSearchParams();
+        if (kbId) params.append('knowledgeBaseId', kbId);
+        if (status) params.append('status', status);
+        if (keyword) params.append('keyword', keyword);
+
+        try {
+            const res = await fetchApi('/api/knowledge-document/tasks?' + params.toString());
+            const data = await res.json();
+
+            if (!data.success) {
+                container.innerHTML = '<div style="text-align:center;color:#f87171;padding:60px 0;">' + (data.message || '查询失败') + '</div>';
+                return;
+            }
+
+            const tasks = data.data || [];
+            if (tasks.length === 0) {
+                container.innerHTML = '<div style="text-align:center;color:#64748b;padding:60px 0;">暂无任务</div>';
+            } else {
+                container.innerHTML = buildTaskTable(tasks);
+            }
+
+            // 存在进行中的任务且开启自动刷新 -> 2 秒后继续轮询
+            const auto = document.getElementById('taskAutoRefresh').checked;
+            const hasRunning = tasks.some(t => t.status === 0 || t.status === 1);
+            if (auto && hasRunning) {
+                taskPollTimer = setTimeout(loadTaskList, 2000);
+            }
+        } catch (err) {
+            container.innerHTML = '<div style="text-align:center;color:#f87171;padding:60px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    function buildTaskTable(tasks) {
+        const rows = tasks.map(t => {
+            const st = taskStatusMap[t.status] || ['未知', '#94a3b8'];
+            const ctime = t.createTime ? new Date(t.createTime).toLocaleString('zh-CN') : '-';
+            const cost = t.costTime != null ? (t.costTime / 1000).toFixed(1) + 's' : '-';
+            const docName = (t.documentName || '-').replace(/'/g, "\\'");
+            const taskNo = (t.taskNo || '').replace(/'/g, "\\'");
+
+            // 整体进度列：成功=100%；待处理=-；其余显示成功/总 + 进度条
+            let progCell;
+            if (t.status === 2) {
+                progCell = '<span style="color:#34d399;font-weight:600;">100%</span>';
+            } else if (t.status === 0) {
+                progCell = '<span style="color:#64748b;">-</span>';
+            } else {
+                const total = t.totalChunk || 0;
+                const succ = t.successChunk || 0;
+                const ratio = total > 0 ? Math.round(succ / total * 100) : 0;
+                progCell = total > 0
+                    ? '<div style="display:flex;align-items:center;gap:8px;"><div style="width:100px;height:6px;background:rgba(255,255,255,0.08);border-radius:3px;overflow:hidden;"><div style="width:' + ratio + '%;height:100%;background:#6366f1;"></div></div><span style="color:#94a3b8;font-size:12px;">' + ratio + '%</span></div>'
+                    : '<span style="color:#64748b;">-</span>';
+            }
+
+            return '<tr>' +
+                '<td style="font-family:Consolas,Menlo,monospace;font-size:13px;color:#818cf8;white-space:nowrap;">' + (t.taskNo || '-') + '</td>' +
+                '<td style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="' + docName + '">' + docName + '</td>' +
+                '<td>' + (t.kbName || '-') + '</td>' +
+                '<td>' + (t.version || 1) + '</td>' +
+                '<td><span class="status-badge" style="background:' + st[1] + '20;color:' + st[1] + ';">' + st[0] + '</span></td>' +
+                '<td>' + (t.successChunk || 0) + ' / ' + (t.totalChunk || 0) + '</td>' +
+                '<td>' + progCell + '</td>' +
+                '<td>' + cost + '</td>' +
+                '<td>' + ctime + '</td>' +
+                '<td style="text-align:center;"><button onclick="showTaskDetail(\'' + taskNo + '\')" style="background:none;border:1px solid rgba(99,102,241,0.4);color:#a5b4fc;padding:4px 12px;border-radius:6px;cursor:pointer;font-size:13px;transition:all 0.2s;" onmouseover="this.style.background=\'rgba(99,102,241,0.15)\'" onmouseout="this.style.background=\'none\'">详情</button></td>' +
+                '</tr>';
+        }).join('');
+
+        return '<table class="doc-table">' +
+            '<thead><tr>' +
+            '<th>任务号</th><th>文档名称</th><th>知识库</th><th>版本</th><th>状态</th><th>Chunk 成功/总</th><th>整体进度</th><th>耗时</th><th>创建时间</th><th style="text-align:center;">操作</th>' +
+            '</tr></thead>' +
+            '<tbody>' + rows + '</tbody>' +
+            '</table>';
+    }
+
+    function resetTaskFilter() {
+        document.getElementById('taskKbFilter').value = '';
+        document.getElementById('taskStatusFilter').value = '';
+        document.getElementById('taskKeyword').value = '';
+        loadTaskList();
+    }
+
+    async function showTaskDetail(taskNo) {
+        document.getElementById('taskDetailModal').style.display = 'flex';
+        document.getElementById('taskDetailNo').textContent = taskNo;
+        const body = document.getElementById('taskDetailBody');
+        body.innerHTML = '<div style="text-align:center;color:#64748b;padding:30px 0;">加载中...</div>';
+        try {
+            const res = await fetchApi('/api/knowledge-document/task/' + encodeURIComponent(taskNo));
+            const data = await res.json();
+            if (!data.success || !data.data) {
+                body.innerHTML = '<div style="text-align:center;color:#f87171;padding:30px 0;">' + (data.message || '加载失败') + '</div>';
+                return;
+            }
+            const t = data.data;
+            const st = taskStatusMap[t.status] || ['未知', '#94a3b8'];
+            const kv = (label, value) => '<div style="min-width:0;"><span style="color:#64748b;font-size:13px;">' + label + '：</span><span style="color:#e2e8f0;font-size:13px;">' + value + '</span></div>';
+            let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px 20px;margin-bottom:16px;">';
+            html += kv('状态', '<span style="color:' + st[1] + ';font-weight:600;">' + st[0] + '</span>');
+            html += kv('Chunk', (t.successChunk || 0) + ' / ' + (t.totalChunk || 0) + (t.failChunk > 0 ? '（失败 ' + t.failChunk + '）' : ''));
+            html += kv('重试次数', (t.retryCount || 0));
+            html += kv('耗时', t.costTime != null ? (t.costTime / 1000).toFixed(1) + 's' : '-');
+            html += kv('创建时间', t.createTime ? new Date(t.createTime).toLocaleString('zh-CN') : '-');
+            html += kv('开始时间', t.startTime ? new Date(t.startTime).toLocaleString('zh-CN') : '-');
+            html += kv('结束时间', t.finishTime ? new Date(t.finishTime).toLocaleString('zh-CN') : '-');
+            html += '</div>';
+            html += '<div style="border-top:1px solid rgba(255,255,255,0.06);padding-top:6px;">' + renderStageBars(t) + '</div>';
+            if (t.errorMessage) {
+                html += '<div style="margin-top:14px;padding:10px 12px;border-radius:8px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);color:#f87171;font-size:13px;word-break:break-all;">错误信息：' + t.errorMessage + '</div>';
+            }
+            body.innerHTML = html;
+        } catch (err) {
+            body.innerHTML = '<div style="text-align:center;color:#f87171;padding:30px 0;">加载失败，请重试</div>';
+        }
+    }
+
+    function closeTaskDetail() {
+        document.getElementById('taskDetailModal').style.display = 'none';
+    }
+    // ====== 任务列表 END ======
 
     async function deleteKnowledgeBase(id) {
         if (!confirm('确定要删除该知识库吗？此操作不可恢复。')) return;

@@ -38,6 +38,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * 知识文档 REST API
@@ -157,6 +159,108 @@ public class KnowledgeDocumentController {
         item.put("finishTime", task.getFinishTime());
         item.put("createTime", task.getCreateTime());
         return ResponseEntity.ok(Map.of("success", true, "data", item));
+    }
+
+    /**
+     * 查询 Embedding 任务列表（强制按当前用户可见知识库过滤）
+     *
+     * @param knowledgeBaseId 知识库 ID（可选，指定时必须是当前用户可见）
+     * @param status          任务状态（可选，0待处理 1处理中 2成功 3失败）
+     * @param keyword         任务号 / 文档名模糊搜索（可选）
+     */
+    @GetMapping("/tasks")
+    public ResponseEntity<Map<String, Object>> tasks(
+            @RequestParam(required = false) Long knowledgeBaseId,
+            @RequestParam(required = false) Integer status,
+            @RequestParam(required = false) String keyword) {
+
+        List<Long> visible = kbAuthorizationService.visibleKbIds(); // null = 全部可见（ADMIN）
+
+        // 可见性前置拦截：无任何可见知识库 / 指定知识库不可见
+        if (visible != null && (visible.isEmpty()
+                || (knowledgeBaseId != null && !visible.contains(knowledgeBaseId)))) {
+            return ResponseEntity.ok(Map.of("success", true, "total", 0, "data", List.of()));
+        }
+
+        // 1. 查询任务（按创建时间倒序，最新 100 条）
+        LambdaQueryWrapper<KnowledgeEmbeddingTaskEntity> wrapper = new LambdaQueryWrapper<>();
+        KnowledgeEmbeddingTaskStatus statusEnum = KnowledgeEmbeddingTaskStatus.fromCode(status);
+        wrapper.eq(statusEnum != null, KnowledgeEmbeddingTaskEntity::getStatus, statusEnum);
+        if (keyword != null && !keyword.isBlank()) {
+            // 任务号模糊 OR 文档名匹配（文档名匹配需先查文档表得到 documentId 集合）
+            List<Long> matchedDocIds = knowledgeDocumentEntityService.lambdaQuery()
+                    .like(KnowledgeDocumentEntity::getFileName, keyword)
+                    .list()
+                    .stream()
+                    .map(KnowledgeDocumentEntity::getId)
+                    .toList();
+            wrapper.and(w -> {
+                w.like(KnowledgeEmbeddingTaskEntity::getTaskNo, keyword);
+                if (!matchedDocIds.isEmpty()) {
+                    w.or().in(KnowledgeEmbeddingTaskEntity::getDocumentId, matchedDocIds);
+                }
+            });
+        }
+        wrapper.orderByDesc(KnowledgeEmbeddingTaskEntity::getCreateTime).last("LIMIT 100");
+        List<KnowledgeEmbeddingTaskEntity> tasks = knowledgeEmbeddingTaskService.list(wrapper);
+        if (tasks.isEmpty()) {
+            return ResponseEntity.ok(Map.of("success", true, "total", 0, "data", List.of()));
+        }
+
+        // 2. 批量关联文档与知识库（避免 N+1 查询）
+        Set<Long> docIds = tasks.stream()
+                .map(KnowledgeEmbeddingTaskEntity::getDocumentId)
+                .collect(Collectors.toSet());
+        Map<Long, KnowledgeDocumentEntity> docMap = knowledgeDocumentEntityService.listByIds(docIds).stream()
+                .collect(Collectors.toMap(KnowledgeDocumentEntity::getId, d -> d));
+        Set<Long> kbIds = docMap.values().stream()
+                .map(KnowledgeDocumentEntity::getKnowledgeId)
+                .collect(Collectors.toSet());
+        Map<Long, String> kbNameMap = knowledgeBaseService.listByIds(kbIds).stream()
+                .collect(Collectors.toMap(KnowledgeBaseEntity::getId, KnowledgeBaseEntity::getName));
+
+        // 3. 组装结果 + 按可见知识库过滤（数据源头防泄露）
+        List<Map<String, Object>> result = new ArrayList<>();
+        for (KnowledgeEmbeddingTaskEntity task : tasks) {
+            KnowledgeDocumentEntity doc = docMap.get(task.getDocumentId());
+            if (doc == null) {
+                continue; // 文档已被删除，任务数据孤立
+            }
+            if (knowledgeBaseId != null && !knowledgeBaseId.equals(doc.getKnowledgeId())) {
+                continue;
+            }
+            if (visible != null && !visible.contains(doc.getKnowledgeId())) {
+                continue;
+            }
+            Map<String, Object> item = new LinkedHashMap<>();
+            item.put("taskId", task.getId());
+            item.put("taskNo", task.getTaskNo());
+            item.put("documentId", doc.getId());
+            item.put("documentName", doc.getFileName());
+            item.put("knowledgeBaseId", doc.getKnowledgeId());
+            item.put("kbName", kbNameMap.get(doc.getKnowledgeId()));
+            item.put("version", doc.getVersion());
+            KnowledgeEmbeddingTaskStatus st = task.getStatus();
+            item.put("status", st == null ? null : st.getCode());
+            item.put("statusText", statusText(st));
+            item.put("totalChunk", task.getTotalChunk());
+            item.put("successChunk", task.getSuccessChunk());
+            item.put("failChunk", task.getFailChunk());
+            item.put("parseProgress", nvl(task.getParseProgress()));
+            item.put("splitProgress", nvl(task.getSplitProgress()));
+            item.put("chunkProgress", nvl(task.getChunkProgress()));
+            item.put("embedProgress", nvl(task.getEmbedProgress()));
+            item.put("milvusProgress", nvl(task.getMilvusProgress()));
+            item.put("retryCount", task.getRetryCount());
+            item.put("errorMessage", task.getErrorMessage());
+            item.put("costTime", task.getCostTime());
+            item.put("startTime", task.getStartTime());
+            item.put("finishTime", task.getFinishTime());
+            item.put("createTime", task.getCreateTime());
+            result.add(item);
+        }
+
+        return ResponseEntity.ok(Map.of("success", true, "total", result.size(), "data", result));
     }
 
     private String statusText(KnowledgeEmbeddingTaskStatus status) {
