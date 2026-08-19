@@ -173,36 +173,25 @@
             border-radius: 8px;
             font-size: 13px;
             margin-top: 12px;
-            display: none;
         }
 
         .alert.error {
-            display: block;
             background: rgba(239, 83, 80, 0.15);
             color: #ef5350;
             border: 1px solid rgba(239, 83, 80, 0.25);
         }
 
         .alert.success {
-            display: block;
             background: rgba(102, 187, 106, 0.15);
             color: #66bb6a;
             border: 1px solid rgba(102, 187, 106, 0.25);
-        }
-
-        .register-extra {
-            display: none;
-        }
-
-        .register-extra.show {
-            display: block;
         }
     </style>
 </head>
 <body>
 <div id="particles-js"></div>
 
-<div class="login-container">
+<div id="app" class="login-container">
     <div class="card">
         <div class="logo">
             <div class="logo-icon">🧠</div>
@@ -211,52 +200,57 @@
         </div>
 
         <div class="tabs">
-            <button id="tab-login" class="active" onclick="switchTab('login')">登 录</button>
-            <button id="tab-register" onclick="switchTab('register')">注 册</button>
+            <button :class="{ active: tab === 'login' }" @click="switchTab('login')">登 录</button>
+            <button :class="{ active: tab === 'register' }" @click="switchTab('register')">注 册</button>
         </div>
 
         <!-- 登录表单 -->
-        <div id="form-login">
+        <div v-show="tab === 'login'" @keydown.enter="handleLogin">
             <div class="form-group">
                 <label>用户名</label>
-                <input type="text" id="login-username" placeholder="请输入用户名" autocomplete="username">
+                <input type="text" v-model.trim="loginForm.username" placeholder="请输入用户名" autocomplete="username">
             </div>
             <div class="form-group">
                 <label>密 码</label>
-                <input type="password" id="login-password" placeholder="请输入密码" autocomplete="current-password">
+                <input type="password" v-model="loginForm.password" placeholder="请输入密码" autocomplete="current-password">
             </div>
-            <button class="btn btn-primary" onclick="handleLogin()" id="login-btn">登 录</button>
+            <button class="btn btn-primary" :disabled="submitting" @click="handleLogin">
+                {{ submitting ? '登录中...' : '登 录' }}
+            </button>
         </div>
 
         <!-- 注册表单 -->
-        <div id="form-register" style="display:none;">
+        <div v-show="tab === 'register'" @keydown.enter="handleRegister">
             <div class="form-group">
                 <label>用户名 <span style="color:#ef5350">*</span></label>
-                <input type="text" id="reg-username" placeholder="请输入用户名" autocomplete="off">
+                <input type="text" v-model.trim="regForm.username" placeholder="请输入用户名" autocomplete="off">
             </div>
-            <div class="form-group register-extra">
+            <div class="form-group">
                 <label>昵称</label>
-                <input type="text" id="reg-nickname" placeholder="输入显示昵称（可选）" autocomplete="off">
+                <input type="text" v-model.trim="regForm.nickname" placeholder="输入显示昵称（可选）" autocomplete="off">
             </div>
-            <div class="form-group register-extra">
+            <div class="form-group">
                 <label>邮箱</label>
-                <input type="email" id="reg-email" placeholder="请输入邮箱（可选）" autocomplete="off">
+                <input type="email" v-model.trim="regForm.email" placeholder="请输入邮箱（可选）" autocomplete="off">
             </div>
             <div class="form-group">
                 <label>密 码 <span style="color:#ef5350">*</span></label>
-                <input type="password" id="reg-password" placeholder="至少 6 位密码" autocomplete="new-password">
+                <input type="password" v-model="regForm.password" placeholder="至少 6 位密码" autocomplete="new-password">
             </div>
             <div class="form-group">
                 <label>确认密码 <span style="color:#ef5350">*</span></label>
-                <input type="password" id="reg-password2" placeholder="再次输入密码" autocomplete="new-password">
+                <input type="password" v-model="regForm.password2" placeholder="再次输入密码" autocomplete="new-password">
             </div>
-            <button class="btn btn-primary" onclick="handleRegister()" id="reg-btn">注 册</button>
+            <button class="btn btn-primary" :disabled="submitting" @click="handleRegister">
+                {{ submitting ? '注册中...' : '注 册' }}
+            </button>
         </div>
 
-        <div id="alert-box" class="alert"></div>
+        <div v-if="alertMsg" class="alert" :class="alertType">{{ alertMsg }}</div>
     </div>
 </div>
 
+<script src="/js/vue.global.prod.js"></script>
 <script>
     // --- Particles.js 背景动画 ---
     particlesJS('particles-js', {
@@ -277,149 +271,120 @@
         retina_detect: true
     });
 
-    let currentTab = 'login';
+    const { createApp } = Vue;
 
-    // 如果已有有效 Token，直接跳转到首页
-    function checkExistingToken() {
-        const token = localStorage.getItem('token');
-        if (token) {
-            // 快速验证 Token 是否仍然有效
-            fetch('/api/user', {
-                headers: {'Authorization': 'Bearer ' + token}
-            }).then(res => {
-                if (res.ok) {
-                    window.location.href = '/index.html';
-                } else {
-                    localStorage.removeItem('token');
+    createApp({
+        data() {
+            return {
+                tab: 'login',
+                submitting: false,
+                alertMsg: '',
+                alertType: '',
+                loginForm: { username: '', password: '' },
+                regForm: { username: '', nickname: '', email: '', password: '', password2: '' }
+            };
+        },
+        mounted() {
+            this.checkExistingToken();
+        },
+        methods: {
+            // 如果已有有效 Token，直接跳转到首页
+            checkExistingToken() {
+                const token = localStorage.getItem('token');
+                if (token) {
+                    fetch('/api/user', {
+                        headers: { 'Authorization': 'Bearer ' + token }
+                    }).then(res => {
+                        if (res.ok) {
+                            window.location.href = '/index.html';
+                        } else {
+                            localStorage.removeItem('token');
+                        }
+                    }).catch(() => {
+                        localStorage.removeItem('token');
+                    });
                 }
-            }).catch(() => {
-                localStorage.removeItem('token');
-            });
-        }
-    }
-    checkExistingToken();
-
-    function switchTab(tab) {
-        currentTab = tab;
-        document.getElementById('tab-login').classList.toggle('active', tab === 'login');
-        document.getElementById('tab-register').classList.toggle('active', tab === 'register');
-        document.getElementById('form-login').style.display = tab === 'login' ? '' : 'none';
-        document.getElementById('form-register').style.display = tab === 'register' ? '' : 'none';
-        document.getElementById('alert-box').className = 'alert';
-        document.getElementById('alert-box').style.display = 'none';
-    }
-
-    function showAlert(msg, type) {
-        const box = document.getElementById('alert-box');
-        box.textContent = msg;
-        box.className = 'alert ' + type;
-        box.style.display = 'block';
-    }
-
-    function hideAlert() {
-        document.getElementById('alert-box').style.display = 'none';
-        document.getElementById('alert-box').className = 'alert';
-    }
-
-    // 登录
-    async function handleLogin() {
-        hideAlert();
-        const username = document.getElementById('login-username').value.trim();
-        const password = document.getElementById('login-password').value;
-
-        if (!username || !password) {
-            showAlert('请输入用户名和密码', 'error');
-            return;
-        }
-
-        const btn = document.getElementById('login-btn');
-        btn.disabled = true;
-        btn.textContent = '登录中...';
-
-        try {
-            const res = await fetch('/api/login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username, password})
-            });
-            const data = await res.json();
-
-            if (res.ok && data.success) {
-                localStorage.setItem('token', data.token);
-                localStorage.setItem('username', data.username);
-                showAlert('登录成功，正在跳转...', 'success');
-                setTimeout(() => { window.location.href = '/index.html'; }, 600);
-            } else {
-                showAlert(data.message || '登录失败', 'error');
-            }
-        } catch (e) {
-            showAlert('网络错误，请稍后重试', 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = '登 录';
-        }
-    }
-
-    // 注册
-    async function handleRegister() {
-        hideAlert();
-        const username = document.getElementById('reg-username').value.trim();
-        const nickname = document.getElementById('reg-nickname').value.trim();
-        const email = document.getElementById('reg-email').value.trim();
-        const password = document.getElementById('reg-password').value;
-        const password2 = document.getElementById('reg-password2').value;
-
-        if (!username || !password) {
-            showAlert('用户名和密码不能为空', 'error');
-            return;
-        }
-        if (password.length < 6) {
-            showAlert('密码至少需要 6 位', 'error');
-            return;
-        }
-        if (password !== password2) {
-            showAlert('两次输入的密码不一致', 'error');
-            return;
-        }
-
-        const btn = document.getElementById('reg-btn');
-        btn.disabled = true;
-        btn.textContent = '注册中...';
-
-        try {
-            const res = await fetch('/api/register', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username, password, nickname, email})
-            });
-            const data = await res.json();
-
-            if (res.ok && data.success) {
-                localStorage.setItem('token', data.token);
-                localStorage.setItem('username', data.username);
-                showAlert('注册成功，正在跳转...', 'success');
-                setTimeout(() => { window.location.href = '/index.html'; }, 600);
-            } else {
-                showAlert(data.message || '注册失败', 'error');
-            }
-        } catch (e) {
-            showAlert('网络错误，请稍后重试', 'error');
-        } finally {
-            btn.disabled = false;
-            btn.textContent = '注 册';
-        }
-    }
-
-    // 回车键提交
-    document.addEventListener('keydown', function (e) {
-        if (e.key === 'Enter') {
-            if (currentTab === 'login') {
-                handleLogin();
-            } else {
-                handleRegister();
+            },
+            switchTab(tab) {
+                this.tab = tab;
+                this.alertMsg = '';
+            },
+            showAlert(msg, type) {
+                this.alertMsg = msg;
+                this.alertType = type;
+            },
+            // 登录
+            async handleLogin() {
+                if (this.submitting) return;
+                this.alertMsg = '';
+                const { username, password } = this.loginForm;
+                if (!username || !password) {
+                    this.showAlert('请输入用户名和密码', 'error');
+                    return;
+                }
+                this.submitting = true;
+                try {
+                    const res = await fetch('/api/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, password })
+                    });
+                    const data = await res.json();
+                    if (res.ok && data.success) {
+                        localStorage.setItem('token', data.token);
+                        localStorage.setItem('username', data.username);
+                        this.showAlert('登录成功，正在跳转...', 'success');
+                        setTimeout(() => { window.location.href = '/index.html'; }, 600);
+                    } else {
+                        this.showAlert(data.message || '登录失败', 'error');
+                    }
+                } catch (e) {
+                    this.showAlert('网络错误，请稍后重试', 'error');
+                } finally {
+                    this.submitting = false;
+                }
+            },
+            // 注册
+            async handleRegister() {
+                if (this.submitting) return;
+                this.alertMsg = '';
+                const { username, nickname, email, password, password2 } = this.regForm;
+                if (!username || !password) {
+                    this.showAlert('用户名和密码不能为空', 'error');
+                    return;
+                }
+                if (password.length < 6) {
+                    this.showAlert('密码至少需要 6 位', 'error');
+                    return;
+                }
+                if (password !== password2) {
+                    this.showAlert('两次输入的密码不一致', 'error');
+                    return;
+                }
+                this.submitting = true;
+                try {
+                    const res = await fetch('/api/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username, password, nickname, email })
+                    });
+                    const data = await res.json();
+                    if (res.ok && data.success) {
+                        localStorage.setItem('token', data.token);
+                        localStorage.setItem('username', data.username);
+                        this.showAlert('注册成功，正在跳转...', 'success');
+                        setTimeout(() => { window.location.href = '/index.html'; }, 600);
+                    } else {
+                        this.showAlert(data.message || '注册失败', 'error');
+                    }
+                } catch (e) {
+                    this.showAlert('网络错误，请稍后重试', 'error');
+                } finally {
+                    this.submitting = false;
+                }
             }
         }
-    });
+    }).mount('#app');
 </script>
 </body>
 </html>
