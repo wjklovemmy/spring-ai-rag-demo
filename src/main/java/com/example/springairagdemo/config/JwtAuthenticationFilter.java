@@ -26,7 +26,8 @@ public class JwtAuthenticationFilter implements Filter {
     private static final List<String> WHITELIST = Arrays.asList(
             "/api/login",
             "/api/register",
-            "/api/logout"
+            "/api/logout",
+            "/api/refresh"
     );
 
     public JwtAuthenticationFilter(JwtUtil jwtUtil) {
@@ -60,9 +61,18 @@ public class JwtAuthenticationFilter implements Filter {
             return;
         }
 
-        String token = authHeader.substring(7);
+        String token = authHeader.substring(7).trim();
+        if (token.isEmpty()) {
+            sendUnauthorized(httpResponse, "未提供认证令牌");
+            return;
+        }
         if (!jwtUtil.validateToken(token)) {
-            sendUnauthorized(httpResponse, "认证令牌无效或已过期");
+            // 区分「过期」与「无效」：前端仅对 TOKEN_EXPIRED 触发自动刷新
+            if (jwtUtil.isTokenExpired(token)) {
+                sendUnauthorized(httpResponse, "认证令牌已过期", "TOKEN_EXPIRED");
+            } else {
+                sendUnauthorized(httpResponse, "认证令牌无效", "TOKEN_INVALID");
+            }
             return;
         }
 
@@ -84,8 +94,13 @@ public class JwtAuthenticationFilter implements Filter {
     }
 
     private void sendUnauthorized(HttpServletResponse response, String message) throws IOException {
+        sendUnauthorized(response, message, "TOKEN_INVALID");
+    }
+
+    private void sendUnauthorized(HttpServletResponse response, String message, String code) throws IOException {
         response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
         response.setContentType("application/json;charset=UTF-8");
-        response.getWriter().write("{\"success\":false,\"message\":\"" + message + "\"}");
+        response.getWriter().write(
+                "{\"success\":false,\"message\":\"" + message + "\",\"code\":\"" + code + "\"}");
     }
 }

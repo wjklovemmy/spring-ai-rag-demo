@@ -288,22 +288,50 @@
             this.checkExistingToken();
         },
         methods: {
-            // 如果已有有效 Token，直接跳转到首页
+            clearAuth() {
+                localStorage.removeItem('token');
+                localStorage.removeItem('refreshToken');
+                localStorage.removeItem('username');
+            },
+            // 如果已有有效 Token，直接跳转到首页；Access Token 过期则用 Refresh Token 自动续期
             checkExistingToken() {
                 const token = localStorage.getItem('token');
-                if (token) {
-                    fetch('/api/user', {
-                        headers: { 'Authorization': 'Bearer ' + token }
-                    }).then(res => {
-                        if (res.ok) {
-                            window.location.href = '/index.html';
-                        } else {
-                            localStorage.removeItem('token');
-                        }
-                    }).catch(() => {
-                        localStorage.removeItem('token');
-                    });
+                const refreshToken = localStorage.getItem('refreshToken');
+                if (!token && !refreshToken) {
+                    return;
                 }
+                fetch('/api/user', {
+                    headers: token ? { 'Authorization': 'Bearer ' + token } : {}
+                }).then(res => {
+                    if (res.ok) {
+                        window.location.href = '/index.html';
+                    } else if (refreshToken) {
+                        this.tryRefresh(refreshToken);
+                    } else {
+                        this.clearAuth();
+                    }
+                }).catch(() => {
+                    this.clearAuth();
+                });
+            },
+            // 使用 Refresh Token 换取新双 Token，成功后跳转首页
+            tryRefresh(refreshToken) {
+                fetch('/api/refresh', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ refreshToken })
+                }).then(res => res.json()).then(data => {
+                    if (data.success) {
+                        localStorage.setItem('token', data.token);
+                        localStorage.setItem('refreshToken', data.refreshToken);
+                        localStorage.setItem('username', data.username);
+                        window.location.href = '/index.html';
+                    } else {
+                        this.clearAuth();
+                    }
+                }).catch(() => {
+                    this.clearAuth();
+                });
             },
             switchTab(tab) {
                 this.tab = tab;
@@ -332,6 +360,7 @@
                     const data = await res.json();
                     if (res.ok && data.success) {
                         localStorage.setItem('token', data.token);
+                        localStorage.setItem('refreshToken', data.refreshToken);
                         localStorage.setItem('username', data.username);
                         this.showAlert('登录成功，正在跳转...', 'success');
                         setTimeout(() => { window.location.href = '/index.html'; }, 600);
@@ -371,6 +400,7 @@
                     const data = await res.json();
                     if (res.ok && data.success) {
                         localStorage.setItem('token', data.token);
+                        localStorage.setItem('refreshToken', data.refreshToken);
                         localStorage.setItem('username', data.username);
                         this.showAlert('注册成功，正在跳转...', 'success');
                         setTimeout(() => { window.location.href = '/index.html'; }, 600);

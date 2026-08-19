@@ -275,9 +275,45 @@
             cursor: pointer;
         }
         .doc-table .doc-name:hover { text-decoration: underline; }
+
+        /* 登录校验前全屏遮罩：未登录访问时不闪现主页内容 */
+        #pageLoading {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: #0a0a1a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 16px;
+            z-index: 9999;
+        }
+        #pageLoading .spinner {
+            width: 42px;
+            height: 42px;
+            border: 3px solid rgba(99, 102, 241, 0.2);
+            border-top-color: #6366f1;
+            border-radius: 50%;
+            animation: pageSpin 0.8s linear infinite;
+        }
+        @keyframes pageSpin { to { transform: rotate(360deg); } }
+        #pageLoading .loading-text {
+            color: #94a3b8;
+            font-size: 14px;
+            letter-spacing: 2px;
+        }
     </style>
 </head>
 <body>
+
+<!-- 登录校验前遮罩：校验通过后移除，未登录直接跳转登录页 -->
+<div id="pageLoading">
+    <div class="spinner"></div>
+    <div class="loading-text">正在加载...</div>
+</div>
 
 <div class="toast-container" id="toastContainer"></div>
 
@@ -823,34 +859,110 @@
         return escapeHtml(jsEscape(str));
     }
 
-    // ---- JWT Token 管理 ----
+    // ---- JWT 双 Token 管理（Access Token + Refresh Token）----
     function getToken() { return localStorage.getItem('token'); }
+    function getRefreshToken() { return localStorage.getItem('refreshToken'); }
 
+    // 刷新请求共享 Promise：并发多个 401 时只触发一次刷新，其余请求等待同一结果
+    let refreshPromise = null;
+
+    function clearAuthAndRedirect() {
+        localStorage.removeItem('token');
+        localStorage.removeItem('refreshToken');
+        localStorage.removeItem('username');
+        window.location.href = '/login.html';
+    }
+
+    // 使用 Refresh Token 换取新双 Token（Refresh Token 每次刷新都会轮换）
+    function refreshAccessToken() {
+        if (!refreshPromise) {
+            const refreshToken = getRefreshToken();
+            if (!refreshToken) {
+                clearAuthAndRedirect();
+                return Promise.reject(new Error('no refresh token'));
+            }
+            refreshPromise = fetch('/api/refresh', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refreshToken: refreshToken })
+            }).then(res => res.json()).then(data => {
+                if (data.success) {
+                    localStorage.setItem('token', data.token);
+                    localStorage.setItem('refreshToken', data.refreshToken);
+                    return data.token;
+                }
+                throw new Error(data.message || 'refresh failed');
+            }).catch(e => {
+                clearAuthAndRedirect();
+                throw e;
+            }).finally(() => {
+                refreshPromise = null;
+            });
+        }
+        return refreshPromise;
+    }
+
+    // 统一请求入口：Access Token 过期（401）时自动用 Refresh Token 续期并重试一次
     async function fetchApi(url, options) {
         options = options || {};
         const headers = options.headers || {};
-        const authHeaders = { 'Authorization': 'Bearer ' + getToken() };
-        return fetch(url, Object.assign({}, options, { headers: Object.assign({}, headers, authHeaders) }));
+        const token = getToken();
+        if (token) {
+            headers['Authorization'] = 'Bearer ' + token;
+        }
+        let res = await fetch(url, Object.assign({}, options, { headers: headers }));
+        if (res.status === 401 && !options.noAuthRetry && getRefreshToken()) {
+            try {
+                await refreshAccessToken();
+                headers['Authorization'] = 'Bearer ' + getToken();
+                res = await fetch(url, Object.assign({}, options, { headers: headers }));
+            } catch (e) {
+                // 刷新失败已跳转登录页，原请求直接抛错
+                throw e;
+            }
+        }
+        return res;
     }
 
-    // ---- 登录状态检查 ----
+    // ---- 登录状态检查：未登录访问（含根路径 / ）直接跳转登录页 ----
     (async function checkAuth() {
-        const res = await fetchApi('/api/user');
-        if (!res.ok) {
+        try {
+            const res = await fetchApi('/api/user');
+            if (!res.ok) {
+                window.location.href = '/login.html';
+                return;
+            }
+            const data = await res.json();
+            document.getElementById('userName').textContent = data.username;
+            document.getElementById('userAvatar').textContent = data.username.charAt(0).toUpperCase();
+            // 仅 ADMIN 显示用户管理 / 角色管理入口
+            if (data.isAdmin) {
+                document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
+            }
+            // 校验通过：移除遮罩，显示页面
+            var loader = document.getElementById('pageLoading');
+            if (loader) loader.remove();
+        } catch (e) {
             window.location.href = '/login.html';
-            return;
-        }
-        const data = await res.json();
-        document.getElementById('userName').textContent = data.username;
-        document.getElementById('userAvatar').textContent = data.username.charAt(0).toUpperCase();
-        // 仅 ADMIN 显示用户管理 / 角色管理入口
-        if (data.isAdmin) {
-            document.querySelectorAll('.admin-only').forEach(el => el.style.display = '');
         }
     })();
 
+    // 登出：先通知服务端撤销 Refresh Token（之后无法再续期），再清理本地并跳转登录页。
+    // 无论接口成功与否都清理本地状态，保证一定能退出。
     async function logout() {
+        const refreshToken = getRefreshToken();
+        try {
+            await fetchApi('/api/logout', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ refreshToken: refreshToken || '' }),
+                noAuthRetry: true
+            });
+        } catch (e) {
+            // 忽略网络异常，继续清理本地
+        }
         localStorage.removeItem('token');
+        localStorage.removeItem('refreshToken');
         localStorage.removeItem('username');
         window.location.href = '/login.html';
     }

@@ -85,6 +85,17 @@ services:
       exit 0;
       "
 
+  redis:
+    container_name: knowledge-redis
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    # 开启 AOF 持久化：重启不丢 Refresh Token 会话
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
 networks:
   default:
     name: milvus
@@ -94,3 +105,4 @@ volumes:
   minio_data:
   milvus_data:
   doc_minio_data:
+  redis_data:

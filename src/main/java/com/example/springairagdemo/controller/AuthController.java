@@ -41,6 +41,7 @@ public class AuthController {
                     "success", true,
                     "message", result.message(),
                     "token", result.token(),
+                    "refreshToken", result.refreshToken(),
                     "username", result.username(),
                     "userId", result.userId()
             ));
@@ -51,7 +52,7 @@ public class AuthController {
     }
 
     /**
-     * 用户登录，返回 JWT Token
+     * 用户登录，返回 Access + Refresh 双 Token
      */
     @PostMapping("/api/login")
     public ResponseEntity<Map<String, Object>> login(@RequestBody Map<String, String> body) {
@@ -65,6 +66,30 @@ public class AuthController {
                     "success", true,
                     "message", result.message(),
                     "token", result.token(),
+                    "refreshToken", result.refreshToken(),
+                    "username", result.username(),
+                    "userId", result.userId()
+            ));
+        }
+        return ResponseEntity.status(401).body(Map.of(
+                "success", false, "message", result.message()
+        ));
+    }
+
+    /**
+     * 刷新令牌：使用 Refresh Token 换取新的 Access + Refresh Token
+     */
+    @PostMapping("/api/refresh")
+    public ResponseEntity<Map<String, Object>> refresh(@RequestBody Map<String, String> body) {
+        String refreshToken = body.get("refreshToken");
+        UserService.LoginResult result = userService.refresh(refreshToken);
+
+        if (result.success()) {
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", result.message(),
+                    "token", result.token(),
+                    "refreshToken", result.refreshToken(),
                     "username", result.username(),
                     "userId", result.userId()
             ));
@@ -93,10 +118,13 @@ public class AuthController {
     }
 
     /**
-     * 登出（JWT 无状态，前端删除本地 Token 即可）
+     * 登出：撤销 Redis 中保存的 Refresh Token（撤销后无法再续期），
+     * 前端调用后清理本地 Token 并跳转登录页。
      */
     @PostMapping("/api/logout")
-    public ResponseEntity<Map<String, Object>> logout() {
+    public ResponseEntity<Map<String, Object>> logout(@RequestBody(required = false) Map<String, String> body) {
+        String refreshToken = body != null ? body.get("refreshToken") : null;
+        userService.logout(refreshToken);
         return ResponseEntity.ok(Map.of("success", true, "message", "已登出"));
     }
 
