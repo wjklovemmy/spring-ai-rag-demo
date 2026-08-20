@@ -2,6 +2,7 @@ package com.example.springairagdemo.config;
 
 import com.example.springairagdemo.security.LoginUser;
 import com.example.springairagdemo.security.UserContext;
+import com.example.springairagdemo.service.RedisRefreshTokenService;
 import jakarta.servlet.*;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
@@ -21,6 +22,7 @@ import java.util.List;
 public class JwtAuthenticationFilter implements Filter {
 
     private final JwtUtil jwtUtil;
+    private final RedisRefreshTokenService refreshTokenService;
 
     /** 无需认证的白名单路径 */
     private static final List<String> WHITELIST = Arrays.asList(
@@ -30,8 +32,9 @@ public class JwtAuthenticationFilter implements Filter {
             "/api/refresh"
     );
 
-    public JwtAuthenticationFilter(JwtUtil jwtUtil) {
+    public JwtAuthenticationFilter(JwtUtil jwtUtil, RedisRefreshTokenService refreshTokenService) {
         this.jwtUtil = jwtUtil;
+        this.refreshTokenService = refreshTokenService;
     }
 
     @Override
@@ -73,6 +76,12 @@ public class JwtAuthenticationFilter implements Filter {
             } else {
                 sendUnauthorized(httpResponse, "认证令牌无效", "TOKEN_INVALID");
             }
+            return;
+        }
+
+        // 登出后 Access Token 已进黑名单 -> 立即失效（即使尚未到期）
+        if (refreshTokenService.isAccessTokenBlacklisted(token)) {
+            sendUnauthorized(httpResponse, "认证令牌已失效", "TOKEN_INVALID");
             return;
         }
 

@@ -9,6 +9,7 @@ import org.springframework.stereotype.Component;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.UUID;
 
 /**
  * JWT 工具类：双 Token 机制（Access Token + Refresh Token）。
@@ -61,6 +62,8 @@ public class JwtUtil {
                 .subject(String.valueOf(userId))
                 .claim("username", username)
                 .claim(CLAIM_TYPE, type)
+                // jti 唯一标识：作为 Redis 中 Refresh Token 会话的 key，支持原子消费与重放检测
+                .id(UUID.randomUUID().toString())
                 .issuedAt(now)
                 .expiration(expiry)
                 .signWith(secretKey)
@@ -135,5 +138,20 @@ public class JwtUtil {
      */
     public Date getExpiration(String token) {
         return parseToken(token).getExpiration();
+    }
+
+    /**
+     * 获取 Token 的 jti（唯一 ID），作为 Redis 中 Refresh Token 会话的 key
+     */
+    public String getJti(String token) {
+        return parseToken(token).getId();
+    }
+
+    /**
+     * 获取 Token 剩余有效秒数（黑名单 / 会话 TTL 用）
+     */
+    public long getRemainingTtlSeconds(String token) {
+        long ms = getExpiration(token).getTime() - System.currentTimeMillis();
+        return Math.max(ms / 1000, 0);
     }
 }

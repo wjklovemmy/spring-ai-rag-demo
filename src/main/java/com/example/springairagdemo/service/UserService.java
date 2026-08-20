@@ -103,28 +103,54 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
         if (!jwtUtil.validateRefreshToken(refreshToken)) {
             return LoginResult.fail("Refresh Token 无效或已过期，请重新登录");
         }
-        // Redis 撤销校验：登录态被登出 / 被轮换替换后，key 已不存在 -> 拒绝续期
-        if (!refreshTokenService.isActive(refreshToken)) {
-            return LoginResult.fail("Refresh Token 已被撤销，请重新登录");
-        }
         Long userId = jwtUtil.getUserId(refreshToken);
         String username = jwtUtil.getUsername(refreshToken);
+        String jti = jwtUtil.getJti(refreshToken);
 
-        // 轮换：旧 Refresh Token 立即作废，签发并保存新双 Token
-        refreshTokenService.revoke(refreshToken);
+        // 原子消费（GETDEL）：同一 Refresh Token 全局只能被成功消费一次，
+        // 消除「检查存在 + 删除」两步之间的并发竞态；并发刷新 / 重放时只有一个请求成功。
+        Long consumedUserId = refreshTokenService.consume(jti);
+        if (consumedUserId == null) {
+            // JWT 本身有效但 Redis 中已无记录：已被轮换 / 登出撤销 / 重放
+            log.warn("Refresh Token 已被消费或重放，拒绝续期: userId={}", userId);
+            return LoginResult.fail("Refresh Token 已被撤销，请重新登录");
+        }
+
+        // 轮换成功：旧 Refresh Token 已被原子消费，签发并保存新双 Token
         TokenPair pair = issueTokenPair(userId, username);
         log.info("用户 {} 通过 Refresh Token 续期成功", username);
         return LoginResult.ok(pair.accessToken(), pair.refreshToken(), username, userId);
     }
 
     /**
-     * 登出：撤销指定 Refresh Token（服务端强制失效，之后无法再续期）。
+     * 登出：
+     * <ol>
+     *   <li>撤销该用户的<b>全部</b> Refresh Token（含刚轮换出的新 token，杜绝登出-刷新竞态）</li>
+     *   <li>当前 Access Token 加入黑名单，立即失效（JWT 无状态的补充，TTL 到期自动清除）</li>
+     * </ol>
      * 前端无论调用成功与否都应清理本地 Token 并跳转登录页。
      */
-    public void logout(String refreshToken) {
+    public void logout(String refreshToken, String accessToken) {
         if (refreshToken != null && !refreshToken.isBlank()) {
-            refreshTokenService.revoke(refreshToken);
-            log.info("用户登出，Refresh Token 已撤销");
+            try {
+                if (jwtUtil.validateRefreshToken(refreshToken)) {
+                    Long userId = jwtUtil.getUserId(refreshToken);
+                    refreshTokenService.revokeAllByUserId(userId);
+                    log.info("用户 {} 登出，已撤销其全部 Refresh Token", userId);
+                }
+            } catch (Exception e) {
+                log.debug("登出撤销 Refresh Token 失败（忽略）: {}", e.getMessage());
+            }
+        }
+        if (accessToken != null && !accessToken.isBlank()) {
+            try {
+                long ttl = jwtUtil.getRemainingTtlSeconds(accessToken);
+                if (ttl > 0) {
+                    refreshTokenService.blacklistAccessToken(accessToken, ttl);
+                }
+            } catch (Exception e) {
+                log.debug("Access Token 加入黑名单失败（忽略）: {}", e.getMessage());
+            }
         }
     }
 
@@ -136,7 +162,8 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
                 jwtUtil.generateAccessToken(userId, username),
                 jwtUtil.generateRefreshToken(userId, username)
         );
-        refreshTokenService.saveToken(userId, pair.refreshToken(), jwtUtil.getExpiration(pair.refreshToken()));
+        refreshTokenService.saveToken(userId, jwtUtil.getJti(pair.refreshToken()),
+                jwtUtil.getRemainingTtlSeconds(pair.refreshToken()));
         return pair;
     }
 

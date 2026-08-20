@@ -947,15 +947,16 @@
         }
     })();
 
-    // 登出：先通知服务端撤销 Refresh Token（之后无法再续期），再清理本地并跳转登录页。
-    // 无论接口成功与否都清理本地状态，保证一定能退出。
+    // 登出：通知服务端撤销该用户全部 Refresh Token + 当前 Access Token 加入黑名单（立即失效），
+    // 再清理本地并跳转登录页。无论接口成功与否都清理本地状态，保证一定能退出。
     async function logout() {
+        const token = getToken();
         const refreshToken = getRefreshToken();
         try {
             await fetchApi('/api/logout', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ refreshToken: refreshToken || '' }),
+                body: JSON.stringify({ refreshToken: refreshToken || '', accessToken: token || '' }),
                 noAuthRetry: true
             });
         } catch (e) {

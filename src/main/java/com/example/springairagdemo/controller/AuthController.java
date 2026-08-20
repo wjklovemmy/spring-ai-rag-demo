@@ -118,13 +118,14 @@ public class AuthController {
     }
 
     /**
-     * 登出：撤销 Redis 中保存的 Refresh Token（撤销后无法再续期），
+     * 登出：撤销该用户全部 Refresh Token + 当前 Access Token 加入黑名单（立即失效），
      * 前端调用后清理本地 Token 并跳转登录页。
      */
     @PostMapping("/api/logout")
     public ResponseEntity<Map<String, Object>> logout(@RequestBody(required = false) Map<String, String> body) {
         String refreshToken = body != null ? body.get("refreshToken") : null;
-        userService.logout(refreshToken);
+        String accessToken = body != null ? body.get("accessToken") : null;
+        userService.logout(refreshToken, accessToken);
         return ResponseEntity.ok(Map.of("success", true, "message", "已登出"));
     }
 
