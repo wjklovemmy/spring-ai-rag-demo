@@ -36,10 +36,11 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
-| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权） |
+| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
+| 网关 | Spring Cloud Gateway 2025.0.0（gateway-server 4.3.0） | 统一入口（8081）：路由 `/api/**`、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
-| 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面 |
+| 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 8081） |
 
 ---
 
@@ -52,9 +53,13 @@ graph TB
         INDEX["index.html<br/>问答 / 上传 / 任务进度"]
     end
 
-    subgraph Backend["Spring Boot 应用"]
+    subgraph Gateway["网关 Spring Cloud Gateway :8081"]
+        GWAUTH["JwtAuthGlobalFilter<br/>JWT 校验 + Redis 黑名单 + 注入用户头"]
+    end
+
+    subgraph Backend["RAG 服务 spring-ai-rag :8080"]
         CTRL["Controller 层<br/>Auth / KnowledgeBase / KnowledgeDocument"]
-        AUTH["JWT 认证过滤器<br/>JwtAuthenticationFilter"]
+        GATE_ID["GatewayIdentityFilter<br/>校验内部令牌 → UserContext"]
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
         SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
@@ -75,8 +80,10 @@ graph TB
     AI["DeepSeek API"]
     DS["DashScope API"]
 
-    LOGIN --> CTRL
-    INDEX --> AUTH --> CTRL
+    LOGIN --> GWAUTH
+    INDEX --> GWAUTH
+    GWAUTH -->|/api/** 转发| GATE_ID
+    GATE_ID --> CTRL
     CTRL --> ASPECT --> AUTHZ --> MYSQL
     AUTHZ --> CTRL
     CTRL --> SVC
@@ -125,8 +132,8 @@ spring-ai-rag-demo/
     │   │   │   ├── MilvusConfig.java              # Milvus 客户端
     │   │   │   ├── RagConfigProperties.java       # rag.* 配置绑定（含 batch-size）
     │   │   │   ├── JwtUtil.java                   # JWT 生成/解析
-    │   │   │   ├── JwtConfig.java                 # JWT 配置属性
-    │   │   │   ├── JwtAuthenticationFilter.java   # 认证过滤器
+    │   │   │   ├── JwtConfig.java                 # JWT 配置属性（注册 GatewayIdentityFilter）
+    │   │   │   ├── GatewayIdentityFilter.java     # 校验网关内部令牌并注入登录态（UserContext）
     │   │   │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
     │   │   │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
     │   │   │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
@@ -201,14 +208,17 @@ spring-ai-rag-demo/
     │       │   └── index.html                      # 问答/上传/任务分阶段进度仪表盘
     └── test/
 ├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 8081）
-│   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM
+│   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM + jjwt 0.12.6
 │   └── src/
 │       ├── main/
 │       │   ├── java/com/example/gateway/
 │       │   │   ├── GatewayApplication.java    # 启动类 + IP 限流 KeyResolver
-│       │   │   └── filter/LoggingGlobalFilter.java # 全局访问日志过滤器
+│       │   │   ├── security/JwtUtil.java      # JWT 校验工具（secret 与 RAG 共享一致）
+│       │   │   └── filter/
+│       │   │       ├── JwtAuthGlobalFilter.java # 全局认证过滤器（白名单/黑名单/注入用户头）
+│       │   │       └── LoggingGlobalFilter.java # 全局访问日志过滤器
 │       │   └── resources/
-│       │       └── application.yaml          # 路由 / CORS / 可选 IP 限流
+│       │       └── application.yaml          # 路由 / CORS / jwt.secret / Redis / 可选 IP 限流
 │       └── test/
 ├── sql/
 │   └── init.sql                              # 全量初始化脚本（业务表 + RBAC 权限表 + 内置角色/账号）
@@ -319,26 +329,21 @@ spring-ai-rag-demo/
 
 **认证**（识别"你是谁"）：
 
+注册/登录仍由 RAG 服务签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
+
 ```
-注册  POST /api/register   username/password/nickname/email
-                             ↓
-                     UserService.register
-                     · 校验用户名唯一
-                     · BCrypt 加密密码入库
-                     · 返回 JWT Token
-
-登录  POST /api/login      username/password
-                             ↓
-                     UserService.login
-                     · BCrypt 校验密码
-                     · 生成 JWT（有效期 7 天，默认）
-
-访问  /api/**             请求头携带 Authorization: Bearer <token>
-                             ↓
-                     JwtAuthenticationFilter
-                     · 校验 Token → 构造 LoginUser → UserContext.set()
-                     · 放行 register/login/logout，拦截其余 /api/**
-                     · 请求结束 finally 中 UserContext.clear()
+访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 8081）
+                            ↓
+              网关 JwtAuthGlobalFilter（8081，GlobalFilter order=-200）
+              · 白名单放行：/api/register、/api/login、/api/logout、/api/refresh
+              · 校验 Token 签名与有效期（jjwt，secret 与 RAG 完全一致）
+              · 查 Redis 黑名单（登出/刷新后旧 Token 立即失效）
+              · 注入 X-User-Id / X-Username / X-Gateway-Token 后转发
+                            ↓
+              RAG GatewayIdentityFilter（8080）
+              · 校验 X-Gateway-Token（内部信任令牌，防绕过网关直连伪造身份）
+              · 构造 LoginUser → UserContext.set() → 进入业务鉴权（RBAC / kb_member）
+              · 请求结束 finally 中 UserContext.clear()
 ```
 
 **授权**（判定"你能做什么"）——纵深防御三层：
@@ -453,8 +458,20 @@ spring-ai-rag-demo/
 | `rag.document.chunk.semantic.threshold` | 相邻段落相似度断点阈值（默认 0.55） |
 | `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
 | `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
-| `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间 |
+| `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间（**必须与 gateway 模块完全一致**，否则网关无法校验签名） |
+| `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 侧 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
 
+**gateway 模块（`gateway/src/main/resources/application.yaml`）关键配置：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `spring.cloud.gateway.server.webflux.routes` | 路由：`/api/**` → `http://localhost:8080`（RAG 服务） |
+| `spring.cloud.gateway.server.webflux.globalcors` | 跨域：放行所有来源（页面从 8080 加载、接口走 8081） |
+| `jwt.secret` / `jwt.expiration-ms` | 与 RAG 模块一致（网关侧仅校验、不签发） |
+| `spring.data.redis.*` | 与 RAG 同一 Redis 实例（Token 黑名单） |
+| `gateway.internal-token` | 与 RAG 模块一致的内部信任令牌 |
+
+> 注意：Spring Cloud 2025.0 起 `spring.cloud.gateway.*` 配置前缀已废弃，网关配置统一使用 `spring.cloud.gateway.server.webflux.*`。
 > Rerank 复用 `spring.ai.dashscope.api-key`，无需单独配置 key；
 > OCR 需在阿里云开通"文字识别 OCR"服务，并配置 AccessKey（建议用环境变量注入）；
 > 语义切片复用 `DashScopeEmbeddingModel`（text-embedding-v3），每篇文档按段落批量向量化一次（价格极低），失败自动降级为 TokenTextSplitter。
@@ -524,16 +541,18 @@ export ALIYUN_OCR_SK=xxxx
 
 > **重要（已有数据的升级提示）**：collection 按知识库**动态创建**（`kb_{id}`），已存在时直接复用跳过，无需手工清理。由旧版本创建的 collection 若缺少 BM25 字段（`text`/`sparse`），BM25 检索路会失败并**自动降级为纯向量检索**（不再有旧 collection 兼容适配代码）；如需完整 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
 
-### 3. 启动应用
+### 3. 启动应用（两个服务都要启动）
 
-仓库根目录为聚合父工程，业务代码在子模块 `spring-ai-rag`。推荐在根目录用 `-pl` 指定子模块启动：
+仓库根目录为聚合父工程：`spring-ai-rag`（RAG 服务）与 `gateway`（网关）。**网关对外提供 8081 统一入口，RAG 服务在 8080**，需分别启动（建议开两个终端）。推荐在根目录用 `-pl` 指定子模块启动：
 
 ```bash
-# Windows（根目录）
-mvnw.cmd -pl spring-ai-rag spring-boot:run
+# 终端 1：RAG 服务（8080）
+mvnw.cmd -pl spring-ai-rag spring-boot:run     # Windows
+./mvnw -pl spring-ai-rag spring-boot:run       # Linux/macOS
 
-# Linux/macOS（根目录）
-./mvnw -pl spring-ai-rag spring-boot:run
+# 终端 2：网关（8081，对外统一入口）
+mvnw.cmd -pl gateway spring-boot:run           # Windows
+./mvnw -pl gateway spring-boot:run             # Linux/macOS
 ```
 
 也可进入子模块目录直接启动（使用仓库根目录的 Wrapper）：
@@ -542,18 +561,25 @@ mvnw.cmd -pl spring-ai-rag spring-boot:run
 cd spring-ai-rag
 ..\mvnw.cmd spring-boot:run    # Windows
 ../mvnw spring-boot:run        # Linux/macOS
+
+cd ../gateway
+..\mvnw.cmd spring-boot:run    # Windows
+../mvnw spring-boot:run        # Linux/macOS
 ```
 
 > 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
+> 仅直连调试 RAG（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
 
 ### 4. 访问页面
 
-- 登录/注册：http://localhost:8080/login.html
-- 问答/上传：http://localhost:8080/index.html
+- 页面（由 RAG 服务提供）：http://localhost:8080/login.html、http://localhost:8080/index.html
+- API（统一经网关）：http://localhost:8081/api/** —— 前端已内置 `API_BASE = 'http://localhost:8081'`，页面加载后所有接口请求自动经网关转发
 
 ---
 
 ## REST API 一览
+
+> 以下接口统一由**网关 8081** 暴露并转发至 RAG 服务（8080）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，RAG 侧 `GatewayIdentityFilter` 二次校验内部令牌。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
@@ -606,3 +632,4 @@ cd spring-ai-rag
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
 15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
+16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；RAG 服务仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 8081，CORS 由网关 `globalcors` 统一放行。

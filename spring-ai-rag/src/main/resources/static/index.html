@@ -790,6 +790,9 @@
 </div>
 
 <script>
+    // ====== 网关 API 基础地址（页面由 RAG 8080 提供，接口统一走网关 8081） ======
+    const API_BASE = 'http://localhost:8081';
+
     // ====== Toast 提示 ======
     function showToast(msg, type) {
         type = type || 'info';
@@ -881,7 +884,7 @@
                 clearAuthAndRedirect();
                 return Promise.reject(new Error('no refresh token'));
             }
-            refreshPromise = fetch('/api/refresh', {
+            refreshPromise = fetch(API_BASE + '/api/refresh', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ refreshToken: refreshToken })
@@ -910,12 +913,12 @@
         if (token) {
             headers['Authorization'] = 'Bearer ' + token;
         }
-        let res = await fetch(url, Object.assign({}, options, { headers: headers }));
+        let res = await fetch(API_BASE + url, Object.assign({}, options, { headers: headers }));
         if (res.status === 401 && !options.noAuthRetry && getRefreshToken()) {
             try {
                 await refreshAccessToken();
                 headers['Authorization'] = 'Bearer ' + getToken();
-                res = await fetch(url, Object.assign({}, options, { headers: headers }));
+                res = await fetch(API_BASE + url, Object.assign({}, options, { headers: headers }));
             } catch (e) {
                 // 刷新失败已跳转登录页，原请求直接抛错
                 throw e;

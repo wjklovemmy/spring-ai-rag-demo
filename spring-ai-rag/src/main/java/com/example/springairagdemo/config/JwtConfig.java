@@ -7,24 +7,26 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 /**
- * 注册 JWT 过滤器并配置 BCrypt
+ * 注册网关信任过滤器并配置 BCrypt。
+ * 说明：JWT 认证已上移到 Gateway（JwtAuthGlobalFilter），
+ * 本服务通过 {@link GatewayIdentityFilter} 消费网关注入的身份，不再自行解析 Token。
  */
 @Configuration
 public class JwtConfig {
 
-    private final JwtAuthenticationFilter jwtAuthenticationFilter;
+    private final GatewayIdentityFilter gatewayIdentityFilter;
 
-    public JwtConfig(JwtAuthenticationFilter jwtAuthenticationFilter) {
-        this.jwtAuthenticationFilter = jwtAuthenticationFilter;
+    public JwtConfig(GatewayIdentityFilter gatewayIdentityFilter) {
+        this.gatewayIdentityFilter = gatewayIdentityFilter;
     }
 
     /**
-     * 注册 JWT 认证过滤器，拦截 /api/* 路径
+     * 注册网关信任过滤器，拦截 /api/* 路径
      */
     @Bean
-    public FilterRegistrationBean<JwtAuthenticationFilter> jwtFilterRegistration() {
-        FilterRegistrationBean<JwtAuthenticationFilter> registration = new FilterRegistrationBean<>();
-        registration.setFilter(jwtAuthenticationFilter);
+    public FilterRegistrationBean<GatewayIdentityFilter> gatewayIdentityFilterRegistration() {
+        FilterRegistrationBean<GatewayIdentityFilter> registration = new FilterRegistrationBean<>();
+        registration.setFilter(gatewayIdentityFilter);
         registration.addUrlPatterns("/api/*");
         registration.setOrder(1);
         return registration;

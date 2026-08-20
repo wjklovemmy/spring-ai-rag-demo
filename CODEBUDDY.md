@@ -106,15 +106,23 @@ Key settings:
 - **`POST /api/knowledge-document/upload`** — Upload a PDF (multipart form, field name `file`). Returns `{success, message, fileName, chunkCount}`.
 - **`POST /api/knowledge-document/chat`** — Send a question (JSON body `{"question": "..."}`). Returns `{success, question, answer}`.
 
-**Auth endpoints** (`AuthController`):
+**Auth endpoints** (`AuthController`, RAG 侧负责签发 JWT，校验集中在网关):
 
-- **`POST /api/login`** — Accepts `{username, password}`, stores username in HTTP session. Demo mode: any non-empty credentials succeed.
-- **`GET /api/user`** — Returns current logged-in username via session, or 401.
-- **`POST /api/logout`** — Invalidates the session.
+- **`POST /api/login`** — Accepts `{username, password}`, validates via BCrypt, returns a JWT access token.
+- **`GET /api/user`** — Returns current logged-in user info (from JWT claims injected by the gateway), or 401.
+- **`POST /api/logout`** — Revokes the access token (adds to Redis blacklist).
+
+### Gateway Authentication (RAG 不直接对外暴露)
+
+所有 `/api/**` 请求统一经 `gateway`（8081）进入：
+
+1. `JwtAuthGlobalFilter`（gateway）按与 RAG 一致的 `jwt.secret` 校验 `Authorization: Bearer <token>`，查询 Redis 黑名单，白名单放行 `register/login/logout/refresh`，并注入 `X-User-Id` / `X-Username` / `X-Gateway-Token` 请求头。
+2. `GatewayIdentityFilter`（RAG）校验 `X-Gateway-Token`（共享 `gateway.internal-token`，防绕过网关直连伪造身份），随后构造 `LoginUser` 写入 `UserContext`（ThreadLocal），请求结束 `finally` 清理。
+3. 前端页面由 RAG 在 8080 提供，页面内置 `API_BASE = 'http://localhost:8081'`，所有接口请求自动经网关（跨域由网关 `globalcors` 统一放行）。
 
 ### Static Frontend
 
-Two pure HTML pages served from `/static`:
+Two pure HTML pages served from `/static` on port **8080** (all their API calls go to the gateway on **8081** via the `API_BASE` constant):
 
 - `login.html` — Login form with animated background, calls `POST /api/login`
 - `index.html` — Dashboard with sidebar navigation (Home, Knowledge Q&A, Upload Document tabs), checks auth via `GET /api/user`, calls `POST /api/knowledge-document/chat` and `POST /api/knowledge-document/upload`

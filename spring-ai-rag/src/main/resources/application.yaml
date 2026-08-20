@@ -168,10 +168,18 @@ rag:
         fallback-on-error: true
 
 # ==================== JWT 配置 ====================
+# JWT 校验已上移到 Gateway；本服务仍负责签发（登录/注册/刷新），故保留 secret
 jwt:
   # 密钥（至少 256 位 / 32 字节），生产环境请使用强随机字符串并保密
+  # 必须与 gateway 模块的 jwt.secret 完全一致，否则网关无法校验签名
   secret: R4gD3m0-K3y-32ch4rs-L0ng-S3cur3!!
   # 访问令牌（Access Token）过期时间（毫秒），默认 30 分钟
   expiration-ms: 1800000
   # 刷新令牌（Refresh Token）过期时间（毫秒），默认 7 天
   refresh-expiration-ms: 604800000
+
+# ==================== 网关信任配置 ====================
+# 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，
+# 确认请求经由本服务网关转发（防绕过网关直连伪造身份），必须与 gateway 模块一致
+gateway:
+  internal-token: rag-gw-trust-2026

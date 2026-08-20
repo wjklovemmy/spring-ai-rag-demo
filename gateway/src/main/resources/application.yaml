@@ -4,6 +4,14 @@ server:
 spring:
   application:
     name: gateway
+  # Redis：认证黑名单检查 + 可选 IP 限流，必须与 RAG 服务同一实例（共享 auth:blacklist:*）
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password:
+      database: 0
+      timeout: 3s
   cloud:
     gateway:
       # Cloud 2025.0（gateway 4.3.0）起，全部配置迁移到 server.webflux 前缀，
@@ -41,6 +49,17 @@ management:
     web:
       exposure:
         include: health,info,gateway
+
+# ============ 认证（网关集中校验） ============
+jwt:
+  # 必须与 RAG 服务 spring-ai-rag 的 jwt.secret 完全一致，否则签名校验失败
+  secret: R4gD3m0-K3y-32ch4rs-L0ng-S3cur3!!
+  # 校验用（不签发），过期时间配置仅供参考，实际以 token 内 claim 为准
+  expiration-ms: 1800000
+
+# 网关内部信任令牌：RAG 据此确认请求来自本网关，两端必须一致
+gateway:
+  internal-token: rag-gw-trust-2026
 
 logging:
   level:

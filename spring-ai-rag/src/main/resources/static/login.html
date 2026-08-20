@@ -252,6 +252,9 @@
 
 <script src="/js/vue.global.prod.js"></script>
 <script>
+    // ====== 网关 API 基础地址（页面由 RAG 8080 提供，接口统一走网关 8081） ======
+    const API_BASE = 'http://localhost:8081';
+
     // --- Particles.js 背景动画 ---
     particlesJS('particles-js', {
         particles: {
@@ -300,7 +303,7 @@
                 if (!token && !refreshToken) {
                     return;
                 }
-                fetch('/api/user', {
+                fetch(API_BASE + '/api/user', {
                     headers: token ? { 'Authorization': 'Bearer ' + token } : {}
                 }).then(res => {
                     if (res.ok) {
@@ -316,7 +319,7 @@
             },
             // 使用 Refresh Token 换取新双 Token，成功后跳转首页
             tryRefresh(refreshToken) {
-                fetch('/api/refresh', {
+                fetch(API_BASE + '/api/refresh', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ refreshToken })
@@ -352,7 +355,7 @@
                 }
                 this.submitting = true;
                 try {
-                    const res = await fetch('/api/login', {
+                    const res = await fetch(API_BASE + '/api/login', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ username, password })
@@ -392,7 +395,7 @@
                 }
                 this.submitting = true;
                 try {
-                    const res = await fetch('/api/register', {
+                    const res = await fetch(API_BASE + '/api/register', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ username, password, nickname, email })
