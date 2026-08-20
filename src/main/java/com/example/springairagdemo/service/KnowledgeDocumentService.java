@@ -13,6 +13,7 @@ import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.core.task.TaskExecutor;
+import org.springframework.dao.DuplicateKeyException;
 
 import java.util.concurrent.CompletableFuture;
 import org.springframework.transaction.annotation.Transactional;
@@ -59,6 +60,9 @@ import java.util.stream.Collectors;
  */
 @Slf4j
 public abstract class KnowledgeDocumentService {
+
+    /** 同名文档并发上传版本号冲突时的最大重试次数 */
+    private static final int MAX_VERSION_RETRY = 5;
 
     @Autowired
     protected KnowledgeBaseService knowledgeBaseService;
@@ -208,7 +212,9 @@ public abstract class KnowledgeDocumentService {
             return;
         }
 
-        // 1. 重置任务字段（processTaskAsync 会重新置为处理中并增量补齐）
+        // 1. 重置任务字段并置回 PENDING（processTaskAsync 通过 CAS 抢占 PENDING 才能执行，
+        //    避免与其它入口并发重复处理同一任务）
+        task.setStatus(KnowledgeEmbeddingTaskStatus.PENDING);
         task.setTotalChunk(0);
         task.setSuccessChunk(0);
         task.setFailChunk(0);
@@ -250,11 +256,23 @@ public abstract class KnowledgeDocumentService {
             return;
         }
         try {
-            // 1. 任务置为处理中
+            // 1. CAS 抢占任务（PENDING -> PROCESSING）：防止同一任务被并发/重复入队时重复处理。
+            //    只有从 PENDING 原子转成功的线程获得处理权，其他线程直接放弃。
+            boolean claimed = knowledgeEmbeddingTaskService.lambdaUpdate()
+                    .eq(KnowledgeEmbeddingTaskEntity::getId, taskId)
+                    .eq(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PENDING)
+                    .set(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PROCESSING)
+                    .set(KnowledgeEmbeddingTaskEntity::getStartTime, new Date(start))
+                    .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
+                    .update();
+            if (!claimed) {
+                log.warn("任务 {} 已被其他线程处理或状态不允许（并发/重复入队），跳过本次处理",
+                        task.getTaskNo());
+                return;
+            }
             task.setStatus(KnowledgeEmbeddingTaskStatus.PROCESSING);
             task.setStartTime(new Date(start));
             task.setUpdateTime(new Date());
-            knowledgeEmbeddingTaskService.updateById(task);
 
             // 2. 从存储读取原始文件并解析（原始文件在提交阶段已最先持久化），文档状态推进为解析中
             updateDocumentStatus(docEntity, DocumentStatus.PARSING);
@@ -462,6 +480,8 @@ public abstract class KnowledgeDocumentService {
     /**
      * 保存文档信息到 MySQL，自动推断版本号；
      * 原始文件由调用方在后续步骤最先通过 {@link #persistUploadedFile} 持久化。
+     * <p>并发安全：同名文档同时上传时，两个线程可能推断出相同版本号，
+     * 依赖唯一索引 (knowledge_id, file_name, version) 拦截冲突，捕获 DuplicateKeyException 后重查重试。</p>
      */
     protected KnowledgeDocumentEntity saveDocumentInfo(MultipartFile file, Long knowledgeBaseId) {
         String originalFilename = file.getOriginalFilename();
@@ -470,36 +490,44 @@ public abstract class KnowledgeDocumentService {
             extension = originalFilename.substring(originalFilename.lastIndexOf('.') + 1).toLowerCase();
         }
 
-        // 查找同一知识库下同名文档的所有版本（不限状态，避免失败版本导致版本号重号），确定新版本号
-        int newVersion = 1;
-        List<KnowledgeDocumentEntity> existingDocs = knowledgeDocumentEntityService.lambdaQuery()
-                .eq(KnowledgeDocumentEntity::getKnowledgeId, knowledgeBaseId)
-                .eq(KnowledgeDocumentEntity::getFileName, originalFilename)
-                .orderByDesc(KnowledgeDocumentEntity::getVersion)
-                .list();
-        if (!existingDocs.isEmpty()) {
-            newVersion = existingDocs.get(0).getVersion() + 1;
-            log.info("检测到同名文档已有 {} 条版本记录，新版本号: {}", existingDocs.size(), newVersion);
+        // 并发同名上传时版本号可能被并发推断重号，靠唯一索引兜底并重试（最多 MAX_VERSION_RETRY 次）
+        for (int attempt = 0; ; attempt++) {
+            // 查找同一知识库下同名文档的所有版本（不限状态，避免失败版本导致版本号重号），确定新版本号
+            int newVersion = 1;
+            List<KnowledgeDocumentEntity> existingDocs = knowledgeDocumentEntityService.lambdaQuery()
+                    .eq(KnowledgeDocumentEntity::getKnowledgeId, knowledgeBaseId)
+                    .eq(KnowledgeDocumentEntity::getFileName, originalFilename)
+                    .orderByDesc(KnowledgeDocumentEntity::getVersion)
+                    .list();
+            if (!existingDocs.isEmpty()) {
+                newVersion = existingDocs.get(0).getVersion() + 1;
+            }
+
+            KnowledgeDocumentEntity entity = new KnowledgeDocumentEntity();
+            entity.setKnowledgeId(knowledgeBaseId);
+            entity.setFileName(originalFilename);
+            entity.setFilePath(originalFilename);
+            entity.setFileSize(file.getSize());
+            entity.setFileType(extension);
+            entity.setChunkCount(0);
+            entity.setStatus(DocumentStatus.UPLOADING.getCode());
+            entity.setVersion(newVersion);
+            entity.setIsActive(1);
+            entity.setCreateTime(new Date());
+            entity.setUpdateTime(new Date());
+
+            try {
+                knowledgeDocumentEntityService.save(entity);
+                log.info("原始文档信息已保存: {} v{} (id={}, knowledgeBaseId={})",
+                        originalFilename, newVersion, entity.getId(), knowledgeBaseId);
+                return entity;
+            } catch (DuplicateKeyException e) {
+                if (attempt >= MAX_VERSION_RETRY) {
+                    throw new RuntimeException("同名文档并发上传版本号冲突，请稍后重试", e);
+                }
+                log.warn("同名文档并发上传版本号冲突（v{}），第 {} 次重试", newVersion, attempt + 1);
+            }
         }
-
-        KnowledgeDocumentEntity entity = new KnowledgeDocumentEntity();
-        entity.setKnowledgeId(knowledgeBaseId);
-        entity.setFileName(originalFilename);
-        entity.setFilePath(originalFilename);
-        entity.setFileSize(file.getSize());
-        entity.setFileType(extension);
-        entity.setChunkCount(0);
-        entity.setStatus(DocumentStatus.UPLOADING.getCode());
-        entity.setVersion(newVersion);
-        entity.setIsActive(1);
-        entity.setCreateTime(new Date());
-        entity.setUpdateTime(new Date());
-        knowledgeDocumentEntityService.save(entity);
-
-        log.info("原始文档信息已保存: {} v{} (id={}, knowledgeBaseId={})",
-                originalFilename, newVersion, entity.getId(), knowledgeBaseId);
-
-        return entity;
     }
 
     // ===================== 文档删除 =====================

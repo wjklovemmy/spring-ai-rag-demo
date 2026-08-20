@@ -41,6 +41,9 @@ CREATE TABLE IF NOT EXISTS knowledge_document (
 
     INDEX idx_knowledge_id (knowledge_id),
 
+    -- 同名文档并发上传防重号：同一知识库下 (库, 文件名, 版本) 唯一
+    UNIQUE KEY uk_kb_file_version (knowledge_id, file_name, version),
+
     CONSTRAINT fk_document_base
     FOREIGN KEY (knowledge_id)
     REFERENCES knowledge_base(id)
@@ -69,6 +72,9 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
     INDEX idx_document_id (document_id),
 
     INDEX idx_hash (content_hash),
+
+    -- 同一文档内 chunk 序号唯一：防止任务被并发/重复处理时产生重复 chunk
+    UNIQUE KEY uk_document_index (document_id, chunk_index),
 
     CONSTRAINT fk_chunk_document
     FOREIGN KEY (document_id)
@@ -128,13 +134,6 @@ CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
     REFERENCES knowledge_document(id)
 
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Embedding任务';
-
--- version / expire_time / is_active 已并入上方 knowledge_document 建表语句（全新部署无需关心）。
--- 存量库（表已存在）升级时请手动执行：
--- ALTER TABLE knowledge_document
---     ADD COLUMN version     INT        DEFAULT 1   COMMENT '文档版本号，同名多次上传递增',
---   ADD COLUMN expire_time DATETIME   DEFAULT NULL COMMENT '过期时间，旧版本平滑下线用',
---   ADD COLUMN is_active   TINYINT    DEFAULT 1   COMMENT '是否启用：1-启用 0-禁用';
 
 
 -- ==================== 用户表 ====================
