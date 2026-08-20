@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.example</groupId>
+        <artifactId>spring-ai-rag-demo</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>spring-ai-rag</artifactId>
+    <name>spring-ai-rag</name>
+    <description>RAG 服务核心模块：PDF 文档入库（Milvus）与基于 DeepSeek 的知识问答</description>
+
+    <!--
+      依赖、版本管理与构建插件（spring-boot-maven-plugin、lombok 注解处理器等）
+      全部继承自父工程 spring-ai-rag-demo，此处无需重复声明。
+    -->
+</project>

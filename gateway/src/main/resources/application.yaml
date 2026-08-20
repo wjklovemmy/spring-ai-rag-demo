@@ -1,0 +1,47 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: gateway
+  cloud:
+    gateway:
+      # Cloud 2025.0（gateway 4.3.0）起，全部配置迁移到 server.webflux 前缀，
+      # 旧的 spring.cloud.gateway.* 已废弃（IDE 会标红）
+      server:
+        webflux:
+          # 路由：/api/** 全部透传到 RAG 服务（路径前缀保持 /api，无需 StripPrefix）
+          routes:
+            - id: rag-service
+              uri: http://localhost:8080
+              predicates:
+                - Path=/api/**
+              # 可选：按客户端 IP 限流（需 Redis）。启用时取消注释即可
+              # filters:
+              #   - name: RequestRateLimiter
+              #     args:
+              #       redis-rate-limiter.replenishRate: 10
+              #       redis-rate-limiter.burstCapacity: 20
+              #       key-resolver: "#{@clientIpKeyResolver}"
+          globalcors:
+            cors-configurations:
+              '[/**]':
+                # 允许任意来源；如网关与前端同源部署可收紧为具体域名
+                allowed-origin-patterns:
+                  - "*"
+                allowed-methods:
+                  - "*"
+                allowed-headers:
+                  - "*"
+                allow-credentials: true
+                max-age: 3600
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,gateway
+
+logging:
+  level:
+    org.springframework.cloud.gateway: info

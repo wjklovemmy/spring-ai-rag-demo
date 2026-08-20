@@ -6,24 +6,36 @@ This is a **RAG (Retrieval-Augmented Generation)** demonstration application bui
 
 ## Build & Run Commands
 
+The repository root is an aggregator POM (`packaging=pom`). It has two modules:
+- `spring-ai-rag` — the RAG service (port 8080)
+- `gateway` — Spring Cloud Gateway entry point (port 8081, routes `/api/**` to `spring-ai-rag`)
+
+Build/run with the `-pl <module>` flag from the root:
+
 ```bash
-# Build the project (skip tests)
+# Build the whole project (skip tests)
 ./mvnw clean package -DskipTests
 
-# Run the application (defaults to port 8080)
-./mvnw spring-boot:run
+# Build a single module (e.g. spring-ai-rag or gateway)
+./mvnw -pl spring-ai-rag clean package -DskipTests
+
+# Run the RAG application (defaults to port 8080)
+./mvnw -pl spring-ai-rag spring-boot:run
+
+# Run the gateway (defaults to port 8081)
+./mvnw -pl gateway spring-boot:run
 
 # Run all tests
 ./mvnw test
 
 # Run a single test class
-./mvnw test -Dtest=SpringAiRagDemoApplicationTests
+./mvnw -pl spring-ai-rag test -Dtest=SpringAiRagDemoApplicationTests
 
 # Run a specific test method
-./mvnw test -Dtest=SpringAiRagDemoApplicationTests#contextLoads
+./mvnw -pl spring-ai-rag test -Dtest=SpringAiRagDemoApplicationTests#contextLoads
 ```
 
-On Windows, replace `./mvnw` with `mvnw.cmd`.
+On Windows, replace `./mvnw` with `mvnw.cmd`. The `gateway` module manages its own `spring-cloud-dependencies` BOM (2025.0.0) since the parent POM does not declare it.
 
 ## Prerequisites
 

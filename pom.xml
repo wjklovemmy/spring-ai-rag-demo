@@ -11,8 +11,14 @@
     <groupId>com.example</groupId>
     <artifactId>spring-ai-rag-demo</artifactId>
     <version>0.0.1-SNAPSHOT</version>
+    <!-- 聚合父工程：业务代码在子模块 spring-ai-rag -->
+    <packaging>pom</packaging>
     <name>spring-ai-rag-demo</name>
-    <description>spring-ai-rag-demo</description>
+    <description>spring-ai-rag-demo parent</description>
+    <modules>
+        <module>spring-ai-rag</module>
+        <module>gateway</module>
+    </modules>
     <properties>
         <java.version>17</java.version>
         <spring-ai.version>2.0.0</spring-ai.version>

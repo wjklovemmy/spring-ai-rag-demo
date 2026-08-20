@@ -113,10 +113,11 @@ spring-ai-rag-demo/
 ├── docker/
 │   └── docker-compose.yml          # Milvus(含 etcd/attu) + MinIO 编排
 ├── logs/                           # 运行日志
-├── pom.xml                         # Maven 依赖（Java 17）
+├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理）
 ├── mvnw / mvnw.cmd                 # Maven Wrapper
-└── src/
-    ├── main/
+├── spring-ai-rag/                  # RAG 服务核心模块（业务代码）
+│   └── src/
+│       ├── main/
     │   ├── java/com/example/springairagdemo/
     │   │   ├── SpringAiRagDemoApplication.java
     │   │   ├── config/
@@ -199,6 +200,16 @@ spring-ai-rag-demo/
     │       │   ├── login.html                      # 登录/注册页
     │       │   └── index.html                      # 问答/上传/任务分阶段进度仪表盘
     └── test/
+├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 8081）
+│   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM
+│   └── src/
+│       ├── main/
+│       │   ├── java/com/example/gateway/
+│       │   │   ├── GatewayApplication.java    # 启动类 + IP 限流 KeyResolver
+│       │   │   └── filter/LoggingGlobalFilter.java # 全局访问日志过滤器
+│       │   └── resources/
+│       │       └── application.yaml          # 路由 / CORS / 可选 IP 限流
+│       └── test/
 ├── sql/
 │   └── init.sql                              # 全量初始化脚本（业务表 + RBAC 权限表 + 内置角色/账号）
 ```
@@ -515,13 +526,25 @@ export ALIYUN_OCR_SK=xxxx
 
 ### 3. 启动应用
 
-```bash
-# Windows
-mvnw.cmd spring-boot:run
+仓库根目录为聚合父工程，业务代码在子模块 `spring-ai-rag`。推荐在根目录用 `-pl` 指定子模块启动：
 
-# Linux/macOS
-./mvnw spring-boot:run
+```bash
+# Windows（根目录）
+mvnw.cmd -pl spring-ai-rag spring-boot:run
+
+# Linux/macOS（根目录）
+./mvnw -pl spring-ai-rag spring-boot:run
 ```
+
+也可进入子模块目录直接启动（使用仓库根目录的 Wrapper）：
+
+```bash
+cd spring-ai-rag
+..\mvnw.cmd spring-boot:run    # Windows
+../mvnw spring-boot:run        # Linux/macOS
+```
+
+> 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
 
 ### 4. 访问页面
 
