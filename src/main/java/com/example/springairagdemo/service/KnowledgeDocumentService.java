@@ -256,196 +256,283 @@ public abstract class KnowledgeDocumentService {
             return;
         }
         try {
-            // 1. CAS 抢占任务（PENDING -> PROCESSING）：防止同一任务被并发/重复入队时重复处理。
-            //    只有从 PENDING 原子转成功的线程获得处理权，其他线程直接放弃。
-            boolean claimed = knowledgeEmbeddingTaskService.lambdaUpdate()
-                    .eq(KnowledgeEmbeddingTaskEntity::getId, taskId)
-                    .eq(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PENDING)
-                    .set(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PROCESSING)
-                    .set(KnowledgeEmbeddingTaskEntity::getStartTime, new Date(start))
-                    .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
-                    .update();
-            if (!claimed) {
-                log.warn("任务 {} 已被其他线程处理或状态不允许（并发/重复入队），跳过本次处理",
-                        task.getTaskNo());
+            // 1. CAS 抢占任务（PENDING -> PROCESSING），防止同一任务被并发/重复入队时重复处理
+            if (!claimTask(task, start)) {
                 return;
             }
-            task.setStatus(KnowledgeEmbeddingTaskStatus.PROCESSING);
-            task.setStartTime(new Date(start));
-            task.setUpdateTime(new Date());
 
-            // 2. 从存储读取原始文件并解析（原始文件在提交阶段已最先持久化），文档状态推进为解析中
-            updateDocumentStatus(docEntity, DocumentStatus.PARSING);
-            List<Document> documents;
-            try (InputStream inputStream = fileStorageService.getInputStream(docEntity.getFilePath())) {
-                documents = parseDocument(inputStream);
-            }
-            log.info("任务 {} 解析完成，共 {} 个文档页面", task.getTaskNo(), documents.size());
-            task.setParseProgress(100);
-            task.setUpdateTime(new Date());
-            knowledgeEmbeddingTaskService.updateById(task);
+            // 2. 读取原始文件解析 PDF 并切分为 chunks
+            List<Document> chunks = parseAndSplit(task, docEntity);
 
-            // 3. 切分（纯计算、确定性：同输入重跑时 chunkIndex 从 0 稳定编号）
-            List<Document> chunks = splitDocument(documents);
-            log.info("任务 {} 切分完成，共 {} 个文本片段", task.getTaskNo(), chunks.size());
+            // 3. 增量查缺：按 (chunk_index, content_hash, milvus_id) 分类已有 chunk
+            ChunkDiff diff = diffChunks(docEntity, chunks);
 
-            // 4. 记录 chunk 总数（同时标记切片阶段完成）
-            task.setTotalChunk(chunks.size());
-            task.setSuccessChunk(0);
-            task.setFailChunk(0);
-            task.setSplitProgress(100);
-            task.setUpdateTime(new Date());
-            knowledgeEmbeddingTaskService.updateById(task);
+            // 4. 删除作废/多余的旧 chunk（MySQL 行 + Milvus 向量）
+            cleanStaleChunks(docEntity, chunks, diff.stale());
 
-            // 5. 增量查缺：按 (chunk_index, content_hash, milvus_id) 分类已有 chunk
-            List<KnowledgeChunkEntity> existing = knowledgeChunkEntityService.lambdaQuery()
-                    .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
-                    .list();
-            Map<Integer, KnowledgeChunkEntity> existingByIndex = existing.stream()
-                    .collect(Collectors.toMap(KnowledgeChunkEntity::getChunkIndex, e -> e, (a, b) -> a));
+            // 5. 新增/变化 chunk 批量写入 MySQL
+            persistChunksToMysql(task, docEntity, diff.toSave());
 
-            List<KnowledgeChunkEntity> toSave = new ArrayList<>();       // 新 / 内容变化：写 MySQL + 向量
-            List<KnowledgeChunkEntity> toVectorOnly = new ArrayList<>(); // 已写 MySQL、仅缺向量
-            List<KnowledgeChunkEntity> stale = new ArrayList<>();        // 作废/多余旧 chunk（删 MySQL + 向量）
-            int skipCount = 0;                                          // 已完整处理，直接跳过
+            // 6. Embedding + Milvus upsert（分批推进，实时更新进度），返回实际写入向量数
+            int vectorCount = embedAndUpsertVectors(task, docEntity, chunks, diff);
 
-            for (int i = 0; i < chunks.size(); i++) {
-                Document chunk = chunks.get(i);
-                String content = chunk.getText() != null ? chunk.getText() : "";
-                String hash = sha256(content);
-                KnowledgeChunkEntity old = existingByIndex.get(i);
-                if (old == null || !hash.equals(old.getContentHash())) {
-                    // 新增或内容变化（如切分逻辑升级）：旧行（若有）作废删除；Milvus 主键按 index 相同，upsert 自动覆盖
-                    if (old != null) {
-                        stale.add(old);
-                    }
-                    toSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(chunk, i)));
-                } else if (old.getMilvusId() == null) {
-                    // MySQL 已写但向量缺失（上次失败在写向量阶段）：只补向量
-                    toVectorOnly.add(old);
-                } else {
-                    // MySQL + 向量均已写入：跳过（省写库 / embedding / 向量写入）
-                    skipCount++;
-                }
-            }
-            // 新切分数量变少时，尾部残留旧 chunk（index >= 新数量）需清理
-            for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingByIndex.entrySet()) {
-                if (entry.getKey() >= chunks.size()) {
-                    stale.add(entry.getValue());
-                }
-            }
-            // 删除作废/多余的旧 chunk（MySQL 行 + Milvus 向量）
-            if (!stale.isEmpty()) {
-                List<Long> staleIds = stale.stream().map(KnowledgeChunkEntity::getId).toList();
-                knowledgeChunkEntityService.removeByIds(staleIds);
-                // 覆盖删除该文档 index >= 新切分数的向量（含未回填 milvus_id 的残留）
-                vectorStoreService.deleteVectorsByChunkIndexFrom(
-                        docEntity.getKnowledgeId(), docEntity.getId(), chunks.size());
-                log.info("增量清理 {} 个作废/多余旧 chunk (documentId={})", stale.size(), docEntity.getId());
-            }
-
-            // 6. 需要写 MySQL 的 chunk 批量写入（插入后 id 回填，供 Milvus chunkId 字段引用）
-            if (!toSave.isEmpty()) {
-                knowledgeChunkEntityService.saveBatch(toSave);
-                task.setChunkProgress(100);
-                task.setUpdateTime(new Date());
-                knowledgeEmbeddingTaskService.updateById(task);
-                log.info("新增 {} 个 chunk 已写入 MySQL knowledge_chunk (documentId={})", toSave.size(), docEntity.getId());
-            }
-
-            // 7. 向量化（Batch 流水线，拆两阶段分别推进，前端可分别展示 Embedding / Milvus 进度）
-            //    7a. Embedding：按 batch-size 分批向量化，实时更新 embed_progress
-            //    7b. Milvus：按 batch-size 分批 upsert，实时更新 milvus_progress + 回填 milvus_id + 任务成功数
-            //    每批 = 一次 embedding 批量调用 / 一次 Milvus upsert，避免超大文档单次调用内存与超时风险
-            int vectorCount = 0;
-            if (!toSave.isEmpty() || !toVectorOnly.isEmpty()) {
-                updateDocumentStatus(docEntity, DocumentStatus.EMBEDDING);
-                List<KnowledgeChunkEntity> vectorEntities = new ArrayList<>(toSave);
-                vectorEntities.addAll(toVectorOnly);
-                int batchSize = ragConfig.getDocument().getBatchSize();
-                int total = vectorEntities.size();
-                int totalBatches = (total + batchSize - 1) / batchSize;
-
-                // 7a. Embedding 阶段：向量暂存内存（总量 ≈ total×1024×4B，10000 chunks 上限时约 40MB，可控）
-                List<float[]> allEmbeddings = new ArrayList<>(total);
-                for (int i = 0; i < total; i += batchSize) {
-                    List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
-                    allEmbeddings.addAll(vectorStoreService.embedChunks(
-                            toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks)));
-                    task.setEmbedProgress((int) ((i + batch.size()) * 100L / total));
-                    task.setUpdateTime(new Date());
-                    knowledgeEmbeddingTaskService.updateById(task);
-                    log.info("Embedding 批次 {}/{}: 已向量化 {} 个文本 (documentId={}, 进度 {}%)",
-                            (i / batchSize) + 1, totalBatches, batch.size(), docEntity.getId(), task.getEmbedProgress());
-                }
-
-                // 7b. Milvus 阶段：按批 upsert + 回填 milvus_id + 更新成功数
-                int processed = 0;
-                for (int i = 0; i < total; i += batchSize) {
-                    List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
-                    List<float[]> embeddings = allEmbeddings.subList(i, Math.min(i + batchSize, total));
-                    vectorCount += vectorStoreService.upsertVectors(docEntity.getKnowledgeId(),
-                            toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks), embeddings);
-                    // 回填 milvus_id：作为"向量已写入"的增量判定依据（下次恢复时跳过）
-                    for (KnowledgeChunkEntity entity : batch) {
-                        entity.setMilvusId(VectorStoreService.buildVectorId(docEntity.getId(), entity.getChunkIndex()));
-                    }
-                    knowledgeChunkEntityService.updateBatchById(batch);
-                    processed += batch.size();
-                    // 每批完成后回写任务进度，便于前端实时展示（成功数 = 增量跳过 + 已写入）
-                    task.setMilvusProgress((int) (processed * 100L / total));
-                    task.setSuccessChunk(skipCount + processed);
-                    task.setUpdateTime(new Date());
-                    knowledgeEmbeddingTaskService.updateById(task);
-                    log.info("Milvus 批次 {}/{}: 已写入 {} 个 chunk 并回填 (documentId={}, 累计 {}/{}, 进度 {}%)",
-                            (i / batchSize) + 1, totalBatches, batch.size(),
-                            docEntity.getId(), skipCount + processed, chunks.size(), task.getMilvusProgress());
-                }
-            }
-
-            // 8. 更新文档状态为成功
-            docEntity.setChunkCount(chunks.size());
-            updateDocumentStatus(docEntity, DocumentStatus.SUCCESS);
-
-            // 9. 新版本入库成功后，将同名旧版本标记过期时间（平滑下线）
-            deprecateOldVersions(docEntity.getKnowledgeId(), docEntity);
-
-            // 10. 更新任务为成功（successChunk 含增量跳过数）。
-            //     分阶段进度统一置 100：即使本次全增量跳过（无新增/补齐 chunk），
-            //     各阶段实际已完成，避免"任务成功但进度条全 0"的困惑展示。
-            task.setStatus(KnowledgeEmbeddingTaskStatus.SUCCESS);
-            task.setChunkProgress(100);
-            task.setEmbedProgress(100);
-            task.setMilvusProgress(100);
-            task.setSuccessChunk(skipCount + vectorCount);
-            task.setFailChunk(Math.max(0, chunks.size() - skipCount - vectorCount));
-            task.setFinishTime(new Date());
-            task.setCostTime(System.currentTimeMillis() - start);
-            task.setUpdateTime(new Date());
-            knowledgeEmbeddingTaskService.updateById(task);
-            log.info("任务 {} 处理完成: 总chunk={}, 新增/补齐={}, 跳过={}, 向量={}, 耗时 {}ms",
-                    task.getTaskNo(), chunks.size(), toSave.size() + toVectorOnly.size(),
-                    skipCount, vectorCount, task.getCostTime());
+            // 7. 收尾：文档置成功、废弃旧版本、任务置成功
+            finishTask(task, docEntity, chunks, diff, vectorCount, start);
         } catch (Exception e) {
             log.error("Embedding 任务执行失败: taskNo={}, documentId={}",
                     task.getTaskNo(), task.getDocumentId(), e);
-            // 回滚未完成的向量：已回填 milvus_id 的视为已完成保留，供下次恢复增量跳过；仅删除未完成的残留
-            try {
-                List<Long> doneMilvusIds = knowledgeChunkEntityService.lambdaQuery()
-                        .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
-                        .isNotNull(KnowledgeChunkEntity::getMilvusId)
-                        .list().stream()
-                        .map(KnowledgeChunkEntity::getMilvusId)
-                        .toList();
-                vectorStoreService.deleteVectorsByDocumentIdExcept(
-                        docEntity.getKnowledgeId(), docEntity.getId(), doneMilvusIds);
-            } catch (Exception ex) {
-                log.error("任务失败后清理未完成 Milvus 向量失败", ex);
-            }
-            // 标记文档失败状态
+            // 回滚未完成向量（已回填 milvus_id 的保留，供恢复时增量跳过），标记文档与任务失败
+            rollbackIncompleteVectors(docEntity);
             markDocumentFailed(docEntity);
             failTask(task, e.getMessage(), start);
         }
+    }
+
+    /**
+     * CAS 抢占任务（PENDING -> PROCESSING）：
+     * 只有从 PENDING 原子转成功的线程获得处理权，其他线程直接放弃。
+     *
+     * @return true 表示抢占成功，可继续处理
+     */
+    private boolean claimTask(KnowledgeEmbeddingTaskEntity task, long start) {
+        boolean claimed = knowledgeEmbeddingTaskService.lambdaUpdate()
+                .eq(KnowledgeEmbeddingTaskEntity::getId, task.getId())
+                .eq(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PENDING)
+                .set(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PROCESSING)
+                .set(KnowledgeEmbeddingTaskEntity::getStartTime, new Date(start))
+                .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
+                .update();
+        if (!claimed) {
+            log.warn("任务 {} 已被其他线程处理或状态不允许（并发/重复入队），跳过本次处理",
+                    task.getTaskNo());
+            return false;
+        }
+        task.setStatus(KnowledgeEmbeddingTaskStatus.PROCESSING);
+        task.setStartTime(new Date(start));
+        task.setUpdateTime(new Date());
+        return true;
+    }
+
+    /**
+     * 从存储读取原始文件并解析（原始文件在提交阶段已最先持久化），文档状态推进为解析中；
+     * 再切分为 chunks（纯计算、确定性：同输入重跑时 chunkIndex 从 0 稳定编号），
+     * 并记录 chunk 总数（同时标记切片阶段完成）。
+     */
+    private List<Document> parseAndSplit(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity)
+            throws Exception {
+        updateDocumentStatus(docEntity, DocumentStatus.PARSING);
+        List<Document> documents;
+        try (InputStream inputStream = fileStorageService.getInputStream(docEntity.getFilePath())) {
+            documents = parseDocument(inputStream);
+        }
+        log.info("任务 {} 解析完成，共 {} 个文档页面", task.getTaskNo(), documents.size());
+        task.setParseProgress(100);
+        task.setUpdateTime(new Date());
+        knowledgeEmbeddingTaskService.updateById(task);
+
+        List<Document> chunks = splitDocument(documents);
+        log.info("任务 {} 切分完成，共 {} 个文本片段", task.getTaskNo(), chunks.size());
+
+        task.setTotalChunk(chunks.size());
+        task.setSuccessChunk(0);
+        task.setFailChunk(0);
+        task.setSplitProgress(100);
+        task.setUpdateTime(new Date());
+        knowledgeEmbeddingTaskService.updateById(task);
+        return chunks;
+    }
+
+    /**
+     * 增量查缺：按 (chunk_index, content_hash, milvus_id) 将已有 chunk 分类为
+     * 新增/变化（toSave）、仅缺向量（toVectorOnly）、作废/多余（stale）、完整跳过（skipCount）。
+     */
+    private ChunkDiff diffChunks(KnowledgeDocumentEntity docEntity, List<Document> chunks) {
+        List<KnowledgeChunkEntity> existing = knowledgeChunkEntityService.lambdaQuery()
+                .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
+                .list();
+        Map<Integer, KnowledgeChunkEntity> existingByIndex = existing.stream()
+                .collect(Collectors.toMap(KnowledgeChunkEntity::getChunkIndex, e -> e, (a, b) -> a));
+
+        List<KnowledgeChunkEntity> toSave = new ArrayList<>();       // 新 / 内容变化：写 MySQL + 向量
+        List<KnowledgeChunkEntity> toVectorOnly = new ArrayList<>(); // 已写 MySQL、仅缺向量
+        List<KnowledgeChunkEntity> stale = new ArrayList<>();        // 作废/多余旧 chunk（删 MySQL + 向量）
+        int skipCount = 0;                                          // 已完整处理，直接跳过
+
+        for (int i = 0; i < chunks.size(); i++) {
+            Document chunk = chunks.get(i);
+            String content = chunk.getText() != null ? chunk.getText() : "";
+            String hash = sha256(content);
+            KnowledgeChunkEntity old = existingByIndex.get(i);
+            if (old == null || !hash.equals(old.getContentHash())) {
+                // 新增或内容变化（如切分逻辑升级）：旧行（若有）作废删除；Milvus 主键按 index 相同，upsert 自动覆盖
+                if (old != null) {
+                    stale.add(old);
+                }
+                toSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(chunk, i)));
+            } else if (old.getMilvusId() == null) {
+                // MySQL 已写但向量缺失（上次失败在写向量阶段）：只补向量
+                toVectorOnly.add(old);
+            } else {
+                // MySQL + 向量均已写入：跳过（省写库 / embedding / 向量写入）
+                skipCount++;
+            }
+        }
+        // 新切分数量变少时，尾部残留旧 chunk（index >= 新数量）需清理
+        for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingByIndex.entrySet()) {
+            if (entry.getKey() >= chunks.size()) {
+                stale.add(entry.getValue());
+            }
+        }
+        return new ChunkDiff(toSave, toVectorOnly, stale, skipCount);
+    }
+
+    /**
+     * 删除作废/多余的旧 chunk（MySQL 行 + Milvus 向量）。
+     */
+    private void cleanStaleChunks(KnowledgeDocumentEntity docEntity, List<Document> chunks,
+                                  List<KnowledgeChunkEntity> stale) {
+        if (stale.isEmpty()) {
+            return;
+        }
+        List<Long> staleIds = stale.stream().map(KnowledgeChunkEntity::getId).toList();
+        knowledgeChunkEntityService.removeByIds(staleIds);
+        // 覆盖删除该文档 index >= 新切分数的向量（含未回填 milvus_id 的残留）
+        vectorStoreService.deleteVectorsByChunkIndexFrom(
+                docEntity.getKnowledgeId(), docEntity.getId(), chunks.size());
+        log.info("增量清理 {} 个作废/多余旧 chunk (documentId={})", stale.size(), docEntity.getId());
+    }
+
+    /**
+     * 新增/变化 chunk 批量写入 MySQL（插入后 id 回填，供 Milvus chunkId 字段引用）。
+     */
+    private void persistChunksToMysql(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
+                                      List<KnowledgeChunkEntity> toSave) {
+        if (toSave.isEmpty()) {
+            return;
+        }
+        knowledgeChunkEntityService.saveBatch(toSave);
+        task.setChunkProgress(100);
+        task.setUpdateTime(new Date());
+        knowledgeEmbeddingTaskService.updateById(task);
+        log.info("新增 {} 个 chunk 已写入 MySQL knowledge_chunk (documentId={})", toSave.size(), docEntity.getId());
+    }
+
+    /**
+     * 向量化（Batch 流水线，拆两阶段分别推进，前端可分别展示 Embedding / Milvus 进度）：
+     * <ul>
+     *     <li>Embedding：按 batch-size 分批向量化，实时更新 embed_progress；向量暂存内存
+     *         （总量 ≈ total×1024×4B，10000 chunks 上限时约 40MB，可控）。</li>
+     *     <li>Milvus：按 batch-size 分批 upsert + 回填 milvus_id + 更新任务成功数。</li>
+     * </ul>
+     * 每批 = 一次 embedding 批量调用 / 一次 Milvus upsert，避免超大文档单次调用内存与超时风险。
+     *
+     * @return 实际写入 Milvus 的向量数
+     */
+    private int embedAndUpsertVectors(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
+                                      List<Document> chunks, ChunkDiff diff) {
+        List<KnowledgeChunkEntity> toSave = diff.toSave();
+        List<KnowledgeChunkEntity> toVectorOnly = diff.toVectorOnly();
+        if (toSave.isEmpty() && toVectorOnly.isEmpty()) {
+            return 0;
+        }
+        updateDocumentStatus(docEntity, DocumentStatus.EMBEDDING);
+        List<KnowledgeChunkEntity> vectorEntities = new ArrayList<>(toSave);
+        vectorEntities.addAll(toVectorOnly);
+        int batchSize = ragConfig.getDocument().getBatchSize();
+        int total = vectorEntities.size();
+        int totalBatches = (total + batchSize - 1) / batchSize;
+
+        // 7a. Embedding 阶段
+        List<float[]> allEmbeddings = new ArrayList<>(total);
+        for (int i = 0; i < total; i += batchSize) {
+            List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
+            allEmbeddings.addAll(vectorStoreService.embedChunks(
+                    toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks)));
+            task.setEmbedProgress((int) ((i + batch.size()) * 100L / total));
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+            log.info("Embedding 批次 {}/{}: 已向量化 {} 个文本 (documentId={}, 进度 {}%)",
+                    (i / batchSize) + 1, totalBatches, batch.size(), docEntity.getId(), task.getEmbedProgress());
+        }
+
+        // 7b. Milvus 阶段：按批 upsert + 回填 milvus_id + 更新成功数
+        int vectorCount = 0;
+        int processed = 0;
+        for (int i = 0; i < total; i += batchSize) {
+            List<KnowledgeChunkEntity> batch = vectorEntities.subList(i, Math.min(i + batchSize, total));
+            List<float[]> embeddings = allEmbeddings.subList(i, Math.min(i + batchSize, total));
+            vectorCount += vectorStoreService.upsertVectors(docEntity.getKnowledgeId(),
+                    toChunkVectorData(docEntity.getKnowledgeId(), docEntity.getId(), batch, chunks), embeddings);
+            // 回填 milvus_id：作为"向量已写入"的增量判定依据（下次恢复时跳过）
+            for (KnowledgeChunkEntity entity : batch) {
+                entity.setMilvusId(VectorStoreService.buildVectorId(docEntity.getId(), entity.getChunkIndex()));
+            }
+            knowledgeChunkEntityService.updateBatchById(batch);
+            processed += batch.size();
+            // 每批完成后回写任务进度，便于前端实时展示（成功数 = 增量跳过 + 已写入）
+            task.setMilvusProgress((int) (processed * 100L / total));
+            task.setSuccessChunk(diff.skipCount() + processed);
+            task.setUpdateTime(new Date());
+            knowledgeEmbeddingTaskService.updateById(task);
+            log.info("Milvus 批次 {}/{}: 已写入 {} 个 chunk 并回填 (documentId={}, 累计 {}/{}, 进度 {}%)",
+                    (i / batchSize) + 1, totalBatches, batch.size(),
+                    docEntity.getId(), diff.skipCount() + processed, chunks.size(), task.getMilvusProgress());
+        }
+        return vectorCount;
+    }
+
+    /**
+     * 任务收尾：文档置成功（含 chunk 数）、同名旧版本标记过期（平滑下线）、任务置成功。
+     * <p>分阶段进度统一置 100：即使本次全增量跳过（无新增/补齐 chunk），
+     * 各阶段实际已完成，避免"任务成功但进度条全 0"的困惑展示。</p>
+     */
+    private void finishTask(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
+                            List<Document> chunks, ChunkDiff diff, int vectorCount, long start) {
+        docEntity.setChunkCount(chunks.size());
+        updateDocumentStatus(docEntity, DocumentStatus.SUCCESS);
+        deprecateOldVersions(docEntity.getKnowledgeId(), docEntity);
+
+        task.setStatus(KnowledgeEmbeddingTaskStatus.SUCCESS);
+        task.setChunkProgress(100);
+        task.setEmbedProgress(100);
+        task.setMilvusProgress(100);
+        task.setSuccessChunk(diff.skipCount() + vectorCount);
+        task.setFailChunk(Math.max(0, chunks.size() - diff.skipCount() - vectorCount));
+        task.setFinishTime(new Date());
+        task.setCostTime(System.currentTimeMillis() - start);
+        task.setUpdateTime(new Date());
+        knowledgeEmbeddingTaskService.updateById(task);
+        log.info("任务 {} 处理完成: 总chunk={}, 新增/补齐={}, 跳过={}, 向量={}, 耗时 {}ms",
+                task.getTaskNo(), chunks.size(), diff.toSave().size() + diff.toVectorOnly().size(),
+                diff.skipCount(), vectorCount, task.getCostTime());
+    }
+
+    /**
+     * 任务失败后回滚未完成的向量：已回填 milvus_id 的视为已完成保留（供下次恢复增量跳过），
+     * 仅删除未完成的残留。
+     */
+    private void rollbackIncompleteVectors(KnowledgeDocumentEntity docEntity) {
+        try {
+            List<Long> doneMilvusIds = knowledgeChunkEntityService.lambdaQuery()
+                    .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
+                    .isNotNull(KnowledgeChunkEntity::getMilvusId)
+                    .list().stream()
+                    .map(KnowledgeChunkEntity::getMilvusId)
+                    .toList();
+            vectorStoreService.deleteVectorsByDocumentIdExcept(
+                    docEntity.getKnowledgeId(), docEntity.getId(), doneMilvusIds);
+        } catch (Exception ex) {
+            log.error("任务失败后清理未完成 Milvus 向量失败", ex);
+        }
+    }
+
+    /**
+     * 增量分类结果：新增/变化、仅缺向量、作废/多余、完整跳过。
+     */
+    private record ChunkDiff(List<KnowledgeChunkEntity> toSave,
+                             List<KnowledgeChunkEntity> toVectorOnly,
+                             List<KnowledgeChunkEntity> stale,
+                             int skipCount) {
     }
 
     /**
