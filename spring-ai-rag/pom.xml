@@ -38,6 +38,37 @@
     </dependencyManagement>
 
     <dependencies>
+        <!-- ==================== Web / 基础（MVC 应用，静态页面 + REST 接口） ====================
+             注：spring-boot-starter-webmvc 已从父 POM <dependencies> 移除（避免 gateway 继承导致
+             Spring MVC 与 WebFlux 冲突），此处由本模块显式声明 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-webmvc</artifactId>
+        </dependency>
+
+        <!-- ==================== 持久化 / 安全（RAG 业务库 knowledge_base） ====================
+             同样从父 POM 下沉：mybatis-plus 若留在父 POM 会让 gateway（WebFlux，无数据库）
+             继承并触发 DataSource 自动配置报错 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-aspectj</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+            <version>3.5.16</version>
+        </dependency>
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-jsqlparser</artifactId>
+            <version>3.5.16</version>
+        </dependency>
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+
         <!-- ==================== AI / 向量 / 解析（RAG 专用） ==================== -->
         <dependency>
             <groupId>org.springframework.ai</groupId>

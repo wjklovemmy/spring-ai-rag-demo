@@ -7,7 +7,7 @@ This is a **RAG (Retrieval-Augmented Generation)** demonstration application bui
 The repository is a **three-service microservice demo** behind a single API gateway:
 - `spring-ai-rag` — RAG service (port 8080), knowledge base / document / Q&A, own DB `knowledge_base`
 - `spring-ai-user` — **standalone user service** (port 8082), auth / JWT / RBAC / system admin, own DB `spring_ai_user`
-- `gateway` — Spring Cloud Gateway entry point (port 8081), splits traffic by path to the two services
+- `gateway` — Spring Cloud Gateway entry point (port 7070), splits traffic by path to the two services
 
 ## Build & Run Commands
 
@@ -28,7 +28,7 @@ The repository root is an aggregator POM (`packaging=pom`). All three modules ar
 # Run the user service (port 8082)
 ./mvnw -pl spring-ai-user spring-boot:run
 
-# Run the gateway (port 8081, external entry; routes /api/** to the two services)
+# Run the gateway (port 7070, external entry; routes /api/** to the two services)
 ./mvnw -pl gateway spring-boot:run
 ```
 
@@ -54,10 +54,10 @@ These are normally served from the Nacos config center `common.yaml` (higher pre
 ### Service Topology
 
 ```
-Browser (pages served by RAG :8080, API_BASE = http://localhost:8081)
+Browser (pages served by RAG :8080, API_BASE = http://localhost:7070)
         │
         ▼
-gateway :8081 (JwtAuthGlobalFilter: whitelist register/login/logout/refresh,
+gateway :7070 (JwtAuthGlobalFilter: whitelist register/login/logout/refresh,
                validate JWT + Redis blacklist, inject X-User-Id / X-Username /
                X-Permissions / X-Gateway-Token, route by path via Nacos lb://)
         ├── /api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**  → lb://spring-ai-user
@@ -144,7 +144,7 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 **spring-ai-user (8082):** MySQL `spring_ai_user` (standard `spring.datasource.*`, MyBatis-Plus auto-configured); Redis (refresh-token sessions); Nacos (register + config center); `jwt.secret` (signing side, must match gateway); `gateway.internal-token`; OpenFeign (`RagSyncFeignClient` → `lb://spring-ai-rag`, `feign.circuitbreaker.enabled=true` + Sentinel fallbackFactory, `feign.sentinel.rules`); Sentinel transport; `internal-token`.
 
-**gateway (8081):** routes split by path with `lb://spring-ai-user` / `lb://spring-ai-rag` (Nacos discovery; starter renamed to `spring-cloud-starter-gateway-server-webflux` in Gateway 5.0); CORS for all origins; `jwt.secret` (validate only); Redis blacklist; Nacos (register + config center); `gateway.internal-token`; `internal-token`.
+**gateway (7070):** routes split by path with `lb://spring-ai-user` / `lb://spring-ai-rag` (Nacos discovery; starter renamed to `spring-cloud-starter-gateway-server-webflux` in Gateway 5.0); CORS for all origins; `jwt.secret` (validate only); Redis blacklist; Nacos (register + config center); `gateway.internal-token`; `internal-token`.
 
 ### Authentication & Authorization Flow
 
@@ -166,7 +166,7 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 ### Static Frontend
 
-Two pure HTML pages served from `/static` on port **8080** (all their API calls go to the gateway on **8081** via the `API_BASE` constant):
+Two pure HTML pages served from `/static` on port **8080** (all their API calls go to the gateway on **7070** via the `API_BASE` constant):
 
 - `login.html` — Login form with animated background, calls `POST /api/login`
 - `index.html` — Dashboard with sidebar navigation (Home, Knowledge Q&A, Upload Document, 系统管理 tabs), checks auth via `GET /api/user`, calls `POST /api/knowledge-document/chat` and `POST /api/knowledge-document/upload`
@@ -184,8 +184,8 @@ Two pure HTML pages served from `/static` on port **8080** (all their API calls 
 - `spring-ai-starter-model-deepseek` — DeepSeek chat model auto-configuration (only in spring-ai-rag)
 - `spring-ai-starter-vector-store-milvus` — Milvus vector store integration (only in spring-ai-rag)
 - `spring-ai-pdf-document-reader` — PDF parsing via `PagePdfDocumentReader` (only in spring-ai-rag)
-- `mybatis-plus-spring-boot4-starter` 3.5.16 — ORM (both RAG and user service)
-- `mysql-connector-j` — MySQL JDBC driver (runtime scope, inherited from parent)
+- `mybatis-plus-spring-boot4-starter` 3.5.16 (+ `mybatis-plus-jsqlparser`) — ORM, declared in **both** RAG and user service. The parent POM `<dependencies>` holds **only** deps shared by all three services (Nacos, loadbalancer, OpenFeign, Sentinel, devtools, lombok); web/AOP/MyBatis-Plus/MySQL/Redis/JWT/BCrypt are module-scoped so that `gateway` (pure WebFlux, no datasource) never inherits `spring-boot-starter-webmvc` or `mybatis-plus` (which would trigger `DataSourceAutoConfiguration` and fail with "Failed to configure a DataSource")
+- `mysql-connector-j` — MySQL JDBC driver (runtime scope, declared in RAG and user service)
 - Lombok for boilerplate reduction
 - `spring-boot-devtools` for hot reload during development
 - Spring AI BOM / Milvus SDK version management is declared in `spring-ai-rag/pom.xml` (not the parent)

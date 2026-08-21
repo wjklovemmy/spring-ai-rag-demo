@@ -31,19 +31,19 @@
 | 框架 | Spring Boot 4.0.7 | 应用基础框架（Java 17） |
 | AI 框架 | Spring AI 2.0.0 | 统一抽象 Chat / Embedding / VectorStore |
 | 对话模型 | DeepSeek `deepseek-chat` | 问答生成模型 |
-| 向量模型 | DashScope `text-embedding-v3`（1024 维） | 文本向量化（自研 `AbstractEmbeddingModel` 实现） |
+| 向量模型 | DashScope `text-embedding-v3`（1024 维） | 文本向量化（自研 `DashScopeEmbeddingModel`） |
 | 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
-| 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
-| 对象存储 | MinIO 8.6.0 | 原始文档文件存储（同时支持本地磁盘模式）；8.6.0 修复 CVE-2025-59952 |
-| 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
+| 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
+| 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（同时支持本地磁盘模式） |
+| 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
-| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`）；AI 问答（DeepSeek 生成）调用经 `CircuitBreakerFactory` 熔断保护（资源 `ai-chat`），不可用时降级返回「AI服务暂时不可用，请稍后再试」；向量化（DashScope Embedding）亦经 `CircuitBreakerFactory` 熔断保护（资源 `dashscope-embedding`），连续异常比例高时快速失败避免打爆配额，上传任务错误归一为「向量化服务暂时不可用，请稍后重试」；`DashScopeEmbeddingModel` 对网络异常与 5xx 自动重试（最多 2 次）；支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
+| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
-| 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
+| 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（7070）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
-| 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 8081） |
+| 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 7070） |
 
 ---
 
@@ -56,7 +56,7 @@ graph TB
         INDEX["index.html<br/>问答 / 上传 / 任务进度"]
     end
 
-    subgraph Gateway["网关 Spring Cloud Gateway :8081"]
+    subgraph Gateway["网关 Spring Cloud Gateway :7070"]
         GWAUTH["JwtAuthGlobalFilter<br/>JWT 校验 + Redis 黑名单 + 注入用户头"]
     end
 
@@ -140,139 +140,115 @@ graph TB
 ```
 spring-ai-rag-demo/
 ├── docker/
-│   └── docker-compose.yml          # Milvus(含 etcd/attu) + MinIO + Nacos(注册/配置中心) + Redis 编排
+│   ├── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard 编排
+│   └── mysql/init/mysql-schema.sql # Nacos 3.1.1 官方建表脚本（宿主机 MySQL 初始化 nacos_config 库用）
 ├── nacos/
 │   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
-│   └── README.md                   # Nacos 接入说明（启动/导入/验证）
-├── logs/                           # 运行日志
-├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理，含 Spring Cloud/SCA BOM）
+│   └── README.md                   # Nacos 接入说明（启动/初始化/导入/验证）
+├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理，含 Spring Cloud/SCA BOM；仅保留三服务通用依赖）
 ├── mvnw / mvnw.cmd                 # Maven Wrapper
-├── spring-ai-rag/                  # RAG 服务（独立部署，端口 8080，不依赖用户域模块）
-│   ├── pom.xml                     # Spring AI/Milvus/MinIO/OCR 依赖（用户域已拆分为独立服务）
-│   └── src/
-│       ├── main/
-│       │   └── java/com/example/springairagdemo/
-│       │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(仅扫描本模块)
-│       │       ├── config/
-│       │       │   ├── AiConfig.java                  # ChatClient / 模型装配
-│       │       │   ├── MilvusConfig.java              # Milvus 客户端
-│       │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（含 batch-size）
-│       │       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
-│       │       │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
-│       │       │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
-│       │       │   ├── DataSourceConfig.java          # HikariCP 连接池显式装配
-│       │       │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
-│       │       │   ├── DataInitializer.java           # 启动初始化（恢复中断任务）
-│       │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
-│       │       ├── controller/
-│       │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-│       │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
-│       │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
-│       │       ├── security/                          # 防越权 + 本地身份上下文（用户域拆分后自建）
-│       │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
-│       │       │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
-│       │       │   ├── KbAccessAspect.java            # @RequireKbRole AOP 切面
-│       │       │   ├── GatewayIdentityFilter.java     # 校验 X-Gateway-Token + 消费身份头 → UserContext
-│       │       │   ├── LoginUser.java / UserContext.java # 本地登录态（ThreadLocal，来自网关注入）
-│       │       │   └── ForbiddenException.java        # 403 异常（本地版）
-│       │       ├── embedding/
-│       │       │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型
-│       │       ├── entity/                            # MyBatis-Plus 实体 + 枚举
-│       │       │   ├── KnowledgeBaseEntity.java
-│       │       │   ├── KnowledgeDocumentEntity.java   # 含 version / status(7态) / expire_time
-│       │       │   ├── KnowledgeChunkEntity.java
-│       │       │   ├── KnowledgeEmbeddingTaskEntity.java # 任务 + 5 个阶段进度字段
-│       │       │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
-│       │       │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
-│       │       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
-│       │       │   └── KbAccessLogEntity.java         # 访问审计日志
-│       │       ├── mapper/                            # MyBatis-Plus Mapper
-│       │       │   ├── KnowledgeBaseMapper.java
-│       │       │   ├── KnowledgeDocumentMapper.java
-│       │       │   ├── KnowledgeChunkMapper.java
-│       │       │   ├── KnowledgeEmbeddingTaskMapper.java
-│       │       │   ├── KbMemberMapper.java
-│       │       │   └── KbAccessLogMapper.java
-│       │       ├── parser/
-│       │       │   ├── DocumentParser.java             # 解析接口
-│       │       │   ├── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
-│       │       │   ├── HeadingExtractor.java           # 标题行识别 / 标题链构建
-│       │       │   └── SemanticSplitter.java           # 语义切片（段落聚类 + 断点）
-│       │       └── service/
-│       │           ├── KnowledgeDocumentService.java   # 摄取异步流水线 + 问答（抽象类）
-│       │           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
-│       │           ├── VectorStoreService.java         # Milvus 增删查（embedChunks / upsertVectors）
-│       │           ├── HybridSearchService.java        # 混合检索编排（RRF 融合 + 异常降级）
-│       │           ├── RerankService.java / DashScopeRerankService.java   # 重排序接口与实现
-│       │           ├── OcrService.java / AliyunOcrService.java            # OCR 接口与实现
-│       │           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
-│       │           ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
-│       │           ├── KnowledgeBaseService.java       # 知识库服务接口
-│       │           ├── KnowledgeDocumentEntityService.java
-│       │           ├── KnowledgeChunkEntityService.java
-│       │           ├── KbAuthorizationService.java     # 权限判定中枢（assertRole/visibleKbIds/授权）
-│       │           ├── KbMemberService.java / KbAccessLogService.java
-│       │           ├── KbMemberDeletionGuard.java      # 删用户前最后所有者保护 + 清理 kb_member（InternalController 驱动）
-│       │           ├── KbAccessLogAuditHandler.java    # 管理操作审计落库 kb_access_log（InternalController 驱动）
-│       │           ├── UserClient.java                 # 远程查用户服务：isAdmin / 用户摘要（/internal/users/**）
-│       │           └── impl/                           # Service 实现类
-│       └── resources/
-│           ├── application.yaml                        # 全局配置
-│           └── static/
-│               ├── login.html                          # 登录/注册页
-│               └── index.html                          # 问答/上传/任务分阶段进度仪表盘
+├── spring-ai-rag/                  # RAG 服务（独立部署，端口 8080）
+│   └── src/main/java/com/example/springairagdemo/
+│       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(仅扫描本模块)
+│       ├── config/
+│       │   ├── AiConfig.java                  # ChatClient / 模型装配 + Sentinel 熔断规则（ai-chat / dashscope-embedding）
+│       │   ├── MilvusConfig.java              # Milvus 客户端
+│       │   ├── RagConfigProperties.java       # rag.* 配置绑定（rerank/hybrid/ocr/storage/chunk 等）
+│       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
+│       │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
+│       │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
+│       │   ├── DataSourceConfig.java          # @Primary 数据源 + MyBatis-Plus 装配（HikariCP）
+│       │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
+│       │   ├── DataInitializer.java           # 启动初始化（恢复中断任务）
+│       │   ├── FeignConfig.java               # 全局 RequestInterceptor（注入 X-Internal-Token）
+│       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
+│       ├── controller/
+│       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
+│       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
+│       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
+│       ├── security/                          # 防越权 + 本地身份上下文
+│       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
+│       │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
+│       │   ├── KbAccessAspect.java            # @RequireKbRole AOP 切面
+│       │   ├── GatewayIdentityFilter.java     # 校验 X-Gateway-Token + 消费身份头 → UserContext
+│       │   ├── LoginUser.java / UserContext.java # 本地登录态（ThreadLocal，来自网关注入）
+│       │   └── ForbiddenException.java        # 403 异常（本地版）
+│       ├── embedding/
+│       │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型（网络异常/5xx 自动重试）
+│       ├── entity/                            # MyBatis-Plus 实体 + 枚举
+│       │   ├── KnowledgeBaseEntity.java
+│       │   ├── KnowledgeDocumentEntity.java   # 含 version / status(7态) / expire_time
+│       │   ├── KnowledgeChunkEntity.java
+│       │   ├── KnowledgeEmbeddingTaskEntity.java # 任务 + 5 个阶段进度字段
+│       │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
+│       │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
+│       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
+│       │   └── KbAccessLogEntity.java         # 访问审计日志
+│       ├── mapper/                            # MyBatis-Plus Mapper（业务表）
+│       ├── parser/
+│       │   ├── DocumentParser.java            # 解析接口
+│       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
+│       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建
+│       │   └── SemanticSplitter.java          # 语义切片（段落聚类 + 断点）
+│       ├── feign/                             # 跨服务调用用户服务
+│       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
+│       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
+│       └── service/
+│           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（抽象类）
+│           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
+│           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
+│           ├── HybridSearchService.java           # 混合检索编排（RRF 融合 + 异常降级）
+│           ├── RerankService.java / DashScopeRerankService.java  # 重排序接口与实现
+│           ├── OcrService.java / AliyunOcrService.java           # OCR 接口与实现
+│           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
+│           ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
+│           ├── KnowledgeBaseService.java / KnowledgeDocumentEntityService.java
+│           ├── KnowledgeChunkEntityService.java / impl/
+│           ├── KbAuthorizationService.java        # 权限判定中枢（assertRole/visibleKbIds/授权）
+│           ├── KbMemberService.java / KbAccessLogService.java
+│           ├── KbMemberDeletionGuard.java         # 删用户前最后所有者保护 + 清理 kb_member
+│           ├── KbAccessLogAuditHandler.java       # 管理操作审计落库 kb_access_log
+│           ├── UserClient.java                    # 远程查用户服务：isAdmin / 用户摘要
+│           ├── EmbeddingServiceUnavailableException.java # 向量化故障统一异常（友好提示）
+│           └── impl/                              # Service 接口实现类
 ├── spring-ai-user/                 # 用户服务（独立部署，端口 8082，独立数据库 spring_ai_user）
-│   ├── pom.xml                     # 用户服务 POM（Spring Boot repackage，可执行 jar）
-│   ├── UserServiceApplication.java # 独立启动类（@MapperScan 用户域 mapper）
-│   └── src/
-│       └── main/
-│           ├── resources/application.yaml   # 端口 / 用户库 / Redis / JWT / 内部令牌
-│           └── java/com/example/user/
-│               ├── config/                             # JWT、内部信任令牌、RAG 回调客户端
-│               │   ├── JwtUtil.java                    # JWT 生成/解析（权限码写入 Access Token）
-│               │   ├── JwtConfig.java                  # JWT 配置属性（注册 GatewayIdentityFilter）
-│               │   ├── GatewayIdentityFilter.java      # 校验网关内部令牌并注入登录态（UserContext）
-│               │   └── RagSyncClient.java              # 回调 RAG /internal/kb/**（删除校验/清理/审计）
-│               ├── controller/
-│               │   ├── AuthController.java             # 注册/登录/登出/当前用户/用户搜索
-│               │   ├── AdminUserController.java        # 系统管理-用户（需 ADMIN，经 RagSyncClient 联动 RAG）
-│               │   ├── AdminRoleController.java        # 系统管理-角色（需 ADMIN）
-│               │   └── InternalUserController.java     # /internal/users/**（供 RAG 查 isAdmin/用户摘要）
-│               ├── security/                           # 认证上下文 + ADMIN 切面
-│               │   ├── LoginUser.java                  # 登录用户模型（id/username/permissions）
-│               │   ├── UserContext.java                # ThreadLocal 当前用户上下文
-│               │   ├── ForbiddenException.java         # 403 业务异常
-│               │   ├── RequireAdmin.java               # ADMIN 功能角色注解（方法级）
-│               │   └── AdminAccessAspect.java          # @RequireAdmin AOP 切面
-│               ├── entity/                             # 用户域实体
-│               │   ├── UserEntity.java
-│               │   ├── SysRoleEntity.java              # RBAC 功能角色
-│               │   └── SysUserRoleEntity.java          # 用户-角色关联
-│               ├── mapper/
-│               │   ├── UserMapper.java
-│               │   ├── SysRoleMapper.java
-│               │   └── SysUserRoleMapper.java
-│               └── service/
-│                   ├── UserService.java                # 注册/登录/删除用户/isAdmin（JWT + BCrypt）
-│                   ├── SysRoleService.java / SysUserRoleService.java
-│                   ├── RedisRefreshTokenService.java   # 刷新令牌 + 登出黑名单
-│                   └── UserDataInitializer.java        # 启动初始化（ADMIN 角色/默认账号）
-├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 8081）
-│   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM + jjwt 0.12.6
-│   └── src/
-│       ├── main/
-│       │   ├── java/com/example/gateway/
-│       │   │   ├── GatewayApplication.java    # 启动类 + IP 限流 KeyResolver
-│       │   │   ├── security/JwtUtil.java      # JWT 校验工具（secret 与用户服务共享一致）
-│       │   │   └── filter/
-│       │   │       ├── JwtAuthGlobalFilter.java # 全局认证过滤器（白名单/黑名单/注入用户头）
-│       │   │       └── LoggingGlobalFilter.java # 全局访问日志过滤器
-│       │   └── resources/
-│       │       └── application.yaml          # 路由分流 / CORS / jwt.secret / Redis / 可选 IP 限流
-│       └── test/
-├── sql/
-│   ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
-│   └── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
+│   └── src/main/java/com/example/user/
+│       ├── UserServiceApplication.java # 独立启动类（@MapperScan 用户域 mapper）
+│       ├── config/
+│       │   ├── JwtUtil.java                    # JWT 生成/解析（权限码写入 Access Token）
+│       │   ├── JwtConfig.java                  # JWT 配置属性（注册 GatewayIdentityFilter）
+│       │   ├── GatewayIdentityFilter.java      # 校验网关内部令牌并注入登录态（UserContext）
+│       │   ├── RagSyncClient.java              # 回调 RAG /internal/kb/**（删除校验/清理/审计）
+│       │   └── FeignConfig.java                # 全局 RequestInterceptor（注入 X-Internal-Token）
+│       ├── controller/
+│       │   ├── AuthController.java             # 注册/登录/登出/当前用户/用户搜索
+│       │   ├── AdminUserController.java        # 系统管理-用户（需 ADMIN，经 RagSyncClient 联动 RAG）
+│       │   ├── AdminRoleController.java        # 系统管理-角色（需 ADMIN）
+│       │   └── InternalUserController.java     # /internal/users/**（供 RAG 查 isAdmin/用户摘要）
+│       ├── security/                           # 认证上下文 + ADMIN 切面
+│       │   ├── LoginUser.java / UserContext.java / ForbiddenException.java
+│       │   ├── RequireAdmin.java               # ADMIN 功能角色注解（方法级）
+│       │   └── AdminAccessAspect.java          # @RequireAdmin AOP 切面
+│       ├── entity/                             # 用户域实体（RBAC 五表）
+│       │   ├── UserEntity.java / SysRoleEntity.java / SysPermissionEntity.java
+│       │   └── SysUserRoleEntity.java / SysRolePermissionEntity.java
+│       ├── mapper/                             # UserMapper / SysRoleMapper / SysPermissionMapper / 两级关联 Mapper
+│       ├── feign/                              # RagSyncFeignClient + RagSyncFeignClientFallbackFactory
+│       └── service/
+│           ├── UserService.java                # 注册/登录/删除用户/isAdmin（JWT + BCrypt）
+│           ├── SysRoleService.java / SysPermissionService.java / 两级关联 Service
+│           ├── RedisRefreshTokenService.java   # 刷新令牌 + 登出黑名单
+│           └── UserDataInitializer.java        # 启动初始化（ADMIN 角色/权限种子/默认账号）
+├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 7070）
+│   └── src/main/java/com/example/gateway/
+│       ├── GatewayApplication.java    # 启动类
+│       ├── security/JwtUtil.java      # JWT 校验工具（secret 与用户服务共享一致）
+│       └── filter/
+│           ├── JwtAuthGlobalFilter.java # 全局认证过滤器（白名单/黑名单/注入用户头）
+│           └── LoggingGlobalFilter.java # 全局访问日志过滤器
+└── sql/
+    ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
+    └── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
 ```
 
 ---
@@ -385,12 +361,12 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 
 **认证**（识别"你是谁"）：
 
-注册/登录由**独立服务 `spring-ai-user`**（8082，经 Nacos 注册）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
+注册/登录由**独立服务 `spring-ai-user`**（8082，经 Nacos 注册）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 7070 进入：
 
 ```
-访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 8081）
+访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 7070）
                             ↓
-              网关 JwtAuthGlobalFilter（8081，GlobalFilter order=-200）
+              网关 JwtAuthGlobalFilter（7070，GlobalFilter order=-200）
               · 白名单放行：/api/register、/api/login、/api/logout、/api/refresh
               · 校验 Token 签名与有效期（jjwt，secret 与用户服务完全一致）
               · 查 Redis 黑名单（登出/刷新后旧 Token 立即失效）
@@ -460,9 +436,12 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 | `knowledge_base` | RAG 服务 spring-ai-rag（8080） | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志 |
 | `spring_ai_user` | 用户服务 spring-ai-user（8082） | `spring.datasource.*`（标准主数据源，MyBatis-Plus 自动装配） | RBAC 五表：用户/角色/权限/两级关联 |
 
+另外 **Nacos 配置中心**也使用同一 MySQL 实例中的 `nacos_config` 库存储配置（见 [快速开始](#快速开始) 第 1 步）。
+
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
 - `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
+- `docker/mysql/init/mysql-schema.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
 用户服务启动时 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色、权限种子与默认账号（幂等）。
 `kb_member` / `kb_access_log` 中的 `user_id` 为**跨库逻辑引用**（无外键约束），删除用户前由用户服务经 `RagSyncClient` 远程回调 RAG 服务 `POST /internal/kb/deletion-check`（校验）与 `/internal/kb/user-cleanup`（清理 kb_member）完成联动。
@@ -494,52 +473,36 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 
 ## 配置说明
 
-`application.yaml` 关键配置：
+**spring-ai-rag（`spring-ai-rag/src/main/resources/application.yaml`）关键配置：**
 
 | 配置项 | 说明 |
 |--------|------|
+| `spring.config.import` | 配置中心：`optional:nacos:common.yaml`（三端密钥；`optional` 前缀保证 Nacos 不可用时本地兜底仍可启动） |
 | `spring.ai.deepseek.*` | DeepSeek base-url / 模型 / 温度（api-key 从环境变量 `DEEPSEEK_API_KEY` 读取） |
 | `spring.ai.dashscope.*` | DashScope embedding 模型（api-key 从环境变量 `DASHSCOPE_API_KEY` 读取） |
-| `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024 |
+| `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024（collection 按知识库动态创建，`initialize-schema: false`） |
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
-| `spring.datasource.pool.*` | HikariCP 连接池（max/min/空闲/超时/存活等，默认 max=50） |
-| `spring.task.embedding.*` | 摄取异步任务线程池（core=2/max=4/queue=100/命名 rag-embedding-N/CallerRuns 饱和策略/优雅停机等待） |
+| `spring.datasource.pool.*` | HikariCP 连接池（maximum-pool-size=10、minimum-idle=2、连接/空闲/存活超时等） |
+| `spring.task.embedding.*` | 摄取异步任务线程池（core=2/max=4/queue=50/命名 rag-embedding-N/优雅停机等待） |
+| `spring.servlet.multipart.*` | 上传大小限制（50MB） |
+| `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
+| `spring.cloud.sentinel.*` | Sentinel transport（Dashboard 上报，`eager` 启动即注册，可选） |
 | `rag.storage.type` | `minio` / `local` 文件存储切换 |
 | `rag.storage.minio.*` | MinIO endpoint / 密钥 / bucket |
 | `rag.document.version-ttl-days` | 旧版本文档共存天数（默认 30） |
 | `rag.document.upload-dir` | 本地存储模式上传目录 |
-| `rag.document.batch-size` | 向量化批处理大小（默认 100：每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写，降低超大文档内存/超时风险） |
-| `rag.document.chunk.*` | 全局文档分块参数（chunk-size、heading、semantic 等，见下表） |
-| `rag.rerank.enabled` | 是否启用召回重排序（默认 true） |
-| `rag.rerank.model` | 重排序模型（默认 `gte-rerank-v2`） |
-| `rag.rerank.candidate-top-k` | 向量召回候选数（默认 20） |
-| `rag.rerank.top-n` | 精排后保留片段数（默认 5） |
-| `rag.rerank.threshold` | 向量召回相似度阈值（默认 0.3） |
-| `rag.rerank.fallback-on-error` | Rerank 失败时降级为纯向量排序（默认 true） |
-| `rag.hybrid.enabled` | 是否启用混合检索（Dense + BM25 + RRF，默认 true；false=纯向量） |
-| `rag.hybrid.route-top-k` | 每路（dense / bm25）召回候选数（默认 40，融合取 rerank.candidate-top-k 条） |
-| `rag.hybrid.min-score` | 融合结果最低 RRF 分数，低于该值视为噪声（默认 0 不启用过滤） |
-| `rag.hybrid.rrf-k` | RRF 平滑系数 k（默认 60，score = Σ 1/(k + rank)） |
-| `rag.hybrid.fallback-on-error` | Hybrid 检索异常时降级为纯向量检索（默认 true） |
-| `rag.ocr.enabled` | 是否启用 OCR（默认 true） |
-| `rag.ocr.region-id` | OCR 服务地域（默认 cn-hangzhou） |
-| `rag.ocr.access-key-id/secret` | 阿里云 AccessKey（建议环境变量 `ALIYUN_OCR_AK/SK`） |
-| `rag.ocr.dpi` | PDF 页渲染分辨率（默认 200） |
-| `rag.ocr.min-text-length` | 页文本低于该长度触发 OCR（默认 20） |
-| `rag.document.chunk.heading.enabled` | 标题感知切分开关（默认 true） |
-| `rag.document.chunk.heading.max-depth` | 标题链最大深度（默认 3） |
-| `rag.document.chunk.heading.max-length` | 标题行最大字符数（默认 40） |
-| `rag.document.chunk.heading.prefix-template` | 标题前缀注入模板（默认 `【{heading}】`） |
-| `rag.document.chunk.semantic.enabled` | 语义切片开关（默认 true） |
-| `rag.document.chunk.semantic.threshold` | 相邻段落相似度断点阈值（默认 0.55） |
-| `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
-| `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
+| `rag.document.batch-size` | 向量化批处理大小（默认 100：每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写） |
+| `rag.document.chunk.*` | 全局文档分块参数（chunk-size、heading、semantic 等，见下） |
+| `rag.rerank.*` | 重排序：enabled / model(`gte-rerank-v2`) / candidate-top-k(20) / top-n(5) / threshold(0.3) / fallback-on-error |
+| `rag.hybrid.*` | 混合检索：enabled / route-top-k(40) / min-score(0) / rrf-k(60) / fallback-on-error |
+| `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
+| `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
+| `rag.document.chunk.semantic.*` | 语义切片：enabled / threshold(0.55) / batch-size(10) / fallback-on-error |
 | `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 与用户服务的 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
 | `feign.circuitbreaker.enabled` | OpenFeign 熔断降级开关（true；配合 Sentinel + fallbackFactory，Hystrix 的官方替代） |
 | `feign.sentinel.rules` | Sentinel 熔断规则（key：`default`=所有 Feign 客户端默认规则，或精确资源名如 `spring-ai-user#isAdmin(Long)`；value：DegradeRule 列表） |
 | `feign.client.config.default.*` | OpenFeign 默认连接/读取超时（connect-timeout 3000ms / read-timeout 10000ms） |
 | `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时由 Feign 拦截器携带，两端必须一致） |
-| `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 
 **spring-ai-user 用户服务（`spring-ai-user/src/main/resources/application.yaml`）关键配置：**
 
@@ -559,8 +522,9 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 
 | 配置项 | 说明 |
 |--------|------|
+| `server.port` | 对外统一入口端口（7070，前端 `API_BASE` 与此一致） |
 | `spring.cloud.gateway.server.webflux.routes` | 路由分流：认证/用户/角色（`/api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**`）→ `lb://spring-ai-user`（用户服务）；其余 `/api/**` → `lb://spring-ai-rag`（RAG 服务）；均经 Nacos 服务发现解析实例 |
-| `spring.cloud.gateway.server.webflux.globalcors` | 跨域：放行所有来源（页面从 8080 加载、接口走 8081） |
+| `spring.cloud.gateway.server.webflux.globalcors` | 跨域：放行所有来源（页面从 8080 加载、接口走 7070） |
 | `jwt.secret` / `jwt.expiration-ms` | 与用户服务一致（网关侧仅校验、不签发） |
 | `spring.data.redis.*` | Redis（Token 黑名单） |
 | `gateway.internal-token` / `internal-token` | 与 RAG、用户服务一致的内部令牌 |
@@ -584,13 +548,27 @@ cd docker
 docker-compose up -d
 ```
 
-会启动：Milvus 2.6.0（+ etcd）、MinIO（9002/9003，bucket `knowledge-documents` 自动创建）、Attu 管理界面（http://localhost:8000）、**Nacos（8848/9848，注册中心 + 配置中心）**、Redis（6379）。
+会启动：Milvus 2.6.0（+ etcd / MinIO / Attu）、doc-minio（9002/9003，bucket `knowledge-documents` 自动创建）、Redis（6379）、**Nacos（8848/9848，注册中心 + 配置中心）**、Sentinel Dashboard（8858）。
 
-> Nacos 控制台：http://localhost:8848/nacos（默认账号 `nacos/nacos`）。首次使用需在控制台"配置管理 → 新建配置"导入共享配置 `Data ID: common.yaml / Group: DEFAULT_GROUP`（内容见 [`nacos/common.yaml`](../nacos/common.yaml)）。若跳过此步，三个服务使用本地 `application.yaml` 中的兜底密钥，功能不受影响。
+> 若只想启动部分服务：`docker compose up -d nacos redis standalone` 等按需指定服务名。
 
-> 仓库中的 compose 未包含 MySQL 服务，需自行准备 MySQL 8.x，并执行一次：
-> 1. `sql/init.sql` — RAG 业务库：业务表 + 成员授权 + 审计日志（幂等，可重复执行）。
-> 2. `sql/user.sql` — 用户域独立库：RBAC 五表（`sys_user`/`sys_role`/`sys_permission`/`sys_user_role`/`sys_role_permission`）+ 内置 `ADMIN` 角色与 `admin` 账号（幂等，可重复执行）。
+**Nacos 配置中心使用外部 MySQL 存储**（compose 中 `MYSQL_SERVICE_HOST=host.docker.internal`），首次启动前需在宿主机 MySQL 完成：
+
+```sql
+-- 1. 建库（账号密码与 compose 中 MYSQL_SERVICE_* 一致：nacos/nacos）
+CREATE DATABASE IF NOT EXISTS nacos_config DEFAULT CHARACTER SET utf8mb4;
+-- 2. 导入 Nacos 3.1.1 官方 schema（docker/mysql/init/mysql-schema.sql）
+--    mysql -uroot -p nacos_config < docker/mysql/init/mysql-schema.sql
+--    或通过任意 MySQL 客户端执行该 SQL 文件
+```
+
+> `host.docker.internal` 是 Docker Desktop（Windows/macOS）的内置域名；Linux 下需在 nacos 服务添加 `extra_hosts: ["host.docker.internal:host-gateway"]`。
+
+> Nacos 控制台：http://localhost:8848/nacos（3.x 默认开启鉴权，账号 `nacos/nacos`）。首次使用需在控制台"配置管理 → 新建配置"导入共享配置 `Data ID: common.yaml / Group: DEFAULT_GROUP`（内容见 [`nacos/common.yaml`](../nacos/common.yaml)）。若跳过此步，三个服务使用本地 `application.yaml` 中的兜底密钥，功能不受影响。
+
+**业务数据库**（同一 MySQL 实例，需执行一次，均幂等可重复）：
+1. `sql/init.sql` — RAG 业务库：`knowledge_base` 库 + 业务表 + 成员授权 + 审计日志。
+2. `sql/user.sql` — 用户域独立库：`spring_ai_user` 库 + RBAC 五表 + 内置 `ADMIN` 角色与 `admin` 账号。
 
 ### 1.1 默认账号
 
@@ -631,16 +609,16 @@ export ALIYUN_OCR_SK=xxxx
 ```
 
 另外在 `application.yaml` 中确认：
-- MySQL 连接与账号密码
+- MySQL 连接与账号密码（业务双库 + `nacos_config` 库）
 - MinIO 连接（默认 `minioadmin/minioadmin`，9002 端口）
 
 > 不需要 OCR / Rerank / Hybrid 时，可分别将 `rag.ocr.enabled`、`rag.rerank.enabled`、`rag.hybrid.enabled` 置为 `false`。
 
-> **重要（已有数据的升级提示）**：collection 按知识库**动态创建**（`kb_{id}`），已存在时直接复用跳过，无需手工清理。由旧版本创建的 collection 若缺少 BM25 字段（`text`/`sparse`），BM25 检索路会失败并**自动降级为纯向量检索**（不再有旧 collection 兼容适配代码）；如需完整 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
+> **重要（已有数据的升级提示）**：collection 按知识库**动态创建**（`kb_{id}`），已存在时直接复用跳过，无需手工清理。由旧版本创建的 collection 若缺少 BM25 字段（`text`/`sparse`），BM25 检索路会失败并**自动降级为纯向量检索**；如需完整 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
 
 ### 3. 启动应用（三个服务都要启动）
 
-仓库根目录为聚合父工程，三个模块均为**独立服务**：`spring-ai-rag`（RAG 服务，8080）、`spring-ai-user`（用户服务，8082）、`gateway`（网关，8081）。**网关对外提供 8081 统一入口，按路径分流到用户服务与 RAG**，需分别启动三个服务（建议开三个终端）。推荐在根目录用 `-pl` 指定子模块启动：
+仓库根目录为聚合父工程，三个模块均为**独立服务**：`spring-ai-rag`（RAG 服务，8080）、`spring-ai-user`（用户服务，8082）、`gateway`（网关，7070）。**网关对外提供 7070 统一入口，按路径分流到用户服务与 RAG**，需分别启动三个服务（建议开三个终端）。推荐在根目录用 `-pl` 指定子模块启动：
 
 ```bash
 # 终端 1：RAG 服务（8080）
@@ -651,7 +629,7 @@ mvnw.cmd -pl spring-ai-rag spring-boot:run     # Windows
 mvnw.cmd -pl spring-ai-user spring-boot:run    # Windows
 ./mvnw -pl spring-ai-user spring-boot:run      # Linux/macOS
 
-# 终端 3：网关（8081，对外统一入口）
+# 终端 3：网关（7070，对外统一入口）
 mvnw.cmd -pl gateway spring-boot:run           # Windows
 ./mvnw -pl gateway spring-boot:run             # Linux/macOS
 ```
@@ -672,21 +650,21 @@ cd ../gateway
 ../mvnw spring-boot:run        # Linux/macOS
 ```
 
-> 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
+> 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为一致。
 > 三个服务启动前需先启动 Nacos（`docker-compose up -d nacos`）；服务注册与发现、网关 `lb://` 路由、OpenFeign 服务间调用（`UserFeignClient` / `RagSyncFeignClient`）均依赖 Nacos。Nacos 不可用时服务仍可启动（`optional:` 配置导入 + 本地兜底密钥），但服务间寻址会失败，OpenFeign 调用将走熔断降级兜底。
 > 三个服务的 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；这些密钥默认从 Nacos 配置中心 `common.yaml` 拉取（Nacos 可用时优先生效），本地 `application.yaml` 保留兜底值。
-> 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
+> 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 7070。
 
 ### 4. 访问页面
 
 - 页面（由 RAG 服务提供）：http://localhost:8080/login.html、http://localhost:8080/index.html
-- API（统一经网关）：http://localhost:8081/api/** —— 前端已内置 `API_BASE = 'http://localhost:8081'`，页面加载后所有接口请求自动经网关转发
+- API（统一经网关）：http://localhost:7070/api/** —— 前端已内置 `API_BASE = 'http://localhost:7070'`，页面加载后所有接口请求自动经网关转发
 
 ---
 
 ## REST API 一览
 
-> 以下接口统一由**网关 8081** 暴露，按路径分流：认证/用户/角色（`/api/register`、`/api/login`、`/api/logout`、`/api/refresh`、`/api/user`、`/api/users/**`、`/api/admin/**`）→ 用户服务（8082）；知识库/文档（`/api/knowledge-*`）→ RAG 服务（8080）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，下游服务 `GatewayIdentityFilter` 二次校验内部令牌。
+> 以下接口统一由**网关 7070** 暴露，按路径分流：认证/用户/角色（`/api/register`、`/api/login`、`/api/logout`、`/api/refresh`、`/api/user`、`/api/users/**`、`/api/admin/**`）→ 用户服务（8082）；知识库/文档（`/api/knowledge-*`）→ RAG 服务（8080）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，下游服务 `GatewayIdentityFilter` 二次校验内部令牌。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
@@ -739,5 +717,6 @@ cd ../gateway
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
 15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
-16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 8081，CORS 由网关 `globalcors` 统一放行。
+16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 7070，CORS 由网关 `globalcors` 统一放行。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
+18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。

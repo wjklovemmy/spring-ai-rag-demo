@@ -29,67 +29,14 @@
         <spring-cloud.version>2025.1.0</spring-cloud.version>
         <spring-cloud-alibaba.version>2025.1.0.0</spring-cloud-alibaba.version>
     </properties>
+    <!--
+      依赖下沉说明：
+      父 POM <dependencies> 仅保留三个服务（spring-ai-rag / spring-ai-user / gateway）通用的依赖；
+      Web / AOP / MyBatis-Plus / MySQL 驱动 / Redis / JWT / BCrypt 等业务专属依赖
+      已下沉至各子模块显式声明（避免 gateway 这类 WebFlux 应用继承到
+      spring-boot-starter-webmvc / mybatis-plus（触发 DataSource 自动配置）等无关依赖）。
+    -->
     <dependencies>
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webmvc</artifactId>
-        </dependency>
-        <!-- AOP（Spring Boot 4 中由 spring-boot-starter-aop 更名而来）：@RequireKbRole 权限切面 -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-aspectj</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.baomidou</groupId>
-            <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
-            <version>3.5.16</version>
-        </dependency>
-        <dependency>
-            <groupId>com.baomidou</groupId>
-            <artifactId>mybatis-plus-jsqlparser</artifactId>
-            <version>3.5.16</version>
-        </dependency>
-        <dependency>
-            <groupId>com.mysql</groupId>
-            <artifactId>mysql-connector-j</artifactId>
-            <scope>runtime</scope>
-        </dependency>
-        <!-- Redis：Refresh Token 会话存储（TTL 自动过期，登出即撤销） -->
-        <dependency>
-            <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-data-redis</artifactId>
-        </dependency>
-        <!-- Lettuce 连接池（配合 spring.data.redis.lettuce.pool 配置） -->
-        <dependency>
-            <groupId>org.apache.commons</groupId>
-            <artifactId>commons-pool2</artifactId>
-        </dependency>
-
-        <!-- JWT -->
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-api</artifactId>
-            <version>0.12.6</version>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-impl</artifactId>
-            <version>0.12.6</version>
-            <scope>runtime</scope>
-        </dependency>
-        <dependency>
-            <groupId>io.jsonwebtoken</groupId>
-            <artifactId>jjwt-jackson</artifactId>
-            <version>0.12.6</version>
-            <scope>runtime</scope>
-        </dependency>
-
-        <!-- BCrypt 密码加密 -->
-        <dependency>
-            <groupId>org.springframework.security</groupId>
-            <artifactId>spring-security-crypto</artifactId>
-        </dependency>
-
         <!-- ==================== Nacos 注册中心 / 配置中心（三个服务统一接入） ====================
              版本由 spring-cloud-alibaba-dependencies BOM（2025.1.0.0）管理 -->
         <!-- Nacos 服务注册与发现 -->

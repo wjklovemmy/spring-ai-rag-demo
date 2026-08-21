@@ -14,7 +14,7 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
  *   <li>用户管理 / 角色管理（仅 ADMIN）</li>
  *   <li>内部接口 /internal/users/**：供 RAG 服务远程判定 isAdmin、批量查询用户摘要</li>
  * </ul>
- * 请求统一经 Gateway（8081）转发进入，本服务通过 GatewayIdentityFilter 消费身份头；
+ * 请求统一经 Gateway（7070）转发进入，本服务通过 GatewayIdentityFilter 消费身份头；
  * 删除用户时的知识库校验与清理经 RagSyncClient（OpenFeign）反向回调 RAG 服务的
  * /internal/kb/** 接口（Nacos 服务发现 + Sentinel 熔断降级）。
  * <p>

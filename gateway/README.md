@@ -28,7 +28,7 @@ mvnw.cmd -pl gateway spring-boot:run
 ./mvnw -pl gateway spring-boot:run
 ```
 
-启动后访问：`http://localhost:8081/api/knowledge-document/chat`（经网关转发到 RAG 服务）。
+启动后访问：`http://localhost:7070/api/knowledge-document/chat`（经网关转发到 RAG 服务）。
 
 ## 启用 IP 限流
 
@@ -40,10 +40,10 @@ mvnw.cmd -pl gateway spring-boot:run
 
 ```bash
 # 健康检查
-curl http://localhost:8081/actuator/health
+curl http://localhost:7070/actuator/health
 
 # 透传登录接口（用户服务返回 200 且会话建立）
-curl -X POST http://localhost:8081/api/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
+curl -X POST http://localhost:7070/api/login -H "Content-Type: application/json" -d "{\"username\":\"admin\",\"password\":\"admin123\"}"
 
 # Nacos 中确认网关已注册（应看到 gateway 实例）
 curl "http://localhost:8848/nacos/v1/ns/instance/list?serviceName=gateway"

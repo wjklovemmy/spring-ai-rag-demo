@@ -9,7 +9,7 @@
                         ▲ 注册 ▲ 配置 ▲
         ┌───────────────┼───────┼───────────────┐
     gateway         spring-ai-rag          spring-ai-user
-   (8081, lb://路由)   (8080)                 (8082)
+   (7070, lb://路由)   (8080)                 (8082)
 ```
 
 - **服务注册与发现**：三个服务以 `spring.application.name` 为服务名注册到 Nacos；网关路由与内部调用全部改用 `lb://服务名`，由 Spring Cloud LoadBalancer 从 Nacos 解析实例，不再硬编码 `localhost:8080/8082`。
@@ -44,4 +44,4 @@ curl http://localhost:8848/nacos/v1/ns/instance/list?serviceName=spring-ai-user
 curl http://localhost:8848/nacos/v1/ns/instance/list?serviceName=gateway
 ```
 
-访问 http://localhost:8081/api/login 等网关入口，链路仍与改造前一致（注册中心只影响服务寻址方式）。
+访问 http://localhost:7070/api/login 等网关入口，链路仍与改造前一致（注册中心只影响服务寻址方式）。

@@ -7,7 +7,7 @@
 # 本地 application.yaml 保留同名兜底值（Nacos 不可用时服务仍可启动，
 # 一旦 Nacos 可用，此处配置优先生效）。
 #
-# 导入方式：Nacos 控制台（http://localhost:8848/nacos，账号 nacos/nacos）
+# 导入方式：Nacos 控制台（http://localhost:8090/nacos，账号 nacos/nacos）
 #   → 配置管理 → 配置列表 → 新建配置
 #   Data ID: common.yaml   Group: DEFAULT_GROUP   格式: YAML
 # ============================================================
