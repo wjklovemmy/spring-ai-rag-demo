@@ -136,49 +136,18 @@ CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Embedding任务';
 
 
--- ==================== 用户表 ====================
-CREATE TABLE IF NOT EXISTS sys_user (
-                                        id BIGINT PRIMARY KEY AUTO_INCREMENT COMMENT '主键',
-                                        username VARCHAR(50) NOT NULL COMMENT '用户名，登录用',
-    password VARCHAR(255) NOT NULL COMMENT 'BCrypt 加密后的密码',
-    nickname VARCHAR(50) DEFAULT NULL COMMENT '显示昵称',
-    email VARCHAR(100) DEFAULT NULL COMMENT '邮箱',
-    status TINYINT NOT NULL DEFAULT 1 COMMENT '状态：1-启用 0-禁用',
-    create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-    update_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-
-    UNIQUE KEY uk_username (username)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='系统用户';
-
 -- ============================================================
--- RAG 防越权 RBAC 数据模型（企业级）
+-- RAG 数据授权（水平/数据权限）与安全审计
 -- 执行环境：知识库所在 MySQL（knowledge_base 库）
 -- 说明：
---   1. sys_role / sys_user_role  —— 全局角色（垂直权限），内置 ADMIN
---   2. kb_member                  —— 知识库成员授权（水平/数据权限），唯一权威
---   3. kb_access_log              —— 安全审计日志（含越权拒绝）
+--   1. 用户表（sys_user）与全局角色（sys_role / sys_permission /
+--      sys_user_role / sys_role_permission）已随用户域迁移至独立库
+--      spring_ai_user，建表与种子见 sql/user.sql；
+--      此处 kb_member / kb_access_log 中的 user_id 为跨库逻辑引用（无外键约束）
+--   2. kb_member    —— 知识库成员授权（水平/数据权限），唯一权威
+--   3. kb_access_log —— 安全审计日志（含越权拒绝）
 --   角色语义：OWNER(可授权/删除知识库) > EDITOR(可上传/删除文档) > VIEWER(可问答/检索)
 -- ============================================================
-
--- 全局角色
-CREATE TABLE IF NOT EXISTS `sys_role` (
-                                          `id`          BIGINT AUTO_INCREMENT PRIMARY KEY,
-                                          `code`        VARCHAR(50)  NOT NULL COMMENT '角色编码，如 ADMIN',
-    `name`        VARCHAR(100) NOT NULL COMMENT '角色名称',
-    `remark`      VARCHAR(255) COMMENT '备注',
-    `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
-    `update_time` DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY `uk_role_code` (`code`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='全局角色表';
-
--- 用户-角色关联
-CREATE TABLE IF NOT EXISTS `sys_user_role` (
-                                               `id`          BIGINT AUTO_INCREMENT PRIMARY KEY,
-                                               `user_id`     BIGINT NOT NULL COMMENT '用户 ID',
-                                               `role_id`     BIGINT NOT NULL COMMENT '角色 ID',
-                                               `create_time` DATETIME DEFAULT CURRENT_TIMESTAMP,
-                                               UNIQUE KEY `uk_user_role` (`user_id`, `role_id`)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户角色关联表';
 
 -- 知识库成员授权（数据权限核心）
 CREATE TABLE IF NOT EXISTS `kb_member` (
@@ -208,23 +177,6 @@ CREATE TABLE IF NOT EXISTS `kb_access_log` (
     KEY `idx_user` (`user_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识库安全审计日志';
 
--- 内置 ADMIN 角色（应用启动时 DataInitializer 也会自动补齐）
-INSERT INTO `sys_role` (`code`, `name`, `remark`) VALUES ('ADMIN', '系统管理员', '可管理所有知识库')
-    ON DUPLICATE KEY UPDATE `name` = VALUES(`name`);
-
--- ============================================================
--- 内置管理员账号（首次部署引导）
--- 密码为 admin123（BCrypt 加密），请上线后立即修改
--- 注意：仅当 sys_user 表为空时由应用 DataInitializer 自动创建；
---       若表已有数据，可执行下面语句手动补齐（幂等，可重复执行）。
--- ============================================================
-INSERT INTO `sys_user` (`username`, `password`, `nickname`, `status`)
-VALUES ('admin', '$2b$12$5W5lVdCRZfzsNzb/9XN1keZFrv42O5EtGeFlne3HxqRhOpvVb/mDm', '系统管理员', 1)
-ON DUPLICATE KEY UPDATE `username` = `username`;
-
--- 绑定 admin -> ADMIN 角色（幂等）
-INSERT INTO `sys_user_role` (`user_id`, `role_id`)
-SELECT u.id, r.id FROM `sys_user` u, `sys_role` r
-WHERE u.username = 'admin' AND r.code = 'ADMIN'
-ON DUPLICATE KEY UPDATE `user_id` = `user_id`;
+-- 内置 ADMIN 角色 / 权限种子 / admin 管理员账号及其绑定关系，
+-- 已全部迁移至用户域独立库脚本 sql/user.sql（应用启动时 UserDataInitializer 也会自动补齐）。
 

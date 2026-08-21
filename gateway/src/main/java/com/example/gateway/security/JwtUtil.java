@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 /**
  * JWT 校验工具（网关侧只做校验，不签发）。
@@ -23,6 +24,8 @@ public class JwtUtil {
 
     public static final String CLAIM_TYPE = "type";
     public static final String TYPE_ACCESS = "access";
+    /** 权限码 claim（Access Token 携带，网关解出后透传下游，鉴权免查库） */
+    public static final String CLAIM_PERMISSIONS = "permissions";
 
     private final SecretKey secretKey;
 
@@ -66,5 +69,15 @@ public class JwtUtil {
 
     public String getUsername(String token) {
         return parseToken(token).get("username", String.class);
+    }
+
+    /** 从 Token 中解析权限码列表（缓存进 JWT 的权限集合，未携带时返回空列表） */
+    @SuppressWarnings("unchecked")
+    public List<String> getPermissions(String token) {
+        Object permissions = parseToken(token).get(CLAIM_PERMISSIONS);
+        if (permissions instanceof List<?> list) {
+            return list.stream().map(String::valueOf).toList();
+        }
+        return List.of();
     }
 }

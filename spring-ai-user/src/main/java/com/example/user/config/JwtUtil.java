@@ -9,12 +9,14 @@ import org.springframework.stereotype.Component;
 import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
 import java.util.Date;
+import java.util.List;
 import java.util.UUID;
 
 /**
  * JWT 工具类：双 Token 机制（Access Token + Refresh Token）。
  * <ul>
- *   <li>Access Token：有效期短（默认 30 分钟），用于正常 API 鉴权，claim 含 type=access</li>
+ *   <li>Access Token：有效期短（默认 30 分钟），用于正常 API 鉴权，claim 含 type=access，
+ *       同时携带用户权限码（permissions），下游鉴权无需再查库（缓存进 JWT）</li>
  *   <li>Refresh Token：有效期长（默认 7 天），用于换取新的双 Token，claim 含 type=refresh</li>
  * </ul>
  * 前端在收到 401 且 code=TOKEN_EXPIRED 时，使用 Refresh Token 调用 /api/refresh 自动续期。
@@ -27,6 +29,8 @@ public class JwtUtil {
     public static final String CLAIM_TYPE = "type";
     public static final String TYPE_ACCESS = "access";
     public static final String TYPE_REFRESH = "refresh";
+    /** 权限码 claim 的 key（仅 Access Token 携带） */
+    public static final String CLAIM_PERMISSIONS = "permissions";
 
     private final SecretKey secretKey;
     private final long expirationMs;
@@ -41,24 +45,26 @@ public class JwtUtil {
     }
 
     /**
-     * 生成 Access Token（用于接口鉴权）
+     * 生成 Access Token（用于接口鉴权），权限码直接写入 JWT claim（缓存进 JWT，
+     * 网关/下游鉴权无需再查库；权限变更最长在 Access Token 有效期后生效）。
      */
-    public String generateAccessToken(Long userId, String username) {
-        return generateToken(userId, username, TYPE_ACCESS, expirationMs);
+    public String generateAccessToken(Long userId, String username, List<String> permissions) {
+        return generateToken(userId, username, TYPE_ACCESS, expirationMs, permissions);
     }
 
     /**
-     * 生成 Refresh Token（用于续期换取新 Token）
+     * 生成 Refresh Token（用于续期换取新 Token），不携带权限码
      */
     public String generateRefreshToken(Long userId, String username) {
-        return generateToken(userId, username, TYPE_REFRESH, refreshExpirationMs);
+        return generateToken(userId, username, TYPE_REFRESH, refreshExpirationMs, null);
     }
 
-    private String generateToken(Long userId, String username, String type, long expireMs) {
+    private String generateToken(Long userId, String username, String type, long expireMs,
+                                 List<String> permissions) {
         Date now = new Date();
         Date expiry = new Date(now.getTime() + expireMs);
 
-        return Jwts.builder()
+        var builder = Jwts.builder()
                 .subject(String.valueOf(userId))
                 .claim("username", username)
                 .claim(CLAIM_TYPE, type)
@@ -66,8 +72,11 @@ public class JwtUtil {
                 .id(UUID.randomUUID().toString())
                 .issuedAt(now)
                 .expiration(expiry)
-                .signWith(secretKey)
-                .compact();
+                .signWith(secretKey);
+        if (permissions != null && !permissions.isEmpty()) {
+            builder.claim(CLAIM_PERMISSIONS, permissions);
+        }
+        return builder.compact();
     }
 
     /**
@@ -131,6 +140,18 @@ public class JwtUtil {
      */
     public String getUsername(String token) {
         return parseToken(token).get("username", String.class);
+    }
+
+    /**
+     * 从 Token 中解析权限码列表（缓存进 JWT 的权限集合，未携带时返回空列表）
+     */
+    @SuppressWarnings("unchecked")
+    public List<String> getPermissions(String token) {
+        Object permissions = parseToken(token).get(CLAIM_PERMISSIONS);
+        if (permissions instanceof List<?> list) {
+            return list.stream().map(String::valueOf).toList();
+        }
+        return List.of();
     }
 
     /**

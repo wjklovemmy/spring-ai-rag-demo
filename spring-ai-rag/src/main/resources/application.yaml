@@ -44,10 +44,18 @@ spring:
           host: localhost
           port: 19530
   datasource:
+    # 主数据源：RAG 业务库（由 DataSourceConfig 绑定到 HikariCP）
     url: jdbc:mysql://localhost:3306/knowledge_base?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
+    # 用户域独立数据源（spring-ai-user 共享 jar 使用，由 UserDataSourceConfig 绑定）
+    # 建库脚本见 sql/user.sql，5 张表：sys_user / sys_role / sys_permission / sys_user_role / sys_role_permission
+    user:
+      url: jdbc:mysql://localhost:3306/spring_ai_user?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+      username: root
+      password: root
+      driver-class-name: com.mysql.cj.jdbc.Driver
     # 连接池参数（自定义，由 DataSourceConfig 绑定到 HikariCP）
   task:
     # Embedding 异步任务线程池参数（自定义，由 AsyncTaskConfig 绑定）

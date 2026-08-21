@@ -2,6 +2,8 @@ package com.example.user.security;
 
 import org.springframework.web.context.request.RequestContextHolder;
 
+import java.util.List;
+
 /**
  * 当前登录用户上下文（ThreadLocal）：
  * 由 {@code JwtAuthenticationFilter} 在请求进入时注入、请求结束时清理。
@@ -33,6 +35,14 @@ public final class UserContext {
     public static String getUsername() {
         LoginUser user = HOLDER.get();
         return user == null ? null : user.username();
+    }
+
+    /**
+     * 当前用户权限码（来自 JWT 缓存，网关透传），未登录或未携带返回 null
+     */
+    public static List<String> getPermissions() {
+        LoginUser user = HOLDER.get();
+        return user == null ? null : user.permissions();
     }
 
     public static void clear() {

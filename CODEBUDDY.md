@@ -45,7 +45,7 @@ Before running, ensure the following services are available:
 - **Milvus** vector database on `localhost:19530` (default database, collection `knowledge_document`)
 - **DeepSeek API** key configured in `application.yaml`
 - **DashScope (Alibaba Cloud) API** key via environment variable `DASHSCOPE_API_KEY`
-- **MySQL** database (MyBatis-Plus mappers defined in both `spring-ai-rag` 业务表 and `spring-ai-user` 用户/角色表)
+- **MySQL** — 双库：RAG 业务库 `knowledge_base`（`sql/init.sql`）+ 用户域独立库 `spring_ai_user`（`sql/user.sql`，RBAC 五表）
 
 ## Architecture
 
@@ -140,13 +140,15 @@ Two pure HTML pages served from `/static` on port **8080** (all their API calls 
 - `login.html` — Login form with animated background, calls `POST /api/login`
 - `index.html` — Dashboard with sidebar navigation (Home, Knowledge Q&A, Upload Document tabs), checks auth via `GET /api/user`, calls `POST /api/knowledge-document/chat` and `POST /api/knowledge-document/upload`
 
-### MyBatis-Plus & MySQL
+### MyBatis-Plus & MySQL（双库隔离，多数据源）
 
-Mappers/entities are split by domain:
-- `spring-ai-rag`（`com.example.springairagdemo`）: `knowledge_base`（含 `id/name/description/status/create_user/create_time/update_time`）/ `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`
-- `spring-ai-user`（`com.example.user`）: `sys_user` / `sys_role` / `sys_user_role`（RBAC 用户域）
+- **主数据源** `spring.datasource.*`（RAG 业务库 `knowledge_base`）：`DataSourceConfig` 显式装配 @Primary `dataSource` + `sqlSessionFactory` + `sqlSessionTemplate`，`@MapperScan("com.example.springairagdemo.mapper")` 绑定；表：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
+- **用户域数据源** `spring.datasource.user.*`（独立库 `spring_ai_user`）：spring-ai-user 的 `UserDataSourceConfig` 独立装配 `userDataSource` + `userSqlSessionFactory` + `userSqlSessionTemplate` + `userTransactionManager`，其上的 `@MapperScan` 将 `com.example.user.mapper` 绑定到该库。RBAC 五表：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`。
 
-RAG 主类通过 `@SpringBootApplication(scanBasePackages)` 与 `@MapperScan` 同时扫描 `com.example.springairagdemo` 与 `com.example.user` 两个包，用户域 Bean/Mapper 与 RAG 业务同进程 8080 生效。
+> 必须显式注册两个 `SqlSessionFactory`：用户域注册 `SqlSessionFactory` 后，MyBatis-Plus 自动配置的默认 factory 会因 `@ConditionalOnMissingBean` 失效，故 RAG 侧主 factory 也显式注册（@Primary）。
+
+RAG 主类 `@SpringBootApplication(scanBasePackages = {"com.example.springairagdemo", "com.example.user"})` 扫描双包，用户域 Bean/Mapper 与 RAG 业务同进程 8080 生效；`@MapperScan` 仅扫 RAG 包（用户域由 UserDataSourceConfig 的 @MapperScan 负责）。
+`kb_member` / `kb_access_log` 的 `user_id` 为跨库逻辑引用（无外键），删除用户前由 SPI `UserDeletionGuard`（RAG 侧实现 `KbMemberDeletionGuard`，对 `KbAuthorizationService` 使用 `@Lazy` 打破循环依赖）清理业务数据。
 
 ### Key Dependencies
 
@@ -154,7 +156,7 @@ RAG 主类通过 `@SpringBootApplication(scanBasePackages)` 与 `@MapperScan` �
 - `spring-ai-starter-model-deepseek` — DeepSeek chat model auto-configuration
 - `spring-ai-starter-vector-store-milvus` — Milvus vector store integration
 - `spring-ai-pdf-document-reader` — PDF parsing via `PagePdfDocumentReader`
-- `mybatis-plus-spring-boot3-starter` 3.5.10.1 — ORM（RAG 业务表 + 用户域表 mapper 均已定义，见上文 MyBatis-Plus & MySQL 章节）
+- `mybatis-plus-spring-boot4-starter` 3.5.16 — ORM（双库 mapper 均已定义，见上文 MyBatis-Plus & MySQL 章节）
 - `mysql-connector-j` — MySQL JDBC driver (runtime scope)
 - Lombok for boilerplate reduction
 - `spring-boot-devtools` for hot reload during development

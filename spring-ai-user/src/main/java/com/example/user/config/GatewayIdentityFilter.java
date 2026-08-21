@@ -34,6 +34,8 @@ public class GatewayIdentityFilter implements Filter {
     public static final String HEADER_USER_ID = "X-User-Id";
     public static final String HEADER_USERNAME = "X-Username";
     public static final String HEADER_GATEWAY_TOKEN = "X-Gateway-Token";
+    /** 权限码头：网关从 JWT 中解出后透传（逗号分隔），本服务直接消费，无需再查库 */
+    public static final String HEADER_PERMISSIONS = "X-Permissions";
 
     /** 无需身份的白名单路径（与网关侧保持一致） */
     private static final List<String> WHITELIST = Arrays.asList(
@@ -81,11 +83,21 @@ public class GatewayIdentityFilter implements Filter {
             return;
         }
 
+        // 权限码由网关从 JWT 中解出透传（逗号分隔），作为鉴权缓存直接消费
+        String permissionsStr = httpRequest.getHeader(HEADER_PERMISSIONS);
+        List<String> permissions = permissionsStr == null || permissionsStr.isBlank()
+                ? List.of()
+                : Arrays.stream(permissionsStr.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .toList();
+
         Long userId = Long.valueOf(userIdStr);
         httpRequest.setAttribute("userId", userId);
         httpRequest.setAttribute("username", username);
+        httpRequest.setAttribute("permissions", permissions);
         try {
-            UserContext.set(new LoginUser(userId, username));
+            UserContext.set(new LoginUser(userId, username, permissions));
             chain.doFilter(request, response);
         } finally {
             UserContext.clear();

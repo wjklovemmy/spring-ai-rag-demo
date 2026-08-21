@@ -41,7 +41,8 @@ public class AuthController {
                     "token", result.token(),
                     "refreshToken", result.refreshToken(),
                     "username", result.username(),
-                    "userId", result.userId()
+                    "userId", result.userId(),
+                    "permissions", result.permissions()
             ));
         }
         return ResponseEntity.badRequest().body(Map.of(
@@ -66,7 +67,8 @@ public class AuthController {
                     "token", result.token(),
                     "refreshToken", result.refreshToken(),
                     "username", result.username(),
-                    "userId", result.userId()
+                    "userId", result.userId(),
+                    "permissions", result.permissions()
             ));
         }
         return ResponseEntity.status(401).body(Map.of(
@@ -89,7 +91,8 @@ public class AuthController {
                     "token", result.token(),
                     "refreshToken", result.refreshToken(),
                     "username", result.username(),
-                    "userId", result.userId()
+                    "userId", result.userId(),
+                    "permissions", result.permissions()
             ));
         }
         return ResponseEntity.status(401).body(Map.of(
@@ -111,7 +114,9 @@ public class AuthController {
                 "success", true,
                 "username", username,
                 "userId", userId,
-                "isAdmin", userService.isAdmin(userId)
+                "isAdmin", userService.isAdmin(userId),
+                // 权限码优先读 JWT 缓存（网关透传），无需再查库
+                "permissions", userService.getCurrentPermissionCodes()
         ));
     }
 

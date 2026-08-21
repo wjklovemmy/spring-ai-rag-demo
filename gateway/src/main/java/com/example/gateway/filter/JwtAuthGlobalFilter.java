@@ -33,9 +33,11 @@ import java.util.List;
 @Component
 public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
 
-    /** 转发身份头：userId / username / 网关信任令牌 */
+    /** 转发身份头：userId / username / 权限码 / 网关信任令牌 */
     public static final String HEADER_USER_ID = "X-User-Id";
     public static final String HEADER_USERNAME = "X-Username";
+    /** 权限码头：从 JWT 解出权限码后逗号拼接透传，下游鉴权直接消费（缓存进 JWT） */
+    public static final String HEADER_PERMISSIONS = "X-Permissions";
     public static final String HEADER_GATEWAY_TOKEN = "X-Gateway-Token";
 
     private static final String BLACKLIST_PREFIX = "auth:blacklist:";
@@ -99,19 +101,23 @@ public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
                 });
     }
 
-    /** 剥离客户端伪造的 X-User-* 头，注入真实身份与网关信任令牌 */
+    /** 剥离客户端伪造的 X-User-* / X-Permissions 头，注入真实身份、权限码与网关信任令牌 */
     private Mono<Void> forwardWithIdentity(ServerWebExchange exchange, GatewayFilterChain chain, String token) {
         Long userId = jwtUtil.getUserId(token);
         String username = jwtUtil.getUsername(token);
         String clientIp = resolveClientIp(exchange);
+        // 权限码直接从 JWT 解出（缓存进 JWT），逗号拼接为单头透传下游
+        String permissionsHeader = String.join(",", jwtUtil.getPermissions(token));
 
         var mutated = exchange.getRequest().mutate()
                 .headers(headers -> {
                     headers.remove(HEADER_USER_ID);
                     headers.remove(HEADER_USERNAME);
+                    headers.remove(HEADER_PERMISSIONS);
                     headers.remove(HEADER_GATEWAY_TOKEN);
                     headers.set(HEADER_USER_ID, String.valueOf(userId));
                     headers.set(HEADER_USERNAME, username);
+                    headers.set(HEADER_PERMISSIONS, permissionsHeader);
                     headers.set(HEADER_GATEWAY_TOKEN, gatewayToken);
                     if (clientIp != null) {
                         headers.set("X-Forwarded-For", clientIp);

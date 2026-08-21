@@ -3,7 +3,7 @@ package com.example.springairagdemo.service;
 import com.example.springairagdemo.entity.KbMemberEntity;
 import com.example.user.security.ForbiddenException;
 import com.example.user.spi.UserDeletionGuard;
-import lombok.RequiredArgsConstructor;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
@@ -17,11 +17,16 @@ import java.util.List;
  * 由用户域 {@code UserService.deleteUser} 自动触发，保持依赖方向单向（业务 → 用户域）。
  */
 @Component
-@RequiredArgsConstructor
 public class KbMemberDeletionGuard implements UserDeletionGuard {
 
     private final KbMemberService kbMemberService;
     private final KbAuthorizationService kbAuthorizationService;
+
+    public KbMemberDeletionGuard(KbMemberService kbMemberService,
+                                 @Lazy KbAuthorizationService kbAuthorizationService) {
+        this.kbMemberService = kbMemberService;
+        this.kbAuthorizationService = kbAuthorizationService;
+    }
 
     @Override
     public void validateDeletion(Long userId) {

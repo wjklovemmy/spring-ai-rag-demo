@@ -3,7 +3,9 @@ package com.example.user.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.example.user.config.JwtUtil;
+import com.example.user.entity.SysPermissionEntity;
 import com.example.user.entity.SysRoleEntity;
+import com.example.user.entity.SysRolePermissionEntity;
 import com.example.user.entity.SysUserRoleEntity;
 import com.example.user.entity.UserEntity;
 import com.example.user.mapper.UserMapper;
@@ -33,18 +35,24 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
     private final RedisRefreshTokenService refreshTokenService;
     private final SysRoleService sysRoleService;
     private final SysUserRoleService sysUserRoleService;
+    private final SysPermissionService sysPermissionService;
+    private final SysRolePermissionService sysRolePermissionService;
     private final List<UserDeletionGuard> deletionGuards;
 
     public UserService(PasswordEncoder passwordEncoder, JwtUtil jwtUtil,
                        RedisRefreshTokenService refreshTokenService,
                        SysRoleService sysRoleService,
                        SysUserRoleService sysUserRoleService,
+                       SysPermissionService sysPermissionService,
+                       SysRolePermissionService sysRolePermissionService,
                        List<UserDeletionGuard> deletionGuards) {
         this.passwordEncoder = passwordEncoder;
         this.jwtUtil = jwtUtil;
         this.refreshTokenService = refreshTokenService;
         this.sysRoleService = sysRoleService;
         this.sysUserRoleService = sysUserRoleService;
+        this.sysPermissionService = sysPermissionService;
+        this.sysRolePermissionService = sysRolePermissionService;
         this.deletionGuards = deletionGuards;
     }
 
@@ -79,8 +87,9 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
         save(user);
         log.info("用户注册成功: {} (id={})", username, user.getId());
 
-        TokenPair pair = issueTokenPair(user.getId(), username);
-        return RegisterResult.ok(pair.accessToken(), pair.refreshToken(), username, user.getId());
+        // 新注册用户初始无角色，权限为空
+        TokenPair pair = issueTokenPair(user.getId(), username, List.of());
+        return RegisterResult.ok(pair.accessToken(), pair.refreshToken(), username, user.getId(), List.of());
     }
 
     /**
@@ -103,9 +112,11 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
             return LoginResult.fail("用户名或密码错误");
         }
 
-        TokenPair pair = issueTokenPair(user.getId(), username);
+        // 权限码查询一次后同时写入 JWT（缓存）与响应
+        List<String> permissions = getPermissionCodes(user.getId());
+        TokenPair pair = issueTokenPair(user.getId(), username, permissions);
         log.info("用户 {} 登录成功", username);
-        return LoginResult.ok(pair.accessToken(), pair.refreshToken(), username, user.getId());
+        return LoginResult.ok(pair.accessToken(), pair.refreshToken(), username, user.getId(), permissions);
     }
 
     /**
@@ -135,10 +146,11 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
             return LoginResult.fail("Refresh Token 已被撤销，请重新登录");
         }
 
-        // 轮换成功：旧 Refresh Token 已被原子消费，签发并保存新双 Token
-        TokenPair pair = issueTokenPair(userId, username);
+        // 轮换成功：旧 Refresh Token 已被原子消费，重新查询权限码并签发新双 Token（刷新可同步最新权限）
+        List<String> permissions = getPermissionCodes(userId);
+        TokenPair pair = issueTokenPair(userId, username, permissions);
         log.info("用户 {} 通过 Refresh Token 续期成功", username);
-        return LoginResult.ok(pair.accessToken(), pair.refreshToken(), username, userId);
+        return LoginResult.ok(pair.accessToken(), pair.refreshToken(), username, userId, permissions);
     }
 
     /**
@@ -238,12 +250,65 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
         log.info("用户已删除: userId={}", userId);
     }
 
+    // ==================== 权限码（RBAC：用户 -> 角色 -> 权限） ====================
+
     /**
-     * 生成一组新的 Access + Refresh Token，并将 Refresh Token 存入 Redis（登录 / 注册 / 续期时调用）
+     * 指定用户的权限码集合：通过 sys_user_role -> sys_role_permission -> sys_permission 链式查询。
+     * 返回启用状态的权限码（去重）。
      */
-    private TokenPair issueTokenPair(Long userId, String username) {
+    public List<String> getPermissionCodes(Long userId) {
+        if (userId == null) {
+            return List.of();
+        }
+        List<Long> roleIds = sysUserRoleService.lambdaQuery()
+                .eq(SysUserRoleEntity::getUserId, userId)
+                .list().stream()
+                .map(SysUserRoleEntity::getRoleId)
+                .distinct().toList();
+        if (roleIds.isEmpty()) {
+            return List.of();
+        }
+        List<Long> permissionIds = sysRolePermissionService.lambdaQuery()
+                .in(SysRolePermissionEntity::getRoleId, roleIds)
+                .list().stream()
+                .map(SysRolePermissionEntity::getPermissionId)
+                .distinct().toList();
+        if (permissionIds.isEmpty()) {
+            return List.of();
+        }
+        return sysPermissionService.lambdaQuery()
+                .in(SysPermissionEntity::getId, permissionIds)
+                .eq(SysPermissionEntity::getStatus, 1)
+                .list().stream()
+                .map(SysPermissionEntity::getCode)
+                .distinct().toList();
+    }
+
+    /**
+     * 当前登录用户的权限码集合：
+     * 优先读取 JWT 缓存（网关透传、UserContext 持有，零 DB 查询）；
+     * 缓存缺失（如未走网关）时回查数据库兜底。
+     */
+    public List<String> getCurrentPermissionCodes() {
+        List<String> cached = UserContext.getPermissions();
+        if (cached != null) {
+            return cached;
+        }
+        return getPermissionCodes(UserContext.getUserId());
+    }
+
+    /** 当前登录用户是否拥有指定权限码 */
+    public boolean hasPermission(String code) {
+        return getCurrentPermissionCodes().contains(code);
+    }
+
+    /**
+     * 生成一组新的 Access + Refresh Token，并将 Refresh Token 存入 Redis（登录 / 注册 / 续期时调用）。
+     * 权限码写入 Access Token 的 JWT claims（缓存进 JWT，供网关与下游鉴权直接消费）。
+     */
+    private TokenPair issueTokenPair(Long userId, String username, List<String> permissions) {
         TokenPair pair = new TokenPair(
-                jwtUtil.generateAccessToken(userId, username),
+                jwtUtil.generateAccessToken(userId, username, permissions),
                 jwtUtil.generateRefreshToken(userId, username)
         );
         refreshTokenService.saveToken(userId, jwtUtil.getJti(pair.refreshToken()),
@@ -257,22 +322,26 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
     // ---- 内部 Result 类 ----
 
     public record RegisterResult(boolean success, String message, String token,
-                                 String refreshToken, String username, Long userId) {
-        public static RegisterResult ok(String token, String refreshToken, String username, Long userId) {
-            return new RegisterResult(true, "注册成功", token, refreshToken, username, userId);
+                                 String refreshToken, String username, Long userId,
+                                 List<String> permissions) {
+        public static RegisterResult ok(String token, String refreshToken, String username,
+                                        Long userId, List<String> permissions) {
+            return new RegisterResult(true, "注册成功", token, refreshToken, username, userId, permissions);
         }
         public static RegisterResult fail(String message) {
-            return new RegisterResult(false, message, null, null, null, null);
+            return new RegisterResult(false, message, null, null, null, null, List.of());
         }
     }
 
     public record LoginResult(boolean success, String message, String token,
-                              String refreshToken, String username, Long userId) {
-        public static LoginResult ok(String token, String refreshToken, String username, Long userId) {
-            return new LoginResult(true, "登录成功", token, refreshToken, username, userId);
+                              String refreshToken, String username, Long userId,
+                              List<String> permissions) {
+        public static LoginResult ok(String token, String refreshToken, String username,
+                                     Long userId, List<String> permissions) {
+            return new LoginResult(true, "登录成功", token, refreshToken, username, userId, permissions);
         }
         public static LoginResult fail(String message) {
-            return new LoginResult(false, message, null, null, null, null);
+            return new LoginResult(false, message, null, null, null, null, List.of());
         }
     }
 }

@@ -77,7 +77,7 @@ graph TB
     end
 
     subgraph Storage["存储层"]
-        MYSQL[("MySQL<br/>文档/Chunk/用户/角色/kb_member 元数据")]
+        MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member<br/>用户域: RBAC 五表")]
         MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
         MINIO[("MinIO<br/>原始 PDF 文件")]
     end
@@ -247,7 +247,8 @@ spring-ai-rag-demo/
 │       │       └── application.yaml          # 路由 / CORS / jwt.secret / Redis / 可选 IP 限流
 │       └── test/
 ├── sql/
-│   └── init.sql                              # 全量初始化脚本（业务表 + RBAC 权限表 + 内置角色/账号）
+│   ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
+│   └── user.sql                              # 用户域独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
 ```
 
 ---
@@ -423,10 +424,21 @@ spring-ai-rag-demo/
 
 ## 数据库设计
 
-初始化脚本：
-- `sql/init.sql` — 全量初始化脚本（需手动在 MySQL 执行一次）：
-  业务表 `knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task`，权限表 `sys_user` / `sys_role` / `sys_user_role` / `kb_member` / `kb_access_log`，以及内置 `ADMIN` 角色与 `admin` 账号（均幂等，可重复执行）。
-  应用启动时用户域 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色与默认账号（仅当 `sys_user` 表为空时）。
+项目采用**双库隔离**（多数据源，同一 MySQL 实例、不同 schema）：
+
+| 库 | 归属 | 数据源配置 | 内容 |
+|----|------|-----------|------|
+| `knowledge_base` | RAG 业务域 | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志 |
+| `spring_ai_user` | 用户域（spring-ai-user 共享 jar） | `spring.datasource.user.*`（UserDataSourceConfig 独立装配） | RBAC 五表：用户/角色/权限/两级关联 |
+
+初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
+- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
+- `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
+
+应用启动时用户域 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色、权限种子与默认账号（幂等）。
+`kb_member` / `kb_access_log` 中的 `user_id` 为**跨库逻辑引用**（无外键约束），删除用户前由 SPI `UserDeletionGuard`（RAG 侧实现）先清理业务域数据。
+
+**RAG 业务库（knowledge_base）**：
 
 | 表 | 用途 | 关键字段 |
 |----|------|----------|
@@ -434,11 +446,20 @@ spring-ai-rag-demo/
 | `knowledge_document` | 文档元数据 | knowledge_id(FK)、file_name、file_path、file_size、file_type、chunk_count、embedding_model、status(**0上传中/1解析中/2向量化中/3成功/4失败/5已废弃/6已过期**)、**version**、**expire_time**（旧版本下线时间）、**is_active** |
 | `knowledge_chunk` | 文本分块 | document_id(FK)、chunk_index、content(LONGTEXT)、content_hash(SHA-256)、token_count、page_no、milvus_id |
 | `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status(0待处理/1处理中/2成功/3失败)、total/success/fail_chunk、**parse/split/chunk/embed/milvus_progress（阶段进度 0-100）**、retry_count、error_message、cost_time |
-| `sys_user` | 系统用户 | username(唯一)、password(BCrypt)、nickname、email、status |
-| `sys_role` | 全局角色（RBAC） | role_code(唯一)、role_name、description |
-| `sys_user_role` | 用户-角色关联 | user_id(FK)、role_id(FK) |
-| `kb_member` | 知识库成员授权（数据权限） | knowledge_id(FK)、user_id(FK)、role(VIEWER/EDITOR/OWNER)、create_time |
+| `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
+
+**用户域独立库（spring_ai_user）—— RBAC 经典五表**：
+
+| 表 | 用途 | 关键字段 |
+|----|------|----------|
+| `sys_user` | 系统用户 | username(唯一)、password(BCrypt)、nickname、email、status |
+| `sys_role` | 角色 | code(唯一，如 ADMIN)、name、remark、status |
+| `sys_permission` | 权限（按钮/API 级权限码） | code(唯一，如 kb:manage)、name、type(1-菜单/2-按钮/API)、parent_id、sort、status |
+| `sys_user_role` | 用户-角色关联 | user_id、role_id（联合唯一） |
+| `sys_role_permission` | 角色-权限关联 | role_id、permission_id（联合唯一） |
+
+权限模型：**用户 → 角色（`sys_user_role`）、角色 → 权限（`sys_role_permission`）** 链式授权；登录/刷新/`/api/user` 返回当前用户权限码集合 `permissions`；ADMIN 角色默认绑定全部权限，角色权限分配见 `PUT /api/admin/roles/{id}/permissions`。
 
 ---
 
@@ -519,7 +540,8 @@ docker-compose up -d
 会启动：Milvus 2.6.0（+ etcd）、MinIO（9002/9003，bucket `knowledge-documents` 自动创建）、Attu 管理界面（http://localhost:8000）。
 
 > 仓库中的 compose 未包含 MySQL 服务，需自行准备 MySQL 8.x，并执行一次：
-> 1. `sql/init.sql` — 全量初始化：业务表 + 权限表 + 内置 `ADMIN` 角色与 `admin` 账号（幂等，可重复执行）。
+> 1. `sql/init.sql` — RAG 业务库：业务表 + 成员授权 + 审计日志（幂等，可重复执行）。
+> 2. `sql/user.sql` — 用户域独立库：RBAC 五表（`sys_user`/`sys_role`/`sys_permission`/`sys_user_role`/`sys_role_permission`）+ 内置 `ADMIN` 角色与 `admin` 账号（幂等，可重复执行）。
 
 ### 1.1 默认账号
 
