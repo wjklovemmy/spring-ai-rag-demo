@@ -1,7 +1,7 @@
-package com.example.springairagdemo.mapper;
+package com.example.user.mapper;
 
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
-import com.example.springairagdemo.entity.SysRoleEntity;
+import com.example.user.entity.SysRoleEntity;
 import org.apache.ibatis.annotations.Mapper;
 
 @Mapper

@@ -1,32 +1,51 @@
-package com.example.springairagdemo.service;
+package com.example.user.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.example.springairagdemo.config.JwtUtil;
-import com.example.springairagdemo.entity.UserEntity;
-import com.example.springairagdemo.mapper.UserMapper;
+import com.example.user.config.JwtUtil;
+import com.example.user.entity.SysRoleEntity;
+import com.example.user.entity.SysUserRoleEntity;
+import com.example.user.entity.UserEntity;
+import com.example.user.mapper.UserMapper;
+import com.example.user.security.UserContext;
+import com.example.user.spi.UserDeletionGuard;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 
 import java.util.Date;
+import java.util.List;
 
 /**
- * 用户服务：注册、登录、双 Token 签发与刷新续期
+ * 用户服务（用户域）：
+ * 注册、登录、双 Token 签发与刷新续期；全局角色（ADMIN）判定；
+ * 用户删除时通过 {@link UserDeletionGuard} 扩展点联动业务模块（RAG）清理跨域数据。
  */
 @Slf4j
 @Service
 public class UserService extends ServiceImpl<UserMapper, UserEntity> {
 
+    /** 内置全局管理员角色编码 */
+    public static final String ADMIN_ROLE_CODE = "ADMIN";
+
     private final PasswordEncoder passwordEncoder;
     private final JwtUtil jwtUtil;
     private final RedisRefreshTokenService refreshTokenService;
+    private final SysRoleService sysRoleService;
+    private final SysUserRoleService sysUserRoleService;
+    private final List<UserDeletionGuard> deletionGuards;
 
     public UserService(PasswordEncoder passwordEncoder, JwtUtil jwtUtil,
-                       RedisRefreshTokenService refreshTokenService) {
+                       RedisRefreshTokenService refreshTokenService,
+                       SysRoleService sysRoleService,
+                       SysUserRoleService sysUserRoleService,
+                       List<UserDeletionGuard> deletionGuards) {
         this.passwordEncoder = passwordEncoder;
         this.jwtUtil = jwtUtil;
         this.refreshTokenService = refreshTokenService;
+        this.sysRoleService = sysRoleService;
+        this.sysUserRoleService = sysUserRoleService;
+        this.deletionGuards = deletionGuards;
     }
 
     /**
@@ -152,6 +171,71 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
                 log.debug("Access Token 加入黑名单失败（忽略）: {}", e.getMessage());
             }
         }
+    }
+
+    // ==================== 全局角色（垂直权限） ====================
+
+    /** 当前登录用户是否为 ADMIN */
+    public boolean isAdmin() {
+        return isAdmin(UserContext.getUserId());
+    }
+
+    /** 指定用户是否为 ADMIN */
+    public boolean isAdmin(Long userId) {
+        if (userId == null) {
+            return false;
+        }
+        List<Long> adminRoleIds = adminRoleIds();
+        if (adminRoleIds.isEmpty()) {
+            return false;
+        }
+        return sysUserRoleService.lambdaQuery()
+                .eq(SysUserRoleEntity::getUserId, userId)
+                .in(SysUserRoleEntity::getRoleId, adminRoleIds)
+                .count() > 0;
+    }
+
+    /** ADMIN 角色 ID 集合 */
+    public List<Long> adminRoleIds() {
+        return sysRoleService.lambdaQuery()
+                .eq(SysRoleEntity::getCode, ADMIN_ROLE_CODE)
+                .list()
+                .stream()
+                .map(SysRoleEntity::getId)
+                .toList();
+    }
+
+    /** 当前 ADMIN 用户总数（用于“不能删除/禁用最后一个管理员”保护） */
+    public long countAdmins() {
+        List<Long> adminRoleIds = adminRoleIds();
+        if (adminRoleIds.isEmpty()) {
+            return 0;
+        }
+        return sysUserRoleService.lambdaQuery()
+                .in(SysUserRoleEntity::getRoleId, adminRoleIds)
+                .count();
+    }
+
+    /**
+     * 删除用户（联动业务模块清理）：
+     * <ol>
+     *   <li>依次调用各 {@link UserDeletionGuard#validateDeletion} 前置校验（不满足则抛异常阻止删除）</li>
+     *   <li>清理功能角色关联（sys_user_role）</li>
+     *   <li>删除用户本体</li>
+     *   <li>依次调用各 {@link UserDeletionGuard#onUserDeleted} 清理跨域数据（如知识库成员授权）</li>
+     * </ol>
+     */
+    public void deleteUser(Long userId) {
+        for (UserDeletionGuard guard : deletionGuards) {
+            guard.validateDeletion(userId);
+        }
+        sysUserRoleService.remove(new LambdaQueryWrapper<SysUserRoleEntity>()
+                .eq(SysUserRoleEntity::getUserId, userId));
+        removeById(userId);
+        for (UserDeletionGuard guard : deletionGuards) {
+            guard.onUserDeleted(userId);
+        }
+        log.info("用户已删除: userId={}", userId);
     }
 
     /**

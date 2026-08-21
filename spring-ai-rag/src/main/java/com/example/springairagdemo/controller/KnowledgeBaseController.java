@@ -2,13 +2,13 @@ package com.example.springairagdemo.controller;
 
 import com.example.springairagdemo.entity.KbMemberEntity;
 import com.example.springairagdemo.entity.KnowledgeBaseEntity;
-import com.example.springairagdemo.entity.UserEntity;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.RequireKbRole;
-import com.example.springairagdemo.security.UserContext;
 import com.example.springairagdemo.service.KbAuthorizationService;
 import com.example.springairagdemo.service.KnowledgeBaseService;
-import com.example.springairagdemo.service.UserService;
+import com.example.user.entity.UserEntity;
+import com.example.user.security.UserContext;
+import com.example.user.service.UserService;
 import com.example.springairagdemo.service.VectorStoreService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

@@ -1,4 +1,4 @@
-package com.example.springairagdemo.config;
+package com.example.user.config;
 
 import io.jsonwebtoken.*;
 import io.jsonwebtoken.security.Keys;

@@ -1,7 +1,7 @@
-package com.example.springairagdemo.config;
+package com.example.user.config;
 
-import com.example.springairagdemo.security.LoginUser;
-import com.example.springairagdemo.security.UserContext;
+import com.example.user.security.LoginUser;
+import com.example.user.security.UserContext;
 import jakarta.servlet.Filter;
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;

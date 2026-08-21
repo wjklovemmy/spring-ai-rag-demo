@@ -1,4 +1,4 @@
-package com.example.springairagdemo.security;
+package com.example.user.security;
 
 /**
  * 当前登录用户（由 JWT 过滤器注入 UserContext）

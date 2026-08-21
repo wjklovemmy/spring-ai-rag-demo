@@ -1,4 +1,4 @@
-package com.example.springairagdemo.security;
+package com.example.user.security;
 
 import java.lang.annotation.ElementType;
 import java.lang.annotation.Retention;

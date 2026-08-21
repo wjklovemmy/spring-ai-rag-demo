@@ -1,17 +1,15 @@
-package com.example.springairagdemo.controller;
+package com.example.user.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.example.springairagdemo.entity.KbMemberEntity;
-import com.example.springairagdemo.entity.SysRoleEntity;
-import com.example.springairagdemo.entity.SysUserRoleEntity;
-import com.example.springairagdemo.entity.UserEntity;
-import com.example.springairagdemo.security.RequireAdmin;
-import com.example.springairagdemo.security.UserContext;
-import com.example.springairagdemo.service.KbAuthorizationService;
-import com.example.springairagdemo.service.KbMemberService;
-import com.example.springairagdemo.service.SysRoleService;
-import com.example.springairagdemo.service.SysUserRoleService;
-import com.example.springairagdemo.service.UserService;
+import com.example.user.entity.SysRoleEntity;
+import com.example.user.entity.SysUserRoleEntity;
+import com.example.user.entity.UserEntity;
+import com.example.user.security.RequireAdmin;
+import com.example.user.security.UserContext;
+import com.example.user.service.SysRoleService;
+import com.example.user.service.SysUserRoleService;
+import com.example.user.service.UserService;
+import com.example.user.spi.UserAdminAuditHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -35,6 +33,10 @@ import java.util.stream.Collectors;
 /**
  * 用户管理 REST API（仅 ADMIN 可访问）：
  * 用户列表 / 创建 / 启禁用 / 重置密码 / 删除 / 分配功能角色。
+ * <p>
+ * 用户域不依赖业务模块：删除用户时的知识库授权校验与清理由宿主应用（RAG）通过
+ * {@link com.example.user.spi.UserDeletionGuard} 扩展点实现，审计通过
+ * {@link UserAdminAuditHandler} 扩展点上报。
  */
 @RestController
 @RequestMapping("/api/admin/users")
@@ -45,9 +47,8 @@ public class AdminUserController {
     private final UserService userService;
     private final SysRoleService sysRoleService;
     private final SysUserRoleService sysUserRoleService;
-    private final KbMemberService kbMemberService;
-    private final KbAuthorizationService kbAuthorizationService;
     private final PasswordEncoder passwordEncoder;
+    private final UserAdminAuditHandler auditHandler;
 
     /** 用户列表（可按用户名/昵称模糊搜索），返回每个用户已分配的功能角色 */
     @GetMapping
@@ -127,7 +128,7 @@ public class AdminUserController {
         if (!saved) {
             return ResponseEntity.internalServerError().body(Map.of("success", false, "message", "创建用户失败"));
         }
-        kbAuthorizationService.audit("USER_CREATE", null, null, "管理员创建用户 " + username);
+        auditHandler.audit("USER_CREATE", "管理员创建用户 " + username);
         log.info("管理员创建用户: {}", username);
         return ResponseEntity.ok(Map.of("success", true, "message", "创建成功", "id", entity.getId()));
     }
@@ -149,13 +150,13 @@ public class AdminUserController {
         if (id.equals(UserContext.getUserId())) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不能修改自己的状态"));
         }
-        if (status == 0 && kbAuthorizationService.isAdmin(id) && countAdmins() <= 1) {
+        if (status == 0 && userService.isAdmin(id) && userService.countAdmins() <= 1) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不能禁用最后一个管理员"));
         }
         user.setStatus(status);
         user.setUpdateTime(new Date());
         userService.updateById(user);
-        kbAuthorizationService.audit("USER_STATUS", null, null,
+        auditHandler.audit("USER_STATUS",
                 "管理员" + (status == 1 ? "启用" : "禁用") + "用户 " + user.getUsername());
         log.info("用户状态变更: userId={}, status={}", id, status);
         return ResponseEntity.ok(Map.of("success", true, "message", status == 1 ? "已启用" : "已禁用"));
@@ -177,16 +178,15 @@ public class AdminUserController {
         user.setPassword(passwordEncoder.encode(password));
         user.setUpdateTime(new Date());
         userService.updateById(user);
-        kbAuthorizationService.audit("USER_PASSWORD", null, null,
-                "管理员重置用户 " + user.getUsername() + " 的密码");
+        auditHandler.audit("USER_PASSWORD", "管理员重置用户 " + user.getUsername() + " 的密码");
         log.info("重置用户密码: userId={}", id);
         return ResponseEntity.ok(Map.of("success", true, "message", "密码已重置"));
     }
 
     /**
      * 删除用户：不能删除自己；不能删除最后一个 ADMIN；
-     * 不能删除某知识库最后一个 OWNER（需先转移所有权）；
-     * 删除时同时清理其功能角色（sys_user_role）与数据授权（kb_member）。
+     * “最后一个知识库所有者”保护与 kb_member 清理由 RAG 的 {@link com.example.user.spi.UserDeletionGuard}
+     * 实现（经 userService.deleteUser 触发）。
      */
     @DeleteMapping("/{id}")
     @RequireAdmin
@@ -198,28 +198,11 @@ public class AdminUserController {
         if (user == null) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "用户不存在"));
         }
-        if (kbAuthorizationService.isAdmin(id) && countAdmins() <= 1) {
+        if (userService.isAdmin(id) && userService.countAdmins() <= 1) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不能删除最后一个管理员"));
         }
-        // 若该用户是某知识库的最后一个 OWNER，拒绝删除，防止知识库失去所有者
-        List<Long> ownKbIds = kbMemberService.lambdaQuery()
-                .eq(KbMemberEntity::getUserId, id)
-                .eq(KbMemberEntity::getRole, "OWNER")
-                .list().stream()
-                .map(KbMemberEntity::getKbId)
-                .toList();
-        for (Long kbId : ownKbIds) {
-            if (kbAuthorizationService.isLastOwner(kbId, id)) {
-                return ResponseEntity.badRequest().body(Map.of(
-                        "success", false,
-                        "message", "该用户是某个知识库的最后一个所有者，请先转移所有权后再删除"));
-            }
-        }
-        // 清理功能角色关联与数据授权
-        sysUserRoleService.lambdaUpdate().eq(SysUserRoleEntity::getUserId, id).remove();
-        kbMemberService.lambdaUpdate().eq(KbMemberEntity::getUserId, id).remove();
-        userService.removeById(id);
-        kbAuthorizationService.audit("USER_DELETE", null, null, "管理员删除用户 " + user.getUsername());
+        userService.deleteUser(id);
+        auditHandler.audit("USER_DELETE", "管理员删除用户 " + user.getUsername());
         log.info("删除用户: userId={}, username={}", id, user.getUsername());
         return ResponseEntity.ok(Map.of("success", true, "message", "用户已删除"));
     }
@@ -266,10 +249,10 @@ public class AdminUserController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "包含不存在的角色"));
         }
         // 保护最后一个 ADMIN
-        boolean currentlyAdmin = kbAuthorizationService.isAdmin(id);
+        boolean currentlyAdmin = userService.isAdmin(id);
         boolean newHasAdmin = newRoles.stream()
-                .anyMatch(r -> KbAuthorizationService.ADMIN_ROLE_CODE.equals(r.getCode()));
-        if (currentlyAdmin && !newHasAdmin && countAdmins() <= 1) {
+                .anyMatch(r -> UserService.ADMIN_ROLE_CODE.equals(r.getCode()));
+        if (currentlyAdmin && !newHasAdmin && userService.countAdmins() <= 1) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不能移除最后一个管理员的功能角色"));
         }
 
@@ -283,13 +266,9 @@ public class AdminUserController {
             sysUserRoleService.save(relation);
         }
         String roleCodes = newRoles.stream().map(SysRoleEntity::getCode).collect(Collectors.joining(","));
-        kbAuthorizationService.audit("ROLE_ASSIGN", null, null,
+        auditHandler.audit("ROLE_ASSIGN",
                 "管理员为用户 " + user.getUsername() + " 分配功能角色 [" + roleCodes + "]");
         log.info("分配角色: userId={}, roleIds={}", id, newRoleIds);
         return ResponseEntity.ok(Map.of("success", true, "message", "角色分配成功"));
-    }
-
-    private long countAdmins() {
-        return userService.list().stream().filter(u -> kbAuthorizationService.isAdmin(u.getId())).count();
     }
 }

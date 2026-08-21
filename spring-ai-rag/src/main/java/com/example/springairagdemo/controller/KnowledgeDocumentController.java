@@ -6,7 +6,7 @@ import com.example.springairagdemo.entity.KnowledgeBaseEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
-import com.example.springairagdemo.security.ForbiddenException;
+import com.example.user.security.ForbiddenException;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.RequireKbRole;
 import com.example.springairagdemo.service.FileStorageService;

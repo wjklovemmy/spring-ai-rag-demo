@@ -1,6 +1,6 @@
-package com.example.springairagdemo.security;
+package com.example.user.security;
 
-import com.example.springairagdemo.service.KbAuthorizationService;
+import com.example.user.service.UserService;
 import lombok.RequiredArgsConstructor;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.annotation.Aspect;
@@ -16,11 +16,11 @@ import org.springframework.stereotype.Component;
 @RequiredArgsConstructor
 public class AdminAccessAspect {
 
-    private final KbAuthorizationService kbAuthorizationService;
+    private final UserService userService;
 
     @Before("@annotation(requireAdmin)")
     public void checkAdmin(JoinPoint joinPoint, RequireAdmin requireAdmin) {
-        if (!kbAuthorizationService.isAdmin()) {
+        if (!userService.isAdmin()) {
             throw new ForbiddenException("需要管理员权限才能执行该操作");
         }
     }

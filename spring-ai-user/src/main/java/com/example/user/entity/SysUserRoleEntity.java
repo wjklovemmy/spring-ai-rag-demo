@@ -1,4 +1,4 @@
-package com.example.springairagdemo.entity;
+package com.example.user.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;

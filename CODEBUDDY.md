@@ -6,8 +6,9 @@ This is a **RAG (Retrieval-Augmented Generation)** demonstration application bui
 
 ## Build & Run Commands
 
-The repository root is an aggregator POM (`packaging=pom`). It has two modules:
+The repository root is an aggregator POM (`packaging=pom`). It has three modules:
 - `spring-ai-rag` — the RAG service (port 8080)
+- `spring-ai-user` — user-domain shared library (jar, package `com.example.user`; pulled in by `spring-ai-rag` and deployed in the same 8080 process — no standalone startup needed)
 - `gateway` — Spring Cloud Gateway entry point (port 8081, routes `/api/**` to `spring-ai-rag`)
 
 Build/run with the `-pl <module>` flag from the root:
@@ -44,19 +45,31 @@ Before running, ensure the following services are available:
 - **Milvus** vector database on `localhost:19530` (default database, collection `knowledge_document`)
 - **DeepSeek API** key configured in `application.yaml`
 - **DashScope (Alibaba Cloud) API** key via environment variable `DASHSCOPE_API_KEY`
-- **MySQL** database (MyBatis-Plus is a dependency but no mapper is currently defined)
+- **MySQL** database (MyBatis-Plus mappers defined in both `spring-ai-rag` 业务表 and `spring-ai-user` 用户/角色表)
 
 ## Architecture
 
 ### Package Structure
 
 ```
-com.example.springairagdemo
-├── config/          — AI bean wiring (ChatClient, model qualification)
-├── controller/      — REST API endpoints
+spring-ai-rag  (com.example.springairagdemo — RAG 业务域)
+├── config/          — AI bean wiring, async task pool, data source, DataInitializer(恢复中断任务)
+├── controller/      — KnowledgeBase / KnowledgeDocument REST endpoints
 ├── embedding/       — Custom EmbeddingModel implementation
-├── entity/          — MyBatis-Plus entity (knowledge_base table)
-└── service/         — Core RAG ingestion and Q&A logic
+├── entity/          — knowledge_base / knowledge_document / chunk / task / kb_member / kb_access_log
+├── mapper/          — MyBatis-Plus mappers (业务表)
+├── parser/          — PDF parser + OCR fallback + semantic splitting
+├── security/        — 知识库数据授权 (KbRole / RequireKbRole / KbAccessAspect)
+└── service/         — Core RAG ingestion and Q&A logic, KbAuthorizationService, SPI 实现
+
+spring-ai-user  (com.example.user — 用户域共享 jar，被 RAG 依赖、同进程 8080)
+├── config/          — JwtUtil / JwtConfig / GatewayIdentityFilter(校验内部令牌 → UserContext)
+├── controller/      — Auth / AdminUser / AdminRole endpoints
+├── security/        — LoginUser / UserContext / RequireAdmin / AdminAccessAspect / ForbiddenException
+├── entity/          — sys_user / sys_role / sys_user_role
+├── mapper/          — UserMapper / SysRoleMapper / SysUserRoleMapper
+├── service/         — UserService / SysRoleService / SysUserRoleService / RedisRefreshTokenService / UserDataInitializer
+└── spi/             — UserDeletionGuard / UserAdminAuditHandler (业务域实现的扩展点接口，解耦反向依赖)
 ```
 
 ### RAG Pipeline (Two Phases)
@@ -106,7 +119,7 @@ Key settings:
 - **`POST /api/knowledge-document/upload`** — Upload a PDF (multipart form, field name `file`). Returns `{success, message, fileName, chunkCount}`.
 - **`POST /api/knowledge-document/chat`** — Send a question (JSON body `{"question": "..."}`). Returns `{success, question, answer}`.
 
-**Auth endpoints** (`AuthController`, RAG 侧负责签发 JWT，校验集中在网关):
+**Auth endpoints** (`AuthController`, 位于 spring-ai-user 用户域模块，负责签发 JWT，校验集中在网关):
 
 - **`POST /api/login`** — Accepts `{username, password}`, validates via BCrypt, returns a JWT access token.
 - **`GET /api/user`** — Returns current logged-in user info (from JWT claims injected by the gateway), or 401.
@@ -117,7 +130,7 @@ Key settings:
 所有 `/api/**` 请求统一经 `gateway`（8081）进入：
 
 1. `JwtAuthGlobalFilter`（gateway）按与 RAG 一致的 `jwt.secret` 校验 `Authorization: Bearer <token>`，查询 Redis 黑名单，白名单放行 `register/login/logout/refresh`，并注入 `X-User-Id` / `X-Username` / `X-Gateway-Token` 请求头。
-2. `GatewayIdentityFilter`（RAG）校验 `X-Gateway-Token`（共享 `gateway.internal-token`，防绕过网关直连伪造身份），随后构造 `LoginUser` 写入 `UserContext`（ThreadLocal），请求结束 `finally` 清理。
+2. `GatewayIdentityFilter`（spring-ai-user，与 RAG 同进程 8080）校验 `X-Gateway-Token`（共享 `gateway.internal-token`，防绕过网关直连伪造身份），随后构造 `LoginUser` 写入 `UserContext`（ThreadLocal），请求结束 `finally` 清理。
 3. 前端页面由 RAG 在 8080 提供，页面内置 `API_BASE = 'http://localhost:8081'`，所有接口请求自动经网关（跨域由网关 `globalcors` 统一放行）。
 
 ### Static Frontend
@@ -129,14 +142,19 @@ Two pure HTML pages served from `/static` on port **8080** (all their API calls 
 
 ### MyBatis-Plus & MySQL
 
-The `KnowledgeBaseEntity` maps to a `knowledge_base` table with columns: `id`, `name`, `description`, `status`, `create_user`, `create_time`, `update_time`. No mapper interface or service is defined yet — this appears to be scaffolding for a future knowledge-base metadata management feature.
+Mappers/entities are split by domain:
+- `spring-ai-rag`（`com.example.springairagdemo`）: `knowledge_base`（含 `id/name/description/status/create_user/create_time/update_time`）/ `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`
+- `spring-ai-user`（`com.example.user`）: `sys_user` / `sys_role` / `sys_user_role`（RBAC 用户域）
+
+RAG 主类通过 `@SpringBootApplication(scanBasePackages)` 与 `@MapperScan` 同时扫描 `com.example.springairagdemo` 与 `com.example.user` 两个包，用户域 Bean/Mapper 与 RAG 业务同进程 8080 生效。
 
 ### Key Dependencies
 
+- `spring-ai-user` — 用户域共享 jar（`com.example:spring-ai-user`，module 依赖，与 RAG 同进程部署，承载认证/用户/角色/系统管理）
 - `spring-ai-starter-model-deepseek` — DeepSeek chat model auto-configuration
 - `spring-ai-starter-vector-store-milvus` — Milvus vector store integration
 - `spring-ai-pdf-document-reader` — PDF parsing via `PagePdfDocumentReader`
-- `mybatis-plus-spring-boot3-starter` 3.5.10.1 — ORM (no mapper defined yet)
+- `mybatis-plus-spring-boot3-starter` 3.5.10.1 — ORM（RAG 业务表 + 用户域表 mapper 均已定义，见上文 MyBatis-Plus & MySQL 章节）
 - `mysql-connector-j` — MySQL JDBC driver (runtime scope)
 - Lombok for boilerplate reduction
 - `spring-boot-devtools` for hot reload during development

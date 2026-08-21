@@ -36,7 +36,7 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
-| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
+| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` 共享 jar（同进程部署），Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.0.0（gateway-server 4.3.0） | 统一入口（8081）：路由 `/api/**`、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
@@ -57,9 +57,15 @@ graph TB
         GWAUTH["JwtAuthGlobalFilter<br/>JWT 校验 + Redis 黑名单 + 注入用户头"]
     end
 
-    subgraph Backend["RAG 服务 spring-ai-rag :8080"]
-        CTRL["Controller 层<br/>Auth / KnowledgeBase / KnowledgeDocument"]
+    subgraph User["用户域 spring-ai-user（共享 jar，同进程 8080）"]
         GATE_ID["GatewayIdentityFilter<br/>校验内部令牌 → UserContext"]
+        USERCTRL["Auth / AdminUser / AdminRole Controller"]
+        ADMINASPECT["AdminAccessAspect<br/>@RequireAdmin AOP 鉴权"]
+        USERSVC["UserService / 角色 / 刷新令牌"]
+    end
+
+    subgraph Backend["RAG 服务 spring-ai-rag :8080"]
+        CTRL["Controller 层<br/>KnowledgeBase / KnowledgeDocument"]
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
         SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
@@ -83,7 +89,8 @@ graph TB
     LOGIN --> GWAUTH
     INDEX --> GWAUTH
     GWAUTH -->|/api/** 转发| GATE_ID
-    GATE_ID --> CTRL
+    GATE_ID --> USERCTRL
+    USERCTRL --> CTRL
     CTRL --> ASPECT --> AUTHZ --> MYSQL
     AUTHZ --> CTRL
     CTRL --> SVC
@@ -123,90 +130,109 @@ spring-ai-rag-demo/
 ├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理）
 ├── mvnw / mvnw.cmd                 # Maven Wrapper
 ├── spring-ai-rag/                  # RAG 服务核心模块（业务代码）
+│   ├── pom.xml                     # 依赖 com.example:spring-ai-user（用户域共享 jar）
 │   └── src/
 │       ├── main/
-    │   ├── java/com/example/springairagdemo/
-    │   │   ├── SpringAiRagDemoApplication.java
-    │   │   ├── config/
-    │   │   │   ├── AiConfig.java                  # ChatClient / 模型装配
-    │   │   │   ├── MilvusConfig.java              # Milvus 客户端
-    │   │   │   ├── RagConfigProperties.java       # rag.* 配置绑定（含 batch-size）
-    │   │   │   ├── JwtUtil.java                   # JWT 生成/解析
-    │   │   │   ├── JwtConfig.java                 # JWT 配置属性（注册 GatewayIdentityFilter）
-    │   │   │   ├── GatewayIdentityFilter.java     # 校验网关内部令牌并注入登录态（UserContext）
-    │   │   │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
-    │   │   │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
-    │   │   │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
-    │   │   │   ├── DataSourceConfig.java          # HikariCP 连接池显式装配
-    │   │   │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
-    │   │   │   ├── DataInitializer.java           # 启动初始化（ADMIN 角色/账号/恢复中断任务）
-    │   │   │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
-    │   │   ├── controller/
-    │   │   │   ├── AuthController.java            # 注册/登录/登出/当前用户/用户搜索
-    │   │   │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-    │   │   │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
-    │   │   │   ├── AdminUserController.java       # 系统管理-用户（需 ADMIN）
-    │   │   │   └── AdminRoleController.java       # 系统管理-角色（需 ADMIN）
-    │   │   ├── security/                          # 防越权（RBAC + 数据授权 + 管理员切面）
-    │   │   │   ├── LoginUser.java                 # 登录用户模型（id/username/nickname）
-    │   │   │   ├── UserContext.java               # ThreadLocal 当前用户上下文
-    │   │   │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
-    │   │   │   ├── ForbiddenException.java        # 403 业务异常
-    │   │   │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
-    │   │   │   ├── RequireAdmin.java              # ADMIN 功能角色注解（方法级）
-    │   │   │   ├── KbAccessAspect.java            # @RequireKbRole AOP 切面
-    │   │   │   └── AdminAccessAspect.java         # @RequireAdmin AOP 切面
-    │   │   ├── embedding/
-    │   │   │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型
-    │   │   ├── entity/                            # MyBatis-Plus 实体 + 枚举
-    │   │   │   ├── KnowledgeBaseEntity.java
-    │   │   │   ├── KnowledgeDocumentEntity.java   # 含 version / status(7态) / expire_time
-    │   │   │   ├── KnowledgeChunkEntity.java
-    │   │   │   ├── KnowledgeEmbeddingTaskEntity.java # 任务 + 5 个阶段进度字段
-    │   │   │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
-    │   │   │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
-    │   │   │   ├── UserEntity.java
-    │   │   │   ├── SysRoleEntity.java             # RBAC 功能角色
-    │   │   │   ├── SysUserRoleEntity.java         # 用户-角色关联
-    │   │   │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
-    │   │   │   └── KbAccessLogEntity.java         # 访问审计日志
-    │   │   ├── mapper/                            # MyBatis-Plus Mapper
-    │   │   │   ├── KnowledgeBaseMapper.java
-    │   │   │   ├── KnowledgeDocumentMapper.java
-    │   │   │   ├── KnowledgeChunkMapper.java
-    │   │   │   ├── KnowledgeEmbeddingTaskMapper.java
-    │   │   │   ├── UserMapper.java
-    │   │   │   ├── SysRoleMapper.java
-    │   │   │   ├── SysUserRoleMapper.java
-    │   │   │   ├── KbMemberMapper.java
-    │   │   │   └── KbAccessLogMapper.java
-    │   │   ├── parser/
-    │   │   │   ├── DocumentParser.java             # 解析接口
-    │   │   │   ├── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
-    │   │   │   ├── HeadingExtractor.java           # 标题行识别 / 标题链构建
-    │   │   │   └── SemanticSplitter.java           # 语义切片（段落聚类 + 断点）
-    │   │   └── service/
-    │   │       ├── KnowledgeDocumentService.java   # 摄取异步流水线 + 问答（抽象类）
-    │   │       ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
-    │   │       ├── VectorStoreService.java         # Milvus 增删查（embedChunks / upsertVectors）
-    │   │       ├── HybridSearchService.java        # 混合检索编排（RRF 融合 + 异常降级）
-    │   │       ├── RerankService.java / DashScopeRerankService.java   # 重排序接口与实现
-    │   │       ├── OcrService.java / AliyunOcrService.java            # OCR 接口与实现
-    │   │       ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
-    │   │       ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
-    │   │       ├── KnowledgeBaseService.java       # 知识库服务接口
-    │   │       ├── KnowledgeDocumentEntityService.java
-    │   │       ├── KnowledgeChunkEntityService.java
-    │   │       ├── UserService.java                # 注册/登录（JWT + BCrypt）
-    │   │       ├── KbAuthorizationService.java     # 权限判定中枢（assertRole/visibleKbIds/授权）
-    │   │       ├── KbMemberService.java / KbAccessLogService.java / SysRoleService.java / SysUserRoleService.java
-    │   │       └── impl/                           # Service 实现类
-    │   └── resources/
-    │       ├── application.yaml                    # 全局配置
-    │       ├── static/
-    │       │   ├── login.html                      # 登录/注册页
-    │       │   └── index.html                      # 问答/上传/任务分阶段进度仪表盘
-    └── test/
+│       │   └── java/com/example/springairagdemo/
+│       │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(scanBasePackages 双包)
+│       │       ├── config/
+│       │       │   ├── AiConfig.java                  # ChatClient / 模型装配
+│       │       │   ├── MilvusConfig.java              # Milvus 客户端
+│       │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（含 batch-size）
+│       │       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
+│       │       │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
+│       │       │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
+│       │       │   ├── DataSourceConfig.java          # HikariCP 连接池显式装配
+│       │       │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
+│       │       │   ├── DataInitializer.java           # 启动初始化（恢复中断任务）
+│       │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
+│       │       ├── controller/
+│       │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
+│       │       │   └── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
+│       │       ├── security/                          # 防越权（知识库数据授权）
+│       │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
+│       │       │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
+│       │       │   └── KbAccessAspect.java            # @RequireKbRole AOP 切面
+│       │       ├── embedding/
+│       │       │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型
+│       │       ├── entity/                            # MyBatis-Plus 实体 + 枚举
+│       │       │   ├── KnowledgeBaseEntity.java
+│       │       │   ├── KnowledgeDocumentEntity.java   # 含 version / status(7态) / expire_time
+│       │       │   ├── KnowledgeChunkEntity.java
+│       │       │   ├── KnowledgeEmbeddingTaskEntity.java # 任务 + 5 个阶段进度字段
+│       │       │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
+│       │       │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
+│       │       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
+│       │       │   └── KbAccessLogEntity.java         # 访问审计日志
+│       │       ├── mapper/                            # MyBatis-Plus Mapper
+│       │       │   ├── KnowledgeBaseMapper.java
+│       │       │   ├── KnowledgeDocumentMapper.java
+│       │       │   ├── KnowledgeChunkMapper.java
+│       │       │   ├── KnowledgeEmbeddingTaskMapper.java
+│       │       │   ├── KbMemberMapper.java
+│       │       │   └── KbAccessLogMapper.java
+│       │       ├── parser/
+│       │       │   ├── DocumentParser.java             # 解析接口
+│       │       │   ├── PdfDocumentParser.java          # PDF 解析实现（含 OCR 兜底）
+│       │       │   ├── HeadingExtractor.java           # 标题行识别 / 标题链构建
+│       │       │   └── SemanticSplitter.java           # 语义切片（段落聚类 + 断点）
+│       │       └── service/
+│       │           ├── KnowledgeDocumentService.java   # 摄取异步流水线 + 问答（抽象类）
+│       │           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
+│       │           ├── VectorStoreService.java         # Milvus 增删查（embedChunks / upsertVectors）
+│       │           ├── HybridSearchService.java        # 混合检索编排（RRF 融合 + 异常降级）
+│       │           ├── RerankService.java / DashScopeRerankService.java   # 重排序接口与实现
+│       │           ├── OcrService.java / AliyunOcrService.java            # OCR 接口与实现
+│       │           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
+│       │           ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
+│       │           ├── KnowledgeBaseService.java       # 知识库服务接口
+│       │           ├── KnowledgeDocumentEntityService.java
+│       │           ├── KnowledgeChunkEntityService.java
+│       │           ├── KbAuthorizationService.java     # 权限判定中枢（assertRole/visibleKbIds/授权）
+│       │           ├── KbMemberService.java / KbAccessLogService.java
+│       │           ├── KbMemberDeletionGuard.java      # SPI：删用户前最后所有者保护 + 清理 kb_member
+│       │           ├── KbAccessLogAuditHandler.java    # SPI：用户域管理操作审计落库 kb_access_log
+│       │           └── impl/                           # Service 实现类
+│       └── resources/
+│           ├── application.yaml                        # 全局配置
+│           └── static/
+│               ├── login.html                          # 登录/注册页
+│               └── index.html                          # 问答/上传/任务分阶段进度仪表盘
+├── spring-ai-user/                 # 用户域共享模块（library jar，被 RAG 依赖、同进程 8080 部署）
+│   ├── pom.xml                     # 用户域模块 POM（包 com.example.user）
+│   └── src/
+│       └── main/
+│           └── java/com/example/user/
+│               ├── config/                             # JWT 与内部信任令牌
+│               │   ├── JwtUtil.java                    # JWT 生成/解析
+│               │   ├── JwtConfig.java                  # JWT 配置属性（注册 GatewayIdentityFilter）
+│               │   └── GatewayIdentityFilter.java      # 校验网关内部令牌并注入登录态（UserContext）
+│               ├── controller/
+│               │   ├── AuthController.java             # 注册/登录/登出/当前用户/用户搜索
+│               │   ├── AdminUserController.java        # 系统管理-用户（需 ADMIN，经 SPI 联动业务域）
+│               │   └── AdminRoleController.java        # 系统管理-角色（需 ADMIN）
+│               ├── security/                           # 认证上下文 + ADMIN 切面
+│               │   ├── LoginUser.java                  # 登录用户模型（id/username/nickname）
+│               │   ├── UserContext.java                # ThreadLocal 当前用户上下文
+│               │   ├── ForbiddenException.java         # 403 业务异常
+│               │   ├── RequireAdmin.java               # ADMIN 功能角色注解（方法级）
+│               │   └── AdminAccessAspect.java          # @RequireAdmin AOP 切面
+│               ├── entity/                             # 用户域实体
+│               │   ├── UserEntity.java
+│               │   ├── SysRoleEntity.java              # RBAC 功能角色
+│               │   └── SysUserRoleEntity.java          # 用户-角色关联
+│               ├── mapper/
+│               │   ├── UserMapper.java
+│               │   ├── SysRoleMapper.java
+│               │   └── SysUserRoleMapper.java
+│               ├── service/
+│               │   ├── UserService.java                # 注册/登录/删除用户/isAdmin（JWT + BCrypt）
+│               │   ├── SysRoleService.java / SysUserRoleService.java
+│               │   ├── RedisRefreshTokenService.java   # 刷新令牌 + 登出黑名单
+│               │   └── UserDataInitializer.java        # 启动初始化（ADMIN 角色/默认账号）
+│               └── spi/                                # 扩展点（业务域实现，用户域只依赖接口）
+│                   ├── UserDeletionGuard.java          # 删除用户前钩子（RAG 侧实现：清理 kb_member）
+│                   └── UserAdminAuditHandler.java      # 用户管理操作审计钩子（RAG 侧实现：落库 kb_access_log）
 ├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 8081）
 │   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM + jjwt 0.12.6
 │   └── src/
@@ -329,7 +355,7 @@ spring-ai-rag-demo/
 
 **认证**（识别"你是谁"）：
 
-注册/登录仍由 RAG 服务签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
+注册/登录由**用户域模块 `spring-ai-user`**（共享 jar，与 RAG 服务同进程部署于 8080）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
 
 ```
 访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 8081）
@@ -340,7 +366,7 @@ spring-ai-rag-demo/
               · 查 Redis 黑名单（登出/刷新后旧 Token 立即失效）
               · 注入 X-User-Id / X-Username / X-Gateway-Token 后转发
                             ↓
-              RAG GatewayIdentityFilter（8080）
+              用户域 GatewayIdentityFilter（spring-ai-user，8080）
               · 校验 X-Gateway-Token（内部信任令牌，防绕过网关直连伪造身份）
               · 构造 LoginUser → UserContext.set() → 进入业务鉴权（RBAC / kb_member）
               · 请求结束 finally 中 UserContext.clear()
@@ -382,7 +408,7 @@ spring-ai-rag-demo/
 - **AOP 自动解析 kbId**：无需手工写重复鉴权代码；
 - **统一 403**：`GlobalExceptionHandler` 将 `ForbiddenException` 转为 `{success:false, code:403}`；
 - **审计日志**：`kb_access_log` 记录关键访问行为；
-- 默认初始化 `ADMIN` 角色 + `admin/admin123` 账号（见 `DataInitializer`）。
+- 默认初始化 `ADMIN` 角色 + `admin/admin123` 账号（见用户域 `UserDataInitializer`）。
 
 **权限管理（系统管理模块，仅 ADMIN 可见）：**
 
@@ -400,7 +426,7 @@ spring-ai-rag-demo/
 初始化脚本：
 - `sql/init.sql` — 全量初始化脚本（需手动在 MySQL 执行一次）：
   业务表 `knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task`，权限表 `sys_user` / `sys_role` / `sys_user_role` / `kb_member` / `kb_access_log`，以及内置 `ADMIN` 角色与 `admin` 账号（均幂等，可重复执行）。
-  应用启动时 `DataInitializer` 也会自动补齐 `ADMIN` 角色与默认账号（仅当 `sys_user` 表为空时）。
+  应用启动时用户域 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色与默认账号（仅当 `sys_user` 表为空时）。
 
 | 表 | 用途 | 关键字段 |
 |----|------|----------|
@@ -459,7 +485,7 @@ spring-ai-rag-demo/
 | `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
 | `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
 | `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间（**必须与 gateway 模块完全一致**，否则网关无法校验签名） |
-| `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 侧 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
+| `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），用户域 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
 
 **gateway 模块（`gateway/src/main/resources/application.yaml`）关键配置：**
 
@@ -497,13 +523,13 @@ docker-compose up -d
 
 ### 1.1 默认账号
 
-应用启动时 `DataInitializer` 会自动初始化 `ADMIN` 角色及超级管理员账号：
+应用启动时用户域 `UserDataInitializer` 会自动初始化 `ADMIN` 角色及超级管理员账号：
 
 | 账号 | 密码 | 说明 |
 |------|------|------|
 | `admin` | `admin123` | 超级管理员（建议首次登录后立即修改密码） |
 
-> 存量知识库升级提示：已有知识库若没有 `kb_member` 记录，普通用户将看不到它们。可在 `DataInitializer` 或迁移脚本中为存量库的 `create_user` 自动补插 OWNER 记录。
+> 存量知识库升级提示：已有知识库若没有 `kb_member` 记录，普通用户将看不到它们。可在业务初始化逻辑或迁移脚本中为存量库的 `create_user` 自动补插 OWNER 记录。
 
 ### 2. 配置环境变量 / 密钥
 
@@ -543,7 +569,7 @@ export ALIYUN_OCR_SK=xxxx
 
 ### 3. 启动应用（两个服务都要启动）
 
-仓库根目录为聚合父工程：`spring-ai-rag`（RAG 服务）与 `gateway`（网关）。**网关对外提供 8081 统一入口，RAG 服务在 8080**，需分别启动（建议开两个终端）。推荐在根目录用 `-pl` 指定子模块启动：
+仓库根目录为聚合父工程：`spring-ai-rag`（RAG 服务，依赖用户域 `spring-ai-user` 共享 jar）、`spring-ai-user`（用户域 library 模块，**无需单独启动**，随 RAG 同进程部署）与 `gateway`（网关）。**网关对外提供 8081 统一入口，RAG 服务（含用户域）在 8080**，需分别启动 RAG 与网关（建议开两个终端）。推荐在根目录用 `-pl` 指定子模块启动：
 
 ```bash
 # 终端 1：RAG 服务（8080）
@@ -579,7 +605,7 @@ cd ../gateway
 
 ## REST API 一览
 
-> 以下接口统一由**网关 8081** 暴露并转发至 RAG 服务（8080）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，RAG 侧 `GatewayIdentityFilter` 二次校验内部令牌。
+> 以下接口统一由**网关 8081** 暴露并转发至 RAG 服务（8080，含用户域）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，用户域（spring-ai-user）`GatewayIdentityFilter` 二次校验内部令牌。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
@@ -633,3 +659,4 @@ cd ../gateway
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
 15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
 16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；RAG 服务仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 8081，CORS 由网关 `globalcors` 统一放行。
+17. **用户域模块化（SPI 解耦）**：认证/用户/角色/系统管理抽为 `spring-ai-user` 共享 jar（包 `com.example.user`），依赖方向单向（业务 → 用户域）；RAG 侧通过 SPI 扩展点（`UserDeletionGuard` 删除用户前清理 `kb_member` 并保护最后所有者、`UserAdminAuditHandler` 将用户管理操作审计落库 `kb_access_log`）联动业务数据，用户域不反向依赖任何业务模块。主类 `@SpringBootApplication(scanBasePackages)` 与 `@MapperScan` 同时扫描双包。

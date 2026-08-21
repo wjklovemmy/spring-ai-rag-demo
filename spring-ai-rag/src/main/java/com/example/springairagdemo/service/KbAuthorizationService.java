@@ -1,10 +1,11 @@
 package com.example.springairagdemo.service;
 
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.example.springairagdemo.entity.*;
-import com.example.springairagdemo.security.ForbiddenException;
+import com.example.springairagdemo.entity.KbAccessLogEntity;
+import com.example.springairagdemo.entity.KbMemberEntity;
 import com.example.springairagdemo.security.KbRole;
-import com.example.springairagdemo.security.UserContext;
+import com.example.user.security.ForbiddenException;
+import com.example.user.security.UserContext;
+import com.example.user.service.UserService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -12,13 +13,12 @@ import org.springframework.stereotype.Service;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
-import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * 知识库授权核心服务：
+ * 知识库授权核心服务（RAG 业务域）：
  * <ul>
- *   <li>垂直权限：全局角色（ADMIN 可管理一切知识库）</li>
+ *   <li>垂直权限：全局角色（ADMIN 可管理一切知识库），判定委托用户域 {@link UserService}</li>
  *   <li>水平/数据权限：kb_member 显式授权（OWNER / EDITOR / VIEWER），唯一权威</li>
  *   <li>安全审计：关键操作与越权拒绝（ACCESS_DENIED）落库</li>
  * </ul>
@@ -29,40 +29,23 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class KbAuthorizationService {
 
-    public static final String ADMIN_ROLE_CODE = "ADMIN";
+    /** 内置全局管理员角色编码（常量收敛到用户域，此处仅做兼容引用） */
+    public static final String ADMIN_ROLE_CODE = UserService.ADMIN_ROLE_CODE;
 
-    private final SysRoleService sysRoleService;
-    private final SysUserRoleService sysUserRoleService;
     private final KbMemberService kbMemberService;
     private final KbAccessLogService kbAccessLogService;
+    private final UserService userService;
 
     // ==================== 全局角色（垂直权限） ====================
 
-    /** 当前登录用户是否为 ADMIN */
+    /** 当前登录用户是否为 ADMIN（委托用户域判定） */
     public boolean isAdmin() {
-        return isAdmin(UserContext.getUserId());
+        return userService.isAdmin();
     }
 
-    /** 指定用户是否为 ADMIN */
+    /** 指定用户是否为 ADMIN（委托用户域判定） */
     public boolean isAdmin(Long userId) {
-        if (userId == null) {
-            return false;
-        }
-        Set<Long> adminRoleIds = adminRoleIds();
-        if (adminRoleIds.isEmpty()) {
-            return false;
-        }
-        return sysUserRoleService.lambdaQuery()
-                .eq(SysUserRoleEntity::getUserId, userId)
-                .in(SysUserRoleEntity::getRoleId, adminRoleIds)
-                .count() > 0;
-    }
-
-    private Set<Long> adminRoleIds() {
-        List<SysRoleEntity> roles = sysRoleService.lambdaQuery()
-                .eq(SysRoleEntity::getCode, ADMIN_ROLE_CODE)
-                .list();
-        return roles.stream().map(SysRoleEntity::getId).collect(Collectors.toSet());
+        return userService.isAdmin(userId);
     }
 
     // ==================== 数据权限判定（水平/对象级） ====================
@@ -179,7 +162,7 @@ public class KbAuthorizationService {
         audit("REVOKE", kbId, null, "移除成员 " + userId);
     }
 
-    /** 是否最后一个 OWNER */
+    /** 是否最后一个 OWNER（ownerCount &lt;= 1 即视为最后一个，防止系统失去所有者） */
     public boolean isLastOwner(Long kbId, Long userId) {
         long ownerCount = kbMemberService.lambdaQuery()
                 .eq(KbMemberEntity::getKbId, kbId)

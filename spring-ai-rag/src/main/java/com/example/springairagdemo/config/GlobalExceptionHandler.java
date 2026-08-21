@@ -1,6 +1,6 @@
 package com.example.springairagdemo.config;
 
-import com.example.springairagdemo.security.ForbiddenException;
+import com.example.user.security.ForbiddenException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;

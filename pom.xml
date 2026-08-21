@@ -16,6 +16,7 @@
     <name>spring-ai-rag-demo</name>
     <description>spring-ai-rag-demo parent</description>
     <modules>
+        <module>spring-ai-user</module>
         <module>spring-ai-rag</module>
         <module>gateway</module>
     </modules>

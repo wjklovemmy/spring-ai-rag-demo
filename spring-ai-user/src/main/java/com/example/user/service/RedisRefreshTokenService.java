@@ -1,4 +1,4 @@
-package com.example.springairagdemo.service;
+package com.example.user.service;
 
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.Cursor;

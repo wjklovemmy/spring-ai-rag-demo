@@ -1,9 +1,8 @@
-package com.example.springairagdemo.controller;
+package com.example.user.controller;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.example.springairagdemo.entity.UserEntity;
-import com.example.springairagdemo.service.KbAuthorizationService;
-import com.example.springairagdemo.service.UserService;
+import com.example.user.entity.UserEntity;
+import com.example.user.service.UserService;
 import jakarta.servlet.http.HttpServletRequest;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -22,7 +21,6 @@ import java.util.Map;
 public class AuthController {
 
     private final UserService userService;
-    private final KbAuthorizationService kbAuthorizationService;
 
     /**
      * 用户注册
@@ -100,7 +98,7 @@ public class AuthController {
     }
 
     /**
-     * 获取当前登录用户信息（从 JWT 过滤器注入的 Request 属性中读取）
+     * 获取当前登录用户信息（从网关注入的 Request 属性中读取）
      */
     @GetMapping("/api/user")
     public ResponseEntity<Map<String, Object>> currentUser(HttpServletRequest request) {
@@ -113,7 +111,7 @@ public class AuthController {
                 "success", true,
                 "username", username,
                 "userId", userId,
-                "isAdmin", kbAuthorizationService.isAdmin(userId)
+                "isAdmin", userService.isAdmin(userId)
         ));
     }
 

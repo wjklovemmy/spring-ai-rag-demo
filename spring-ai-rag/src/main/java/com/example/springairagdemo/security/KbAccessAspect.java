@@ -1,6 +1,7 @@
 package com.example.springairagdemo.security;
 
 import com.example.springairagdemo.service.KbAuthorizationService;
+import com.example.user.security.ForbiddenException;
 import lombok.RequiredArgsConstructor;
 import org.aspectj.lang.JoinPoint;
 import org.aspectj.lang.annotation.Aspect;

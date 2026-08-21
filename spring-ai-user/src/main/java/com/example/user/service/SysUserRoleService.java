@@ -1,8 +1,8 @@
-package com.example.springairagdemo.service;
+package com.example.user.service;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.example.springairagdemo.entity.SysUserRoleEntity;
-import com.example.springairagdemo.mapper.SysUserRoleMapper;
+import com.example.user.entity.SysUserRoleEntity;
+import com.example.user.mapper.SysUserRoleMapper;
 import org.springframework.stereotype.Service;
 
 @Service

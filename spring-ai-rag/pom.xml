@@ -15,6 +15,14 @@
 
     <!--
       依赖、版本管理与构建插件（spring-boot-maven-plugin、lombok 注解处理器等）
-      全部继承自父工程 spring-ai-rag-demo，此处无需重复声明。
+      全部继承自父工程 spring-ai-rag-demo，此处仅需声明用户域共享模块。
     -->
+    <dependencies>
+        <!-- 用户域共享模块（library）：用户/角色/JWT/登录态，同进程被本模块消费 -->
+        <dependency>
+            <groupId>com.example</groupId>
+            <artifactId>spring-ai-user</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
 </project>
