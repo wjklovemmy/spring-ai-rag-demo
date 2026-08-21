@@ -113,7 +113,7 @@ spring-ai-user  (com.example.user — 用户域独立服务 :8082)
 1. Uploaded PDF is written to a temp file
 2. `PagePdfDocumentReader` (Spring AI PDF reader) parses the PDF into `Document` objects (one per page)
 3. `TokenTextSplitter` (plus heading-aware prefix and semantic splitting) chunks the documents
-4. Each chunk is embedded via `DashScopeEmbeddingModel` and stored in Milvus (per-knowledge-base collection `kb_{id}`, batched 100)
+4. Each chunk is embedded via `DashScopeEmbeddingModel` (auto-retry on network errors / 5xx, max 2 attempts; 4xx business errors not retried) and stored in Milvus (per-knowledge-base collection `kb_{id}`, batched 100)
 
 **Phase 2 — Question Answering (`KnowledgeDocumentService.chat`):**
 
@@ -136,7 +136,7 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 ### Custom Embedding Model
 
-`DashScopeEmbeddingModel` extends `AbstractEmbeddingModel` and directly calls the DashScope REST API (`https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding`). It was built because Spring AI 2.0 does not ship a built-in DashScope embedding starter. The model outputs **1024-dimensional** vectors (`text-embedding-v3`).
+`DashScopeEmbeddingModel` extends `AbstractEmbeddingModel` and directly calls the DashScope REST API (`https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding`). It was built because Spring AI 2.0 does not ship a built-in DashScope embedding starter. The model outputs **1024-dimensional** vectors (`text-embedding-v3`). Embedding calls (`VectorStoreService.embedChunks` / `embedQuery`) are protected by a Sentinel circuit breaker (resource `dashscope-embedding`, degrade rule registered in `AiConfig`): sustained high error ratio fails fast to avoid exhausting the DashScope quota; upload-task errors are normalized to `向量化服务暂时不可用，请稍后重试`; network errors / 5xx are auto-retried (max 2).
 
 ### Configuration (`application.yaml`)
 

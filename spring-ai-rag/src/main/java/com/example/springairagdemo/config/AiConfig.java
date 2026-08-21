@@ -28,6 +28,9 @@ public class AiConfig {
     /** AI 聊天调用（DeepSeek）的 Sentinel 熔断资源名 */
     public static final String AI_CHAT_RESOURCE = "ai-chat";
 
+    /** 向量化调用（DashScope Embedding）的 Sentinel 熔断资源名 */
+    public static final String EMBEDDING_RESOURCE = "dashscope-embedding";
+
     /**
      * 显式使用 DeepSeek 的 ChatModel 创建 ChatClient，
      * 避免因多 ChatModel Bean 导致歧义
@@ -49,20 +52,30 @@ public class AiConfig {
     }
 
     /**
-     * 注册 AI 问答（DeepSeek）的 Sentinel 降级规则：
-     * 最小请求数 &gt;= 5 且异常比例 &gt;= 50% 时熔断 10 秒；
-     * 熔断/异常期间 KnowledgeDocumentService#chat 直接返回降级提示
-     * （"AI服务暂时不可用，请稍后再试"），避免接口 500。
+     * 注册 Sentinel 降级规则（AI 问答 + 向量化）：
+     * 最小请求数 &gt;= 5 且异常比例 &gt;= 50% 时熔断 10 秒。
+     * <ul>
+     *   <li>{@code ai-chat}（DeepSeek）：熔断/异常期间 KnowledgeDocumentService#chat 直接返回
+     *       降级提示（"AI服务暂时不可用，请稍后再试"），避免接口 500；</li>
+     *   <li>{@code dashscope-embedding}（DashScope Embedding）：连续异常比例高时快速失败，
+     *       避免大批量文档排队把配额打爆，上传任务错误归一为「向量化服务暂时不可用，请稍后重试」，
+     *       与 ai-chat 互不影响。</li>
+     * </ul>
      */
     @PostConstruct
-    public void initAiChatDegradeRule() {
-        DegradeRule rule = new DegradeRule(AI_CHAT_RESOURCE)
+    public void initSentinelDegradeRules() {
+        DegradeRule chatRule = new DegradeRule(AI_CHAT_RESOURCE)
                 .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
                 .setCount(0.5)
                 .setMinRequestAmount(5)
                 .setTimeWindow(10);
-        DegradeRuleManager.loadRules(List.of(rule));
-        log.info("已注册 AI 问答熔断规则：资源={}, grade=异常比例, count=0.5, minRequestAmount=5, timeWindow=10s",
-                AI_CHAT_RESOURCE);
+        DegradeRule embedRule = new DegradeRule(EMBEDDING_RESOURCE)
+                .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
+                .setCount(0.5)
+                .setMinRequestAmount(5)
+                .setTimeWindow(10);
+        DegradeRuleManager.loadRules(List.of(chatRule, embedRule));
+        log.info("已注册 Sentinel 熔断规则：AI 问答资源={}, Embedding 资源={}, grade=异常比例, count=0.5, minRequestAmount=5, timeWindow=10s",
+                AI_CHAT_RESOURCE, EMBEDDING_RESOURCE);
     }
 }

@@ -38,7 +38,7 @@
 | 对象存储 | MinIO 8.6.0 | 原始文档文件存储（同时支持本地磁盘模式）；8.6.0 修复 CVE-2025-59952 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
-| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`）；AI 问答（DeepSeek 生成）调用经 `CircuitBreakerFactory` 熔断保护（资源 `ai-chat`），不可用时降级返回「AI服务暂时不可用，请稍后再试」；支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
+| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`）；AI 问答（DeepSeek 生成）调用经 `CircuitBreakerFactory` 熔断保护（资源 `ai-chat`），不可用时降级返回「AI服务暂时不可用，请稍后再试」；向量化（DashScope Embedding）亦经 `CircuitBreakerFactory` 熔断保护（资源 `dashscope-embedding`），连续异常比例高时快速失败避免打爆配额，上传任务错误归一为「向量化服务暂时不可用，请稍后重试」；`DashScopeEmbeddingModel` 对网络异常与 5xx 自动重试（最多 2 次）；支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
@@ -323,6 +323,9 @@ spring-ai-rag-demo/
         ├─ Chunk 入库  saveBatch 批量写 MySQL knowledge_chunk（主键回填）
         │             → chunk_progress = 100%
         ├─ Embedding  按 batch-size 分批向量化（embed_progress 0→100%，逐批回写）
+        │             · DashScope 网络异常/5xx 自动重试（最多 2 次，4xx 业务错误不重试）
+        │             · Sentinel 熔断保护（资源 dashscope-embedding），异常比例高时快速失败
+        │             · 失败错误信息归一为「向量化服务暂时不可用，请稍后重试」
         ├─ Milvus     按 batch-size 分批 upsert 到 kb_{id}（milvus_progress 0→100%）
         │             · 回填 milvus_id：作为"向量已写入"的增量判定标记
         │             · 每批更新任务 success_chunk，前端 5 行进度条实时展示
@@ -332,7 +335,7 @@ spring-ai-rag-demo/
 ```
 
 **失败兜底（增量执行，不整批回滚）：**
-- 任何步骤异常 → 任务标记失败（status=3），文档置 4（FAILED），记录 error_message；
+- 任何步骤异常 → 任务标记失败（status=3），文档置 4（FAILED），记录 error_message（向量化类故障归一为「向量化服务暂时不可用，请稍后重试」，其余异常截断至 200 字符）；
 - 半成品保留：已写 MySQL chunk / 已写 Milvus 向量按 `milvus_id` 判空标记，作为恢复线索；
 - 重启恢复：启动时扫描中断任务 → 重新入队增量补齐（解析/切分/embedding 幂等，仅处理未回填 milvus_id 的 chunk）。
 

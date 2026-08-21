@@ -34,7 +34,7 @@ public class DashScopeEmbeddingModel extends AbstractEmbeddingModel {
     private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(5);
     /** 读取超时 */
     private static final Duration READ_TIMEOUT = Duration.ofSeconds(60);
-    /** 网络异常（超时/连接失败）时的最大重试次数 */
+    /** 网络异常（超时/连接失败）或服务端临时错误（5xx）时的最大重试次数 */
     private static final int MAX_RETRIES = 2;
 
     private final RestClient restClient;
@@ -114,8 +114,13 @@ public class DashScopeEmbeddingModel extends AbstractEmbeddingModel {
                 log.debug("DashScope embedding 返回 {} 个向量", embeddings.size());
                 return embeddings;
             } catch (RestClientResponseException e) {
-                // 业务错误（4xx/5xx，如 400 批量超限）不重试，直接抛出
-                throw e;
+                // 4xx 业务错误（如 400 批量超限、401 鉴权失败）不重试；
+                // 5xx 服务端临时错误（500/502/503/504）可重试
+                if (e.getStatusCode().value() >= 500 && attempt < MAX_RETRIES) {
+                    lastError = e;
+                } else {
+                    throw e;
+                }
             } catch (Exception e) {
                 // 网络异常（超时/连接失败）可重试
                 lastError = e;

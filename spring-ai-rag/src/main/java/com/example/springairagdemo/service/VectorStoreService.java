@@ -1,5 +1,6 @@
 package com.example.springairagdemo.service;
 
+import com.example.springairagdemo.config.AiConfig;
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 import io.milvus.common.clientenum.FunctionType;
@@ -31,6 +32,7 @@ import org.springframework.ai.embedding.Embedding;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.embedding.EmbeddingRequest;
 import org.springframework.ai.embedding.EmbeddingResponse;
+import org.springframework.cloud.client.circuitbreaker.CircuitBreakerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -116,14 +118,17 @@ public class VectorStoreService {
 
     private final MilvusClientV2 milvusClient;
     private final EmbeddingModel embeddingModel;
+    private final CircuitBreakerFactory<?, ?> circuitBreakerFactory;
     private final Gson gson = new Gson();
 
     /** 缓存已确认集合存在的 KB ID，避免重复 hasCollection 调用 */
     private final ConcurrentHashMap<Long, Boolean> collectionReady = new ConcurrentHashMap<>();
 
-    public VectorStoreService(MilvusClientV2 milvusClient, EmbeddingModel embeddingModel) {
+    public VectorStoreService(MilvusClientV2 milvusClient, EmbeddingModel embeddingModel,
+                              CircuitBreakerFactory<?, ?> circuitBreakerFactory) {
         this.milvusClient = milvusClient;
         this.embeddingModel = embeddingModel;
+        this.circuitBreakerFactory = circuitBreakerFactory;
     }
 
     @PreDestroy
@@ -282,10 +287,17 @@ public class VectorStoreService {
             return List.of();
         }
         List<String> texts = chunks.stream().map(ChunkVectorData::getContent).toList();
-        EmbeddingResponse embeddingResponse = embeddingModel.call(new EmbeddingRequest(texts, null));
-        return embeddingResponse.getResults().stream()
-                .map(Embedding::getOutput)
-                .toList();
+        // Sentinel 熔断保护（资源 dashscope-embedding）：连续异常比例高时快速失败，
+        // 避免大批量文档排队把 DashScope 配额打爆；失败抛出 EmbeddingServiceUnavailableException，
+        // 由上传任务归一化错误提示
+        return circuitBreakerFactory.create(AiConfig.EMBEDDING_RESOURCE).run(
+                () -> embeddingModel.call(new EmbeddingRequest(texts, null)).getResults().stream()
+                        .map(Embedding::getOutput)
+                        .toList(),
+                t -> {
+                    log.error("向量化服务（DashScope）不可用，批量向量化降级: {}", t.getMessage());
+                    throw new EmbeddingServiceUnavailableException("向量化服务暂时不可用，请稍后重试", t);
+                });
     }
 
     /**
@@ -517,7 +529,14 @@ public class VectorStoreService {
     // ===================== 辅助方法 =====================
 
     private List<Float> embedQuery(String query) {
-        float[] queryEmbedding = embeddingModel.embed(query);
+        // 同样受 dashscope-embedding 资源熔断保护：检索阶段 Embedding 异常时快速失败，
+        // 由 HybridSearchService 的 BM25 兜底降级链接管
+        float[] queryEmbedding = circuitBreakerFactory.create(AiConfig.EMBEDDING_RESOURCE).run(
+                () -> embeddingModel.embed(query),
+                t -> {
+                    log.error("向量化服务（DashScope）不可用，查询向量化降级: {}", t.getMessage());
+                    throw new EmbeddingServiceUnavailableException("向量化服务暂时不可用，请稍后重试", t);
+                });
         List<Float> queryVec = new ArrayList<>(queryEmbedding.length);
         for (float v : queryEmbedding) queryVec.add(v);
         return queryVec;

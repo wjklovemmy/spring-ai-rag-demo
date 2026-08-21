@@ -293,7 +293,7 @@ public abstract class KnowledgeDocumentService {
             // 回滚未完成向量（已回填 milvus_id 的保留，供恢复时增量跳过），标记文档与任务失败
             rollbackIncompleteVectors(docEntity);
             markDocumentFailed(docEntity);
-            failTask(task, e.getMessage(), start);
+            failTask(task, friendlyErrorMessage(e), start);
         }
     }
 
@@ -542,6 +542,27 @@ public abstract class KnowledgeDocumentService {
                              List<KnowledgeChunkEntity> toVectorOnly,
                              List<KnowledgeChunkEntity> stale,
                              int skipCount) {
+    }
+
+    /**
+     * 将异常转为对用户友好的错误信息：
+     * 向量化/Embedding 类故障（含熔断抛出的 {@link EmbeddingServiceUnavailableException}）
+     * 归一为「向量化服务暂时不可用，请稍后重试」；其余异常截断原始消息，
+     * 避免向用户暴露过长堆栈。
+     */
+    private String friendlyErrorMessage(Throwable e) {
+        if (e instanceof EmbeddingServiceUnavailableException) {
+            return "向量化服务暂时不可用，请稍后重试";
+        }
+        String msg = e.getMessage();
+        if (msg != null && (msg.contains("DashScope") || msg.contains("dashscope")
+                || msg.contains("embedding") || msg.contains("Embedding"))) {
+            return "向量化服务暂时不可用，请稍后重试";
+        }
+        if (msg == null || msg.isBlank()) {
+            msg = e.toString();
+        }
+        return msg.length() > 200 ? msg.substring(0, 200) + "..." : msg;
     }
 
     /**
