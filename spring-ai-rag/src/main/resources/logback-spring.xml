@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <configuration>
     <!-- 日志文件路径 -->
-    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="spring-ai-rag-demo"/>
+    <springProperty scope="context" name="APP_NAME" source="spring.application.name" defaultValue="spring-ai-rag"/>
     <property name="LOG_HOME" value="./logs"/>
     <property name="FILE_PATTERN" value="%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{50} - %msg%n"/>
     <property name="CONSOLE_PATTERN" value="%d{yyyy-MM-dd HH:mm:ss.SSS} %highlight(%-5level) %cyan([%thread]) %green(%logger{36}) - %msg%n"/>

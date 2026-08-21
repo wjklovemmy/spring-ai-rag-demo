@@ -25,6 +25,9 @@
         <spring-ai.version>2.0.0</spring-ai.version>
         <!-- 覆盖 spring-ai-milvus-store 传递引入的旧版 SDK：2.5.9+ 引入 v2 客户端，支持 BM25 Hybrid Search -->
         <milvus-sdk.version>2.6.23</milvus-sdk.version>
+        <!-- Spring Cloud / Spring Cloud Alibaba：2025.1.x 适配 Spring Boot 4.0.x（SCA 官方版本对应关系） -->
+        <spring-cloud.version>2025.1.0</spring-cloud.version>
+        <spring-cloud-alibaba.version>2025.1.0.0</spring-cloud-alibaba.version>
     </properties>
     <dependencies>
         <dependency>
@@ -87,6 +90,24 @@
             <artifactId>spring-security-crypto</artifactId>
         </dependency>
 
+        <!-- ==================== Nacos 注册中心 / 配置中心（三个服务统一接入） ====================
+             版本由 spring-cloud-alibaba-dependencies BOM（2025.1.0.0）管理 -->
+        <!-- Nacos 服务注册与发现 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+        </dependency>
+        <!-- Nacos 配置中心（spring.config.import 方式引入） -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+        </dependency>
+        <!-- Spring Cloud LoadBalancer：网关 lb:// 路由 + 服务间内部调用（UserClient / RagSyncClient） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+        </dependency>
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-devtools</artifactId>
@@ -106,6 +127,22 @@
     </dependencies>
     <dependencyManagement>
         <dependencies>
+            <!-- Spring Cloud BOM（2025.1.0，适配 Spring Boot 4.0.x）：网关 lb:// 路由、负载均衡等 -->
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>${spring-cloud.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <!-- Spring Cloud Alibaba BOM（2025.1.0.0）：Nacos 注册中心（服务发现）+ Nacos 配置中心 -->
+            <dependency>
+                <groupId>com.alibaba.cloud</groupId>
+                <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+                <version>${spring-cloud-alibaba.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
             <!-- Spring AI BOM 与 Milvus SDK 版本管理已下沉至 spring-ai-rag 模块（仅 RAG 使用） -->
         </dependencies>
     </dependencyManagement>

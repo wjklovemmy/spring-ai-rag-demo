@@ -1,6 +1,25 @@
 spring:
   application:
-    name: spring-ai-rag-demo
+    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-rag 路由、用户服务 rag.internal-url 保持一致
+    name: spring-ai-rag
+  config:
+    # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
+    import:
+      - optional:nacos:common.yaml?group=DEFAULT_GROUP&refreshEnabled=true
+  cloud:
+    nacos:
+      # Nacos 注册中心 + 配置中心地址（与 docker-compose 中 nacos 服务一致）
+      server-addr: localhost:8848
+      # Nacos 3.x 默认开启鉴权，默认账号 nacos/nacos；如关闭鉴权可省略
+      username: nacos
+      password: nacos
+      discovery:
+        # 服务注册与发现（服务名取 spring.application.name）；namespace 为命名空间 ID，留空 = public
+        group: DEFAULT_GROUP
+      config:
+        # 配置中心文件扩展名
+        file-extension: yaml
+        group: DEFAULT_GROUP
   servlet:
     multipart:
       max-file-size: 50MB
@@ -163,9 +182,10 @@ gateway:
   internal-token: rag-gw-trust-2026
 
 # ==================== 用户服务协作配置 ====================
-# 用户域由独立服务 spring-ai-user（8082）承担：ADMIN 判定与用户摘要经内部接口远程查询
+# 用户域由独立服务 spring-ai-user 承担：ADMIN 判定与用户摘要经内部接口远程查询。
+# lb:// 前缀经 Spring Cloud LoadBalancer 从 Nacos 注册中心解析服务实例（无需硬编码地址）
 user-service:
-  internal-url: http://localhost:8082
+  internal-url: lb://spring-ai-user
 
 # 服务间内部调用令牌：本服务 /internal/kb/** 校验用户服务传来的 X-Internal-Token；
 # 本服务调用用户服务 /internal/users/** 时也携带此令牌，两端必须一致

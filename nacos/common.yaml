@@ -1,0 +1,26 @@
+# ============================================================
+# Nacos 配置中心 - 共享配置（common.yaml，group=DEFAULT_GROUP）
+#
+# 被三个服务（gateway / spring-ai-rag / spring-ai-user）通过
+#   spring.config.import: optional:nacos:common.yaml?group=DEFAULT_GROUP&refreshEnabled=true
+# 共同引用，承载"三端必须一致"的密钥类配置。
+# 本地 application.yaml 保留同名兜底值（Nacos 不可用时服务仍可启动，
+# 一旦 Nacos 可用，此处配置优先生效）。
+#
+# 导入方式：Nacos 控制台（http://localhost:8848/nacos，账号 nacos/nacos）
+#   → 配置管理 → 配置列表 → 新建配置
+#   Data ID: common.yaml   Group: DEFAULT_GROUP   格式: YAML
+# ============================================================
+
+# JWT 密钥（gateway 校验 / spring-ai-user 签发，两端必须一致）
+jwt:
+  secret: R4gD3m0-K3y-32ch4rs-L0ng-S3cur3!!
+  expiration-ms: 1800000
+  refresh-expiration-ms: 604800000
+
+# 网关内部信任令牌（三端必须一致，防绕过网关直连伪造身份）
+gateway:
+  internal-token: rag-gw-trust-2026
+
+# 服务间内部调用令牌（RAG ↔ spring-ai-user 调用 /internal/** 时校验，两端必须一致）
+internal-token: rag-internal-2026

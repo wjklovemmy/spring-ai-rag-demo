@@ -30,8 +30,10 @@ public class RagSyncClient {
     private final String internalToken;
 
     public RagSyncClient(@Value("${rag.internal-url}") String baseUrl,
-                         @Value("${internal-token}") String internalToken) {
-        this.restClient = RestClient.builder().baseUrl(baseUrl).build();
+                         @Value("${internal-token}") String internalToken,
+                         RestClient.Builder loadBalancedRestClientBuilder) {
+        // 注入 @LoadBalanced builder：baseUrl 支持 lb://spring-ai-rag，经 Nacos 注册中心解析实例
+        this.restClient = loadBalancedRestClientBuilder.baseUrl(baseUrl).build();
         this.internalToken = internalToken;
     }
 

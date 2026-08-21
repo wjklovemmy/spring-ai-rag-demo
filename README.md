@@ -35,9 +35,10 @@
 | 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
-| 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
+| 对象存储 | MinIO 8.6.0 | 原始文档文件存储（同时支持本地磁盘模式）；8.6.0 修复 CVE-2025-59952 |
+| 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由与内部调用用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
-| 网关 | Spring Cloud Gateway 2025.0.0（gateway-server 4.3.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → 8082，知识库/文档 → 8080）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
+| 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
 | 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 8081） |
@@ -84,14 +85,21 @@ graph TB
         MINIO[("MinIO<br/>原始 PDF 文件")]
     end
 
+    subgraph Registry["注册中心 / 配置中心"]
+        NACOS[("Nacos :8848<br/>服务注册与发现<br/>配置中心 common.yaml")]
+    end
+
     OCRSVC["阿里云 OCR API"]
     AI["DeepSeek API"]
     DS["DashScope API"]
 
     LOGIN --> GWAUTH
     INDEX --> GWAUTH
-    GWAUTH -->|认证/用户/角色| GATE_ID
-    GWAUTH -->|知识库/文档| CTRL
+    GWAUTH -->|"认证/用户/角色 (lb://spring-ai-user)"| GATE_ID
+    GWAUTH -->|"知识库/文档 (lb://spring-ai-rag)"| CTRL
+    GWAUTH -.注册.-> NACOS
+    GATE_ID -.注册.-> NACOS
+    CTRL -.注册.-> NACOS
     GATE_ID --> USERCTRL
     INT_USER -.内部接口.-> USERSVC
     USERCTRL -.RagSyncClient 回调.-> INT_KB
@@ -130,9 +138,12 @@ graph TB
 ```
 spring-ai-rag-demo/
 ├── docker/
-│   └── docker-compose.yml          # Milvus(含 etcd/attu) + MinIO 编排
+│   └── docker-compose.yml          # Milvus(含 etcd/attu) + MinIO + Nacos(注册/配置中心) + Redis 编排
+├── nacos/
+│   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
+│   └── README.md                   # Nacos 接入说明（启动/导入/验证）
 ├── logs/                           # 运行日志
-├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理）
+├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理，含 Spring Cloud/SCA BOM）
 ├── mvnw / mvnw.cmd                 # Maven Wrapper
 ├── spring-ai-rag/                  # RAG 服务（独立部署，端口 8080，不依赖用户域模块）
 │   ├── pom.xml                     # Spring AI/Milvus/MinIO/OCR 依赖（用户域已拆分为独立服务）
@@ -367,7 +378,7 @@ spring-ai-rag-demo/
 
 **认证**（识别"你是谁"）：
 
-注册/登录由**用户域模块 `spring-ai-user`**（共享 jar，与 RAG 服务同进程部署于 8080）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
+注册/登录由**独立服务 `spring-ai-user`**（8082，经 Nacos 注册）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 8081 进入：
 
 ```
 访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 8081）
@@ -517,8 +528,9 @@ spring-ai-rag-demo/
 | `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
 | `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
 | `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 与用户服务的 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
-| `user-service.internal-url` | 用户服务地址（RAG 调 `/internal/users/**` 查询 isAdmin / 用户摘要） |
+| `user-service.internal-url` | 用户服务地址（RAG 调 `/internal/users/**` 查询 isAdmin / 用户摘要）；`lb://spring-ai-user` 经 Nacos 服务发现解析实例 |
 | `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时携带，两端必须一致） |
+| `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 
 **spring-ai-user 用户服务（`spring-ai-user/src/main/resources/application.yaml`）关键配置：**
 
@@ -528,14 +540,15 @@ spring-ai-rag-demo/
 | `spring.datasource.*` | MySQL 连接（`spring_ai_user` 库，标准主数据源） |
 | `spring.data.redis.*` | Redis（Refresh Token 会话存储 + 登出黑名单） |
 | `jwt.secret` / `jwt.expiration-ms` / `jwt.refresh-expiration-ms` | JWT 密钥与过期时间（签发侧，secret 必须与 gateway 一致） |
-| `rag.internal-url` | RAG 服务地址（回调 `/internal/kb/**` 做删除前校验/清理/审计） |
+| `rag.internal-url` | RAG 服务地址（回调 `/internal/kb/**` 做删除前校验/清理/审计）；`lb://spring-ai-rag` 经 Nacos 服务发现解析实例 |
 | `gateway.internal-token` / `internal-token` | 与 RAG/网关一致的内部令牌 |
+| `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（与 RAG/网关一致，`localhost:8848`） |
 
 **gateway 模块（`gateway/src/main/resources/application.yaml`）关键配置：**
 
 | 配置项 | 说明 |
 |--------|------|
-| `spring.cloud.gateway.server.webflux.routes` | 路由分流：认证/用户/角色（`/api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**`）→ `http://localhost:8082`（用户服务）；其余 `/api/**` → `http://localhost:8080`（RAG 服务） |
+| `spring.cloud.gateway.server.webflux.routes` | 路由分流：认证/用户/角色（`/api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**`）→ `lb://spring-ai-user`（用户服务）；其余 `/api/**` → `lb://spring-ai-rag`（RAG 服务）；均经 Nacos 服务发现解析实例 |
 | `spring.cloud.gateway.server.webflux.globalcors` | 跨域：放行所有来源（页面从 8080 加载、接口走 8081） |
 | `jwt.secret` / `jwt.expiration-ms` | 与用户服务一致（网关侧仅校验、不签发） |
 | `spring.data.redis.*` | Redis（Token 黑名单） |
@@ -560,7 +573,9 @@ cd docker
 docker-compose up -d
 ```
 
-会启动：Milvus 2.6.0（+ etcd）、MinIO（9002/9003，bucket `knowledge-documents` 自动创建）、Attu 管理界面（http://localhost:8000）。
+会启动：Milvus 2.6.0（+ etcd）、MinIO（9002/9003，bucket `knowledge-documents` 自动创建）、Attu 管理界面（http://localhost:8000）、**Nacos（8848/9848，注册中心 + 配置中心）**、Redis（6379）。
+
+> Nacos 控制台：http://localhost:8848/nacos（默认账号 `nacos/nacos`）。首次使用需在控制台"配置管理 → 新建配置"导入共享配置 `Data ID: common.yaml / Group: DEFAULT_GROUP`（内容见 [`nacos/common.yaml`](../nacos/common.yaml)）。若跳过此步，三个服务使用本地 `application.yaml` 中的兜底密钥，功能不受影响。
 
 > 仓库中的 compose 未包含 MySQL 服务，需自行准备 MySQL 8.x，并执行一次：
 > 1. `sql/init.sql` — RAG 业务库：业务表 + 成员授权 + 审计日志（幂等，可重复执行）。
@@ -647,7 +662,8 @@ cd ../gateway
 ```
 
 > 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
-> 三个服务的 `application.yaml` 中 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；用户服务与 RAG 的服务间地址（`rag.internal-url` / `user-service.internal-url`）按实际部署调整。
+> 三个服务启动前需先启动 Nacos（`docker-compose up -d nacos`）；服务注册与发现、网关 `lb://` 路由、`RagSyncClient` / `UserClient` 的内部调用均依赖 Nacos。Nacos 不可用时服务仍可启动（`optional:` 配置导入 + 本地兜底密钥），但服务间寻址会失败。
+> 三个服务的 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；这些密钥默认从 Nacos 配置中心 `common.yaml` 拉取（Nacos 可用时优先生效），本地 `application.yaml` 保留兜底值。
 > 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
 
 ### 4. 访问页面

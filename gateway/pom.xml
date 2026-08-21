@@ -17,30 +17,17 @@
 
     <!--
       Spring Boot / Java 版本、插件等由父工程管理。
-      Spring Cloud 依赖（2025.0.0）因父工程未声明 spring-cloud-dependencies BOM，
-      在此模块内单独管理。
+      Spring Cloud 依赖（2025.1.0）与 Spring Cloud Alibaba（2025.1.0.0，Nacos）BOM
+      已统一在父工程 pom.xml 的 dependencyManagement 中声明，此处不再重复管理。
     -->
-    <properties>
-        <spring-cloud.version>2025.0.0</spring-cloud.version>
-    </properties>
-
-    <dependencyManagement>
-        <dependencies>
-            <dependency>
-                <groupId>org.springframework.cloud</groupId>
-                <artifactId>spring-cloud-dependencies</artifactId>
-                <version>${spring-cloud.version}</version>
-                <type>pom</type>
-                <scope>import</scope>
-            </dependency>
-        </dependencies>
-    </dependencyManagement>
 
     <dependencies>
-        <!-- Spring Cloud Gateway（基于 WebFlux，注意勿引入 spring-boot-starter-web） -->
+        <!-- Spring Cloud Gateway（基于 WebFlux，注意勿引入 spring-boot-starter-web）。
+             Spring Cloud Gateway 5.0（Spring Cloud 2025.1）起，starter 拆分为 webflux/webmvc 两个，
+             原 spring-cloud-starter-gateway 已移除，此处使用 WebFlux 版 -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
-            <artifactId>spring-cloud-starter-gateway</artifactId>
+            <artifactId>spring-cloud-starter-gateway-server-webflux</artifactId>
         </dependency>
 
         <!-- 请求限流 RequestRateLimiter 依赖（默认未启用，启用时需 Redis） -->

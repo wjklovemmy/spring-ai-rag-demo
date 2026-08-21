@@ -3,8 +3,13 @@ server:
 
 spring:
   application:
+    # 服务名 = Nacos 注册名（网关自身也注册，便于统一监控与后续服务间互访）
     name: gateway
-  # Redis：认证黑名单检查 + 可选 IP 限流，必须与 RAG 服务同一实例（共享 auth:blacklist:*）
+  config:
+    # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
+    import:
+      - optional:nacos:common.yaml?group=DEFAULT_GROUP&refreshEnabled=true
+  # Redis：认证黑名单检查 + 可选 IP 限流，必须与用户服务同一实例（共享 auth:blacklist:*）
   data:
     redis:
       host: localhost
@@ -13,22 +18,35 @@ spring:
       database: 0
       timeout: 3s
   cloud:
+    nacos:
+      # Nacos 注册中心 + 配置中心地址（与 docker-compose 中 nacos 服务一致）
+      server-addr: localhost:8848
+      # Nacos 3.x 默认开启鉴权，默认账号 nacos/nacos；如关闭鉴权可省略
+      username: nacos
+      password: nacos
+      discovery:
+        # 服务注册与发现（服务名取 spring.application.name）；namespace 为命名空间 ID，留空 = public
+        group: DEFAULT_GROUP
+      config:
+        # 配置中心文件扩展名
+        file-extension: yaml
+        group: DEFAULT_GROUP
     gateway:
       # Cloud 2025.0（gateway 4.3.0）起，全部配置迁移到 server.webflux 前缀，
       # 旧的 spring.cloud.gateway.* 已废弃（IDE 会标红）
       server:
         webflux:
           # 路由拆分（按 path，顺序敏感：user-service 在前，rag-service 兜底）：
-          #   - 认证 / 用户 / 角色管理 → 用户服务 spring-ai-user（8082，独立服务）
-          #   - 其余 /api/**（知识库 / 文档 / 问答） → RAG 服务 spring-ai-rag（8080）
+          #   - 认证 / 用户 / 角色管理 → 用户服务 spring-ai-user（经 Nacos 服务发现 lb://）
+          #   - 其余 /api/**（知识库 / 文档 / 问答） → RAG 服务 spring-ai-rag（经 Nacos 服务发现 lb://）
           # 路径前缀均保持 /api，无需 StripPrefix
           routes:
             - id: user-service
-              uri: http://localhost:8082
+              uri: lb://spring-ai-user
               predicates:
                 - Path=/api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**
             - id: rag-service
-              uri: http://localhost:8080
+              uri: lb://spring-ai-rag
               predicates:
                 - Path=/api/**
               # 可选：按客户端 IP 限流（需 Redis）。启用时取消注释即可

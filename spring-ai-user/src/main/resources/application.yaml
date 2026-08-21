@@ -1,6 +1,25 @@
 spring:
   application:
+    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-user 路由、RAG 服务 user-service.internal-url 保持一致
     name: spring-ai-user
+  config:
+    # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
+    import:
+      - optional:nacos:common.yaml?group=DEFAULT_GROUP&refreshEnabled=true
+  cloud:
+    nacos:
+      # Nacos 注册中心 + 配置中心地址（与 docker-compose 中 nacos 服务一致）
+      server-addr: localhost:8848
+      # Nacos 3.x 默认开启鉴权，默认账号 nacos/nacos；如关闭鉴权可省略
+      username: nacos
+      password: nacos
+      discovery:
+        # 服务注册与发现（服务名取 spring.application.name）；namespace 为命名空间 ID，留空 = public
+        group: DEFAULT_GROUP
+      config:
+        # 配置中心文件扩展名
+        file-extension: yaml
+        group: DEFAULT_GROUP
   datasource:
     # 用户域独立库 spring_ai_user（标准主数据源，MyBatis-Plus 自动装配）
     # 建库脚本见 sql/user.sql，5 张表：sys_user / sys_role / sys_permission / sys_user_role / sys_role_permission
@@ -44,10 +63,11 @@ gateway:
   internal-token: rag-gw-trust-2026
 
 # ==================== RAG 服务回调配置 ====================
-# 删除用户前的知识库授权校验/清理、管理操作审计，经 HTTP 回调 RAG 服务 /internal/kb/** 接口
+# 删除用户前的知识库授权校验/清理、管理操作审计，经 HTTP 回调 RAG 服务 /internal/kb/** 接口。
+# lb:// 前缀经 Spring Cloud LoadBalancer 从 Nacos 注册中心解析服务实例（无需硬编码地址）
 rag:
   # RAG 服务地址（内部接口不经过网关，直接调用）
-  internal-url: http://localhost:8080
+  internal-url: lb://spring-ai-rag
 
 # 服务间内部调用令牌：本服务调用 RAG /internal/kb/**、RAG 调用本服务 /internal/users/** 时
 # 均携带 X-Internal-Token 头，两端必须一致（防未授权访问内部接口）

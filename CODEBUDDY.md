@@ -32,12 +32,13 @@ The repository root is an aggregator POM (`packaging=pom`). All three modules ar
 ./mvnw -pl gateway spring-boot:run
 ```
 
-On Windows, replace `./mvnw` with `mvnw.cmd`. The `gateway` module manages its own `spring-cloud-dependencies` BOM (2025.0.0) since the parent POM does not declare it.
+On Windows, replace `./mvnw` with `mvnw.cmd`. Spring Cloud (`2025.1.0`) and Spring Cloud Alibaba (`2025.1.0.0`, Nacos) BOMs are declared in the parent POM (`spring-cloud-dependencies` / `spring-cloud-alibaba-dependencies`). Note: Spring Cloud Gateway 5.0 (SC 2025.1) renamed the starter to `spring-cloud-starter-gateway-server-webflux`.
 
 ## Prerequisites
 
 Before running, ensure the following services are available:
 
+- **Nacos** on `localhost:8848` (registry + config center, via `docker-compose up -d nacos`, console `http://localhost:8848/nacos`, default `nacos/nacos`). All three services register here; gateway `lb://` routes and internal calls (`UserClient` / `RagSyncClient`) resolve instances via Nacos. Shared secrets may be published to config center data-id `common.yaml` (see `nacos/common.yaml`), otherwise local fallbacks apply.
 - **Milvus** vector database on `localhost:19530` (default database, per-knowledge-base dynamic collections `kb_{id}`)
 - **DeepSeek API** key via environment variable `DEEPSEEK_API_KEY`
 - **DashScope (Alibaba Cloud) API** key via environment variable `DASHSCOPE_API_KEY`
@@ -46,6 +47,7 @@ Before running, ensure the following services are available:
 
 The three services' `application.yaml` share three secrets that MUST match everywhere:
 `jwt.secret` (gateway ↔ user service), `gateway.internal-token` (gateway → downstream `X-Gateway-Token`), `internal-token` (RAG ↔ user service internal calls `X-Internal-Token`).
+These are normally served from the Nacos config center `common.yaml` (higher precedence when Nacos is reachable); local values are fallbacks so services still boot without Nacos.
 
 ## Architecture
 
@@ -57,9 +59,11 @@ Browser (pages served by RAG :8080, API_BASE = http://localhost:8081)
         ▼
 gateway :8081 (JwtAuthGlobalFilter: whitelist register/login/logout/refresh,
                validate JWT + Redis blacklist, inject X-User-Id / X-Username /
-               X-Permissions / X-Gateway-Token, route by path)
-        ├── /api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**  → spring-ai-user :8082
-        └── other /api/** (knowledge-base, knowledge-document)                                      → spring-ai-rag :8080
+               X-Permissions / X-Gateway-Token, route by path via Nacos lb://)
+        ├── /api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**  → lb://spring-ai-user
+        └── other /api/** (knowledge-base, knowledge-document)                                      → lb://spring-ai-rag
+
+Nacos :8848 (registry + config center)  ← all three services register (spring.application.name)
 
 spring-ai-rag :8080         spring-ai-user :8082
   GatewayIdentityFilter       GatewayIdentityFilter
@@ -73,6 +77,7 @@ spring-ai-rag :8080         spring-ai-user :8082
 ```
 
 - `/internal/**` endpoints do NOT go through the gateway; they authenticate via the `X-Internal-Token` header and are skipped by each service's `GatewayIdentityFilter` (which only guards `/api/**`).
+- Service-to-service HTTP clients (`UserClient` in RAG, `RagSyncClient` in user service) use an `@LoadBalanced RestClient.Builder` bean so their `baseUrl` (`lb://spring-ai-user` / `lb://spring-ai-rag`) is resolved through Nacos + Spring Cloud LoadBalancer instead of hard-coded localhost ports.
 
 ### Package Structure
 
@@ -134,11 +139,11 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 ### Configuration (`application.yaml`)
 
-**spring-ai-rag (8080):** multipart 50MB; DeepSeek base URL / api-key / model / temperature; DashScope api-key from env; Milvus at `localhost:19530`; MinIO/local storage; OCR; rerank; hybrid retrieval; `gateway.internal-token`; `user-service.internal-url=http://localhost:8082`; `internal-token`. No Redis, no JWT config (moved to user service), no `spring.datasource.user.*`.
+**spring-ai-rag (8080):** multipart 50MB; DeepSeek base URL / api-key / model / temperature; DashScope api-key from env; Milvus at `localhost:19530`; MinIO/local storage; OCR; rerank; hybrid retrieval; Nacos (register + config center, `common.yaml` shared keys); `gateway.internal-token`; `user-service.internal-url=lb://spring-ai-user` (Nacos discovery via `@LoadBalanced RestClient`); `internal-token`. No Redis, no JWT config (moved to user service), no `spring.datasource.user.*`.
 
-**spring-ai-user (8082):** MySQL `spring_ai_user` (standard `spring.datasource.*`, MyBatis-Plus auto-configured); Redis (refresh-token sessions); `jwt.secret` (signing side, must match gateway); `gateway.internal-token`; `rag.internal-url=http://localhost:8080`; `internal-token`.
+**spring-ai-user (8082):** MySQL `spring_ai_user` (standard `spring.datasource.*`, MyBatis-Plus auto-configured); Redis (refresh-token sessions); Nacos (register + config center); `jwt.secret` (signing side, must match gateway); `gateway.internal-token`; `rag.internal-url=lb://spring-ai-rag` (Nacos discovery via `@LoadBalanced RestClient`); `internal-token`.
 
-**gateway (8081):** routes split by path (see topology); CORS for all origins; `jwt.secret` (validate only); Redis blacklist; `gateway.internal-token`; `internal-token`.
+**gateway (8081):** routes split by path with `lb://spring-ai-user` / `lb://spring-ai-rag` (Nacos discovery; starter renamed to `spring-cloud-starter-gateway-server-webflux` in Gateway 5.0); CORS for all origins; `jwt.secret` (validate only); Redis blacklist; Nacos (register + config center); `gateway.internal-token`; `internal-token`.
 
 ### Authentication & Authorization Flow
 
