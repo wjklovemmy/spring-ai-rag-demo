@@ -38,7 +38,7 @@ On Windows, replace `./mvnw` with `mvnw.cmd`. Spring Cloud (`2025.1.0`) and Spri
 
 Before running, ensure the following services are available:
 
-- **Nacos** on `localhost:8848` (registry + config center, via `docker-compose up -d nacos`, console `http://localhost:8848/nacos`, default `nacos/nacos`). All three services register here; gateway `lb://` routes and internal calls (`UserClient` / `RagSyncClient`) resolve instances via Nacos. Shared secrets may be published to config center data-id `common.yaml` (see `nacos/common.yaml`), otherwise local fallbacks apply.
+- **Nacos** on `localhost:8848` (registry + config center, via `docker-compose up -d nacos`, console `http://localhost:8848/nacos`, default `nacos/nacos`). All three services register here; gateway `lb://` routes and OpenFeign service-to-service calls (`UserFeignClient` / `RagSyncFeignClient`) resolve instances via Nacos. Shared secrets may be published to config center data-id `common.yaml` (see `nacos/common.yaml`), otherwise local fallbacks apply.
 - **Milvus** vector database on `localhost:19530` (default database, per-knowledge-base dynamic collections `kb_{id}`)
 - **DeepSeek API** key via environment variable `DEEPSEEK_API_KEY`
 - **DashScope (Alibaba Cloud) API** key via environment variable `DASHSCOPE_API_KEY`
@@ -77,7 +77,7 @@ spring-ai-rag :8080         spring-ai-user :8082
 ```
 
 - `/internal/**` endpoints do NOT go through the gateway; they authenticate via the `X-Internal-Token` header and are skipped by each service's `GatewayIdentityFilter` (which only guards `/api/**`).
-- Service-to-service HTTP clients (`UserClient` in RAG, `RagSyncClient` in user service) use an `@LoadBalanced RestClient.Builder` bean so their `baseUrl` (`lb://spring-ai-user` / `lb://spring-ai-rag`) is resolved through Nacos + Spring Cloud LoadBalancer instead of hard-coded localhost ports.
+- Service-to-service calls use **OpenFeign** (`UserFeignClient` in RAG, `RagSyncFeignClient` in user service, under each service's `feign/` package): the service name (`spring-ai-user` / `spring-ai-rag`) is resolved through Nacos + Spring Cloud LoadBalancer instead of hard-coded localhost ports. A global `RequestInterceptor` (`FeignConfig`) injects `X-Internal-Token`. Fault tolerance is provided by `feign.circuitbreaker.enabled=true` + Spring Cloud Circuit Breaker (**Sentinel** via `spring-cloud-circuitbreaker-sentinel`, the official Hystrix replacement — Hystrix is EOL and removed from Spring Cloud 2020+), with `fallbackFactory` classes returning safe degradation values (`UserFeignClientFallbackFactory` / `RagSyncFeignClientFallbackFactory`). Sentinel degrade rules are declared in each service's `application.yaml` under `feign.sentinel.rules` (key `default` = all Feign clients, or exact resource name like `spring-ai-user#isAdmin(Long)`; the resource name defaults to the Feign client service name). `sentinel-transport-simple-http` enables optional Dashboard metric reporting (`spring.cloud.sentinel.transport.dashboard`, port 8719).
 
 ### Package Structure
 
@@ -139,9 +139,9 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 ### Configuration (`application.yaml`)
 
-**spring-ai-rag (8080):** multipart 50MB; DeepSeek base URL / api-key / model / temperature; DashScope api-key from env; Milvus at `localhost:19530`; MinIO/local storage; OCR; rerank; hybrid retrieval; Nacos (register + config center, `common.yaml` shared keys); `gateway.internal-token`; `user-service.internal-url=lb://spring-ai-user` (Nacos discovery via `@LoadBalanced RestClient`); `internal-token`. No Redis, no JWT config (moved to user service), no `spring.datasource.user.*`.
+**spring-ai-rag (8080):** multipart 50MB; DeepSeek base URL / api-key / model / temperature; DashScope api-key from env; Milvus at `localhost:19530`; MinIO/local storage; OCR; rerank; hybrid retrieval; Nacos (register + config center, `common.yaml` shared keys); `gateway.internal-token`; OpenFeign (`UserFeignClient` → `lb://spring-ai-user`, `feign.circuitbreaker.enabled=true` + Sentinel fallbackFactory, `feign.sentinel.rules`); Sentinel transport (`spring.cloud.sentinel.*`, Dashboard at `localhost:8858` via the docker compose `sentinel-dashboard` service, credentials `sentinel/sentinel`); `internal-token`. No Redis, no JWT config (moved to user service), no `spring.datasource.user.*`.
 
-**spring-ai-user (8082):** MySQL `spring_ai_user` (standard `spring.datasource.*`, MyBatis-Plus auto-configured); Redis (refresh-token sessions); Nacos (register + config center); `jwt.secret` (signing side, must match gateway); `gateway.internal-token`; `rag.internal-url=lb://spring-ai-rag` (Nacos discovery via `@LoadBalanced RestClient`); `internal-token`.
+**spring-ai-user (8082):** MySQL `spring_ai_user` (standard `spring.datasource.*`, MyBatis-Plus auto-configured); Redis (refresh-token sessions); Nacos (register + config center); `jwt.secret` (signing side, must match gateway); `gateway.internal-token`; OpenFeign (`RagSyncFeignClient` → `lb://spring-ai-rag`, `feign.circuitbreaker.enabled=true` + Sentinel fallbackFactory, `feign.sentinel.rules`); Sentinel transport; `internal-token`.
 
 **gateway (8081):** routes split by path with `lb://spring-ai-user` / `lb://spring-ai-rag` (Nacos discovery; starter renamed to `spring-cloud-starter-gateway-server-webflux` in Gateway 5.0); CORS for all origins; `jwt.secret` (validate only); Redis blacklist; Nacos (register + config center); `gateway.internal-token`; `internal-token`.
 

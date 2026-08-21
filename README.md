@@ -36,7 +36,9 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.6.0 | 原始文档文件存储（同时支持本地磁盘模式）；8.6.0 修复 CVE-2025-59952 |
-| 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由与内部调用用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
+| 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
+| 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
+| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`），支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
@@ -528,8 +530,10 @@ spring-ai-rag-demo/
 | `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
 | `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
 | `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 与用户服务的 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
-| `user-service.internal-url` | 用户服务地址（RAG 调 `/internal/users/**` 查询 isAdmin / 用户摘要）；`lb://spring-ai-user` 经 Nacos 服务发现解析实例 |
-| `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时携带，两端必须一致） |
+| `feign.circuitbreaker.enabled` | OpenFeign 熔断降级开关（true；配合 Sentinel + fallbackFactory，Hystrix 的官方替代） |
+| `feign.sentinel.rules` | Sentinel 熔断规则（key：`default`=所有 Feign 客户端默认规则，或精确资源名如 `spring-ai-user#isAdmin(Long)`；value：DegradeRule 列表） |
+| `feign.client.config.default.*` | OpenFeign 默认连接/读取超时（connect-timeout 3000ms / read-timeout 10000ms） |
+| `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时由 Feign 拦截器携带，两端必须一致） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 
 **spring-ai-user 用户服务（`spring-ai-user/src/main/resources/application.yaml`）关键配置：**
@@ -540,8 +544,10 @@ spring-ai-rag-demo/
 | `spring.datasource.*` | MySQL 连接（`spring_ai_user` 库，标准主数据源） |
 | `spring.data.redis.*` | Redis（Refresh Token 会话存储 + 登出黑名单） |
 | `jwt.secret` / `jwt.expiration-ms` / `jwt.refresh-expiration-ms` | JWT 密钥与过期时间（签发侧，secret 必须与 gateway 一致） |
-| `rag.internal-url` | RAG 服务地址（回调 `/internal/kb/**` 做删除前校验/清理/审计）；`lb://spring-ai-rag` 经 Nacos 服务发现解析实例 |
-| `gateway.internal-token` / `internal-token` | 与 RAG/网关一致的内部令牌 |
+| `feign.circuitbreaker.enabled` | OpenFeign 熔断降级开关（true；RagSyncFeignClient fallbackFactory 兜底） |
+| `feign.sentinel.rules` | Sentinel 熔断规则（精确资源名如 `spring-ai-rag#deletionCheck(Map)`） |
+| `spring.cloud.sentinel.*` | Sentinel transport（Dashboard 上报，`eager` 启动即注册，可选） |
+| `gateway.internal-token` / `internal-token` | 与 RAG/网关一致的内部令牌（Feign 拦截器统一注入 `X-Internal-Token`） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（与 RAG/网关一致，`localhost:8848`） |
 
 **gateway 模块（`gateway/src/main/resources/application.yaml`）关键配置：**
@@ -662,7 +668,7 @@ cd ../gateway
 ```
 
 > 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
-> 三个服务启动前需先启动 Nacos（`docker-compose up -d nacos`）；服务注册与发现、网关 `lb://` 路由、`RagSyncClient` / `UserClient` 的内部调用均依赖 Nacos。Nacos 不可用时服务仍可启动（`optional:` 配置导入 + 本地兜底密钥），但服务间寻址会失败。
+> 三个服务启动前需先启动 Nacos（`docker-compose up -d nacos`）；服务注册与发现、网关 `lb://` 路由、OpenFeign 服务间调用（`UserFeignClient` / `RagSyncFeignClient`）均依赖 Nacos。Nacos 不可用时服务仍可启动（`optional:` 配置导入 + 本地兜底密钥），但服务间寻址会失败，OpenFeign 调用将走熔断降级兜底。
 > 三个服务的 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；这些密钥默认从 Nacos 配置中心 `common.yaml` 拉取（Nacos 可用时优先生效），本地 `application.yaml` 保留兜底值。
 > 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
 

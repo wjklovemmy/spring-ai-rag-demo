@@ -1,6 +1,6 @@
 spring:
   application:
-    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-user 路由、RAG 服务 user-service.internal-url 保持一致
+    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-user 路由、RAG 服务 UserFeignClient 服务名一致
     name: spring-ai-user
   config:
     # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
@@ -20,6 +20,15 @@ spring:
         # 配置中心文件扩展名
         file-extension: yaml
         group: DEFAULT_GROUP
+    sentinel:
+      # 服务启动即注册到 transport（便于 Dashboard 展示）；默认懒注册
+      eager: true
+      transport:
+        # Sentinel Dashboard 地址（可选：未启动 Dashboard 时仅告警，不影响熔断降级功能）。
+        # Docker 方式：docker compose -f docker/docker-compose.yml up -d sentinel-dashboard（bladex/sentinel-dashboard:1.8.9，端口 8858）
+        dashboard: localhost:8858
+        # transport 指标上报端口（本服务，默认 8719，与 Dashboard 保持唯一）
+        port: 8719
   datasource:
     # 用户域独立库 spring_ai_user（标准主数据源，MyBatis-Plus 自动装配）
     # 建库脚本见 sql/user.sql，5 张表：sys_user / sys_role / sys_permission / sys_user_role / sys_role_permission
@@ -62,13 +71,51 @@ jwt:
 gateway:
   internal-token: rag-gw-trust-2026
 
-# ==================== RAG 服务回调配置 ====================
-# 删除用户前的知识库授权校验/清理、管理操作审计，经 HTTP 回调 RAG 服务 /internal/kb/** 接口。
-# lb:// 前缀经 Spring Cloud LoadBalancer 从 Nacos 注册中心解析服务实例（无需硬编码地址）
-rag:
-  # RAG 服务地址（内部接口不经过网关，直接调用）
-  internal-url: lb://spring-ai-rag
+# ==================== OpenFeign 服务调用配置 ====================
+# 跨服务回调 spring-ai-rag 的删除校验/清理/审计，服务名经 Nacos 注册中心解析实例并负载均衡
+feign:
+  # 开启熔断降级：调用失败/超时/熔断打开时走 RagSyncFeignClientFallbackFactory 安全兜底
+  circuitbreaker:
+    enabled: true
+  # Sentinel 熔断规则（Spring Cloud Circuit Breaker Sentinel 实现，声明式配置）。
+  # 资源名默认 = Feign 客户端服务名（spring-ai-rag）；精确到方法 = "服务名#方法(参数简单类型)"
+  sentinel:
+    # RefreshScope 刷新 / 配置中心变更时热更新规则
+    enable-refresh-rules: true
+    # 默认规则键名：rules 中该键的规则应用到所有 Feign 客户端
+    default-rule: default
+    rules:
+      # 所有 Feign 客户端的默认熔断规则
+      default:
+        - grade: 0            # 熔断维度：0=异常比例 1=慢调用比例 2=异常数
+          count: 0.5          # 触发阈值：异常比例 50%
+          timeWindow: 10      # 熔断打开后的恢复窗口（秒）
+          minRequestAmount: 5 # 触发熔断所需的最小请求数（避免小流量误熔断）
+      # 精确到 RAG 删除前校验方法（该校验失败会阻止删除用户，语义重要，阈值保守）
+      "spring-ai-rag#deletionCheck(Map)":
+        - grade: 0
+          count: 0.3          # 30% 异常比例即熔断
+          timeWindow: 10
+          minRequestAmount: 3
+      # 精确到 RAG 清理/审计方法（异常数熔断，失败仅告警不阻塞主流程）
+      "spring-ai-rag#userCleanup(Map)":
+        - grade: 2
+          count: 5
+          timeWindow: 10
+          minRequestAmount: 2
+      "spring-ai-rag#audit(Map)":
+        - grade: 2
+          count: 5
+          timeWindow: 10
+          minRequestAmount: 2
+  client:
+    config:
+      default:
+        # 建立连接超时（毫秒）
+        connect-timeout: 3000
+        # 读取响应超时（毫秒）
+        read-timeout: 10000
 
 # 服务间内部调用令牌：本服务调用 RAG /internal/kb/**、RAG 调用本服务 /internal/users/** 时
-# 均携带 X-Internal-Token 头，两端必须一致（防未授权访问内部接口）
+# 均携带 X-Internal-Token 头（FeignConfig 拦截器注入），两端必须一致（防未授权访问内部接口）
 internal-token: rag-internal-2026

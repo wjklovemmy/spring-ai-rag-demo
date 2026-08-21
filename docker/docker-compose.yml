@@ -115,6 +115,16 @@ services:
       - nacos_data:/home/nacos/data
     restart: unless-stopped
 
+  # Sentinel Dashboard 熔断降级可视化控制台（可选）
+  # 控制台：http://localhost:8858（默认账号 sentinel/sentinel）
+  # RAG / 用户服务 application.yaml 的 spring.cloud.sentinel.transport.dashboard 已指向 localhost:8858
+  sentinel-dashboard:
+    container_name: knowledge-sentinel-dashboard
+    image: bladex/sentinel-dashboard:1.8.9
+    ports:
+      - "8858:8858"
+    restart: unless-stopped
+
 networks:
   default:
     name: milvus

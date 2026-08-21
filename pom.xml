@@ -102,10 +102,30 @@
             <groupId>com.alibaba.cloud</groupId>
             <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
         </dependency>
-        <!-- Spring Cloud LoadBalancer：网关 lb:// 路由 + 服务间内部调用（UserClient / RagSyncClient） -->
+        <!-- Spring Cloud LoadBalancer：网关 lb:// 路由 + Feign 服务间调用负载均衡 -->
         <dependency>
             <groupId>org.springframework.cloud</groupId>
             <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+        </dependency>
+        <!-- OpenFeign 声明式服务调用：替代 RestClient 实现服务间内部调用（RAG ↔ spring-ai-user） -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-openfeign</artifactId>
+        </dependency>
+        <!-- OpenFeign 熔断降级：Spring Cloud Circuit Breaker（Sentinel 实现）。
+             说明：Netflix Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；
+             Sentinel 的 SentinelCircuitBreaker 实现 spring-cloud-circuitbreaker 抽象，
+             feign.circuitbreaker.enabled=true + fallbackFactory 即熔断降级方案。
+             SentinelFeignClientAutoConfiguration 在引入本依赖后自动生效（spring.cloud.circuitbreaker.sentinel.enabled 默认 true），
+             声明式规则配置见各服务 application.yaml 的 feign.sentinel.rules（default 键=所有 Feign 客户端默认规则）。 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-circuitbreaker-sentinel</artifactId>
+        </dependency>
+        <!-- Sentinel transport：向 Sentinel Dashboard（可选）上报指标，默认端口 8719；未启动 Dashboard 时仅告警不影响运行 -->
+        <dependency>
+            <groupId>com.alibaba.csp</groupId>
+            <artifactId>sentinel-transport-simple-http</artifactId>
         </dependency>
 
         <dependency>

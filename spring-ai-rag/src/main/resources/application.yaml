@@ -1,6 +1,6 @@
 spring:
   application:
-    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-rag 路由、用户服务 rag.internal-url 保持一致
+    # 服务名 = Nacos 注册名，与网关 lb://spring-ai-rag 路由、用户服务 RagSyncFeignClient 服务名一致
     name: spring-ai-rag
   config:
     # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
@@ -20,6 +20,15 @@ spring:
         # 配置中心文件扩展名
         file-extension: yaml
         group: DEFAULT_GROUP
+    sentinel:
+      # 服务启动即注册到 transport（便于 Dashboard 展示）；默认懒注册
+      eager: true
+      transport:
+        # Sentinel Dashboard 地址（可选：未启动 Dashboard 时仅告警，不影响熔断降级功能）。
+        # Docker 方式：docker compose -f docker/docker-compose.yml up -d sentinel-dashboard（bladex/sentinel-dashboard:1.8.9，端口 8858）
+        dashboard: localhost:8858
+        # transport 指标上报端口（本服务，默认 8719，与 Dashboard 保持唯一）
+        port: 8719
   servlet:
     multipart:
       max-file-size: 50MB
@@ -181,12 +190,46 @@ rag:
 gateway:
   internal-token: rag-gw-trust-2026
 
-# ==================== 用户服务协作配置 ====================
-# 用户域由独立服务 spring-ai-user 承担：ADMIN 判定与用户摘要经内部接口远程查询。
-# lb:// 前缀经 Spring Cloud LoadBalancer 从 Nacos 注册中心解析服务实例（无需硬编码地址）
-user-service:
-  internal-url: lb://spring-ai-user
+# ==================== OpenFeign 服务调用配置 ====================
+# 跨服务调用 spring-ai-user 的用户摘要/管理员判定，服务名经 Nacos 注册中心解析实例并负载均衡
+feign:
+  # 开启熔断降级：调用失败/超时/熔断打开时走 UserFeignClientFallbackFactory 安全兜底
+  circuitbreaker:
+    enabled: true
+  # Sentinel 熔断规则（Spring Cloud Circuit Breaker Sentinel 实现，声明式配置）。
+  # 资源名默认 = Feign 客户端服务名（spring-ai-user）；精确到方法 = "服务名#方法(参数简单类型)"
+  sentinel:
+    # RefreshScope 刷新 / 配置中心变更时热更新规则
+    enable-refresh-rules: true
+    # 默认规则键名：rules 中该键的规则应用到所有 Feign 客户端
+    default-rule: default
+    rules:
+      # 所有 Feign 客户端的默认熔断规则
+      default:
+        - grade: 0            # 熔断维度：0=异常比例 1=慢调用比例 2=异常数
+          count: 0.5          # 触发阈值：异常比例 50%
+          timeWindow: 10      # 熔断打开后的恢复窗口（秒）
+          minRequestAmount: 5 # 触发熔断所需的最小请求数（避免小流量误熔断）
+      # 精确到用户服务 isAdmin 方法（管理员判定影响知识库授权，阈值保守一点）
+      "spring-ai-user#isAdmin(Long)":
+        - grade: 0
+          count: 0.3          # 30% 异常比例即熔断
+          timeWindow: 10
+          minRequestAmount: 3
+      # 精确到用户服务 batch 方法（用户摘要批量查询，异常数熔断）
+      "spring-ai-user#batch(Map)":
+        - grade: 2            # 异常数熔断
+          count: 5            # 10 秒内累计 5 次异常
+          timeWindow: 10
+          minRequestAmount: 2
+  client:
+    config:
+      default:
+        # 建立连接超时（毫秒）
+        connect-timeout: 3000
+        # 读取响应超时（毫秒）
+        read-timeout: 10000
 
 # 服务间内部调用令牌：本服务 /internal/kb/** 校验用户服务传来的 X-Internal-Token；
-# 本服务调用用户服务 /internal/users/** 时也携带此令牌，两端必须一致
+# 本服务调用用户服务 /internal/users/** 时也携带此令牌（FeignConfig 拦截器注入），两端必须一致
 internal-token: rag-internal-2026
