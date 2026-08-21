@@ -51,7 +51,7 @@
 
 ```mermaid
 graph TB
-    subgraph Frontend["前端 Vue SPA（spring-ai-web/，如 :9000）"]
+    subgraph Frontend["前端 Vue SPA（spring-ai-web/，如 :9004）"]
         LOGIN["/login<br/>登录 / 注册"]
         INDEX["/（主界面）<br/>问答 / 上传 / 任务进度 / 管理"]
     end
@@ -140,7 +140,7 @@ graph TB
 ```
 spring-ai-rag-demo/
 ├── docker/
-│   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard 编排
+│   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard + 前端 Nginx(frontend-nginx:9004) 编排
 ├── spring-ai-web/                  # 独立 Vue 3 前端工程（Vite + vue-router）：src/ 组件化开发，npm run build 产物 dist/；nginx.conf / README.md
 ├── nacos/
 │   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
@@ -663,11 +663,14 @@ cd ../gateway
 ```bash
 cd spring-ai-web
 npm install          # 安装依赖（首次）
-npm run dev          # 开发模式：Vite 代理 /api → http://localhost:7070，访问 http://localhost:9000
+npm run dev          # 开发模式：Vite 代理 /api → http://localhost:7070，访问 http://localhost:5173（9000 已被 docker minio 占用）
 npm run build        # 生产构建，产物在 dist/
 ```
 
-- 生产部署：按 `spring-ai-web/nginx.conf` 托管 `dist/`（静态资源 + `/api` 反代网关 7070），访问 http://localhost:9000
+> **Windows 环境提示**：若终端报 `vite: command not found`，多为 `NODE_ENV=production` 导致 npm 跳过 devDependencies——本项目 `.npmrc` 已写 `include=dev` 兜底（详见 `spring-ai-web/README.md`）；Node 若未进 PATH，可先 `set PATH=<node目录>;%PATH%`。
+
+- 生产部署（Docker Compose，推荐）：`npm run build` 生成 `dist/` 后，`docker compose -f docker/docker-compose.yml up -d frontend-nginx`，访问 http://localhost:9004（9000~9003 已被 minio 占用，前端端口取 9004；`/api` 经容器内反代宿主机网关 7070）
+- 生产部署（宿主机 Nginx）：按 `spring-ai-web/nginx.conf` 手动调整 `listen`/`root`/`proxy_pass` 后托管 `dist/`
 - API（统一经网关）：http://localhost:7070/api/**
 
 ---

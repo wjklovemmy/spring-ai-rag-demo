@@ -35,7 +35,7 @@ spring-ai-web/
 ## 调用关系
 
 ```
-浏览器 ──> spring-ai-web 静态服务（dist/，如 :9000）
+浏览器 ──> spring-ai-web 静态服务（dist/，如 :9004）
               │  /api/** 同源代理（nginx.conf 或 vite.config.js 代理）
               ▼
           网关 :7070（JWT 校验 / 按路径分流）
@@ -51,13 +51,21 @@ export const API_BASE = ''   // 默认：同源代理，/api/** 由 Nginx / Vite
 
 ## 环境要求
 
-- Node.js ≥ 18（Vite 5 要求）
+- Node.js ≥ 18（Vite 5 要求，建议 20+）
+- 本机项目级 `.npmrc` 已配置 `include=dev`（见下）
+
+### Windows 环境注意事项
+
+1. **Node 不在 PATH**：若使用 IDE 内置下载的 Node（如 IntelliJ IDEA 下载到 `C:\Users\<user>\AppData\Roaming\JetBrains\IntelliJIdea<版本>\node\versions\<版本>\`），cmd/PowerShell 中需手动将对应目录加入 PATH，或在 IDEA Settings → Languages & Frameworks → Node.js 中将其设为默认解释器。
+2. **`NODE_ENV=production` 跳过 devDependencies**：若终端环境（常见于 IDE 运行配置注入）存在 `NODE_ENV=production`，npm 默认不会安装 devDependencies（vite 等缺失，`npm run dev/build` 报 `vite: command not found`）。本项目已在 `spring-ai-web/.npmrc` 写入 `include=dev` 强制安装，无需手动加 `--include=dev`。
+3. **端口占用**：docker compose 中 milvus 的 minio 占用 `9000`、doc-minio 占用 `9002/9003`，故前端 dev 端口取 `5173`、生产 Nginx 取 `9004`，均刻意避开。
+4. **npm 11 `allow-scripts` 安全机制**：首次安装时可能阻止 esbuild 等包的 postinstall 脚本，若 `npm run dev/build` 报 esbuild 相关错误，执行 `npm approve-scripts --allow-scripts-pending` 后重装。
 
 ## 开发调试
 
 ```bash
 npm install
-npm run dev        # http://localhost:9000，/api/** 已代理到网关 7070
+npm run dev        # http://localhost:5173，/api/** 已代理到网关 7070（9000 已被 docker minio 占用）
 ```
 
 ## 生产构建
@@ -68,21 +76,41 @@ npm run build      # 产物输出到 dist/
 
 ## 部署
 
-### 方式一：Nginx（推荐，同源无跨域）
+### 方式一：Docker Compose（推荐，同源无跨域）
+
+前端 Nginx 已编排进根目录 `docker/docker-compose.yml`（服务名 `frontend-nginx`，端口 **9004**，`/api` 反代宿主机网关 7070）：
+
+1. 先构建前端：
+
+```bash
+npm install && npm run build      # 生成 dist/
+```
+
+2. 启动容器：
+
+```bash
+docker compose -f docker/docker-compose.yml up -d frontend-nginx
+```
+
+3. 访问 `http://localhost:9004`（hash 路由 `#/login` 自动进入登录页）。
+
+> 说明：9000~9003 已被 milvus/doc minio 占用，故前端端口取 9004；容器通过 `host.docker.internal` 访问宿主机网关。
+
+### 方式二：宿主机 Nginx（手动部署）
 
 1. `npm run build` 生成 `dist/`。
-2. 修改 `nginx.conf`：`root` 指向 `dist/` 实际路径；如网关不在本机 7070，调整 `proxy_pass`。
+2. 修改 `nginx.conf` 三处：`listen`（避开 9000~9003）、`root` 指向 `dist/` 实际路径、`proxy_pass` 改为 `localhost:7070`。
 3. 启动：
 
 ```bash
 nginx -c /path/to/spring-ai-web/nginx.conf
 ```
 
-4. 访问 `http://localhost:9000`（hash 路由 `#/login` 自动进入登录页）。
+4. 访问 `http://localhost:<listen端口>`（hash 路由 `#/login` 自动进入登录页）。
 
-### 方式二：任意静态服务器（需直连网关）
+### 方式三：任意静态服务器（需直连网关）
 
-静态服务器（如 `python -m http.server 9000`、`npx serve dist`）只托管页面，**不会代理 `/api`**。此时把 `src/api/request.js` 中的 `API_BASE` 改为网关绝对地址后重新构建：
+静态服务器（如 `python -m http.server 8081`、`npx serve dist`）只托管页面，**不会代理 `/api`**。此时把 `src/api/request.js` 中的 `API_BASE` 改为网关绝对地址后重新构建：
 
 ```js
 export const API_BASE = 'http://localhost:7070'   // 网关 CORS 已放行所有来源，可直接跨域调用

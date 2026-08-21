@@ -54,7 +54,7 @@ These are normally served from the Nacos config center `common.yaml` (higher pre
 ### Service Topology
 
 ```
-Browser (Vue SPA served by standalone spring-ai-web/ :9000, same-origin /api → gateway)
+Browser (Vue SPA served by spring-ai-web/ nginx :9004, same-origin /api → gateway)
         │
         ▼
 gateway :7070 (JwtAuthGlobalFilter: whitelist register/login/logout/refresh,
@@ -168,7 +168,7 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 Frontend-backend separation: the frontend was extracted from the RAG service's `/static` into a standalone **Vue 3 + Vite** project `spring-ai-web/` (deployed independently, see `spring-ai-web/README.md` and `spring-ai-web/nginx.conf`). All API calls go to the gateway on **7070** via the `API_BASE` constant in `src/api/request.js` (`''` for same-origin Nginx proxy, or `http://localhost:7070` for direct calls with gateway CORS). Vite dev server proxies `/api` → `http://localhost:7070` (`vite.config.js`).
 
-- `npm run dev` — Vite dev server (http://localhost:9000, proxy `/api` → 7070); `npm run build` — production build to `dist/` (deployed by Nginx with `/api` reverse proxy to 7070)
+- `npm run dev` — Vite dev server (http://localhost:5173, proxy `/api` → 7070; 9000 is taken by docker minio); `npm run build` — production build to `dist/`; production hosting: `docker-compose.yml` service `frontend-nginx` (nginx:1.27-alpine, http://localhost:9004, `/api` reverse-proxied to host gateway 7070 via `host.docker.internal`) or manual Nginx per `nginx.conf`
 - `src/views/LoginView.vue` — Login/register page with animated background, calls `POST /api/login`
 - `src/views/DashboardView.vue` — Main layout with sidebar navigation (Home, Knowledge Q&A, Upload Document, 系统管理 tabs, lazy-loaded tab components), checks auth via `GET /api/user`
 - Tab components — `ChatTab.vue` (`POST /api/knowledge-document/chat`), `UploadTab.vue` (`POST /api/knowledge-document/upload` + task polling), `DocsTab.vue`, `TasksTab.vue`, `KbTab.vue`, `UsersTab.vue`, `RolesTab.vue`, with modals `TaskDetailModal.vue` / `MemberModal.vue` / `RoleAssignModal.vue`
