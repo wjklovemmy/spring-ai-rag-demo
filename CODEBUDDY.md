@@ -121,6 +121,7 @@ spring-ai-user  (com.example.user — 用户域独立服务 :8082)
 2. Retrieved document texts are joined as context
 3. Context is injected into a Chinese system prompt instructing the LLM to answer strictly from the knowledge base
 4. `ChatClient` (backed by DeepSeek `deepseek-chat`) generates the final answer with source citations
+5. The DeepSeek call is wrapped by a `CircuitBreakerFactory` (Sentinel, resource `ai-chat`, degrade rule registered programmatically in `AiConfig`): on exception/timeout/circuit-open it degrades to `AI服务暂时不可用，请稍后再试` with empty `sources` (HTTP 200) instead of failing with 500
 
 ### Model Separation
 

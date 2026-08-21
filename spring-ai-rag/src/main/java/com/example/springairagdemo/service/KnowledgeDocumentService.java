@@ -1,5 +1,6 @@
 package com.example.springairagdemo.service;
 
+import com.example.springairagdemo.config.AiConfig;
 import com.example.springairagdemo.config.RagConfigProperties;
 import com.example.springairagdemo.entity.DocumentStatus;
 import com.example.springairagdemo.entity.KnowledgeChunkEntity;
@@ -12,6 +13,7 @@ import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.cloud.client.circuitbreaker.CircuitBreakerFactory;
 import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DuplicateKeyException;
 
@@ -64,6 +66,9 @@ public abstract class KnowledgeDocumentService {
     /** 同名文档并发上传版本号冲突时的最大重试次数 */
     private static final int MAX_VERSION_RETRY = 5;
 
+    /** AI 服务（DeepSeek）不可用时的降级提示 */
+    private static final String AI_SERVICE_UNAVAILABLE = "AI服务暂时不可用，请稍后再试";
+
     @Autowired
     protected KnowledgeBaseService knowledgeBaseService;
 
@@ -78,6 +83,10 @@ public abstract class KnowledgeDocumentService {
 
     @Autowired
     protected ChatClient chatClient;
+
+    /** Sentinel 熔断降级器工厂（spring-cloud-circuitbreaker-sentinel 实现） */
+    @Autowired
+    protected CircuitBreakerFactory<?, ?> circuitBreakerFactory;
 
     @Autowired
     protected RagConfigProperties ragConfig;
@@ -894,7 +903,7 @@ public abstract class KnowledgeDocumentService {
         }
 
         if (searchResults.isEmpty()) {
-            String answer = chatClient.prompt().user(question).call().content();
+            String answer = callLlm(null, question);
             return new ChatResult(answer, List.of());
         }
 
@@ -1001,7 +1010,7 @@ public abstract class KnowledgeDocumentService {
 
         String context = contextBuilder.toString();
         if (context.isEmpty()) {
-            String answer = chatClient.prompt().user(question).call().content();
+            String answer = callLlm(null, question);
             return new ChatResult(answer, List.of());
         }
 
@@ -1015,11 +1024,13 @@ public abstract class KnowledgeDocumentService {
                 + "知识库内容：%n"
                 + "%s", context);
 
-        String answer = chatClient.prompt()
-                .system(systemPrompt)
-                .user(question)
-                .call()
-                .content();
+        String answer = callLlm(systemPrompt, question);
+
+        // AI 服务不可用（DeepSeek 调用异常/熔断）时降级：不展示引用来源
+        if (AI_SERVICE_UNAVAILABLE.equals(answer)) {
+            log.warn("AI 服务不可用，知识问答降级处理：knowledgeBaseId={}, question={}", knowledgeBaseId, question);
+            return new ChatResult(answer, List.of());
+        }
 
         // 兜底清理：LLM 偶尔仍会输出 Markdown 加粗/行内代码符号，统一移除，保持纯文本展示
         if (answer != null) {
@@ -1067,6 +1078,33 @@ public abstract class KnowledgeDocumentService {
         }
 
         return new ChatResult(answer, citedSources);
+    }
+
+    /**
+     * 调用 LLM（DeepSeek）生成回答，带 Sentinel 熔断降级：
+     * 调用异常/超时/熔断（资源 {@code ai-chat}）时返回降级提示，而不是向上抛错导致接口 500。
+     *
+     * @param systemPrompt 系统提示（无检索上下文时传 null）
+     * @param question     用户问题
+     * @return LLM 回答；AI 服务不可用时返回 {@link #AI_SERVICE_UNAVAILABLE}
+     */
+    private String callLlm(String systemPrompt, String question) {
+        return circuitBreakerFactory.create(AiConfig.AI_CHAT_RESOURCE).run(
+                () -> {
+                    ChatClient.ChatClientRequestSpec spec = chatClient.prompt().user(question);
+                    if (systemPrompt != null && !systemPrompt.isBlank()) {
+                        spec = spec.system(systemPrompt);
+                    }
+                    String content = spec.call().content();
+                    if (content == null || content.isBlank()) {
+                        throw new IllegalStateException("AI 返回空内容");
+                    }
+                    return content;
+                },
+                t -> {
+                    log.error("AI 服务（DeepSeek）调用失败，问答降级处理：{}", t.getMessage(), t);
+                    return AI_SERVICE_UNAVAILABLE;
+                });
     }
 
     // ===================== 辅助方法 =====================

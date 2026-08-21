@@ -38,7 +38,7 @@
 | 对象存储 | MinIO 8.6.0 | 原始文档文件存储（同时支持本地磁盘模式）；8.6.0 修复 CVE-2025-59952 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三个服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥配置上收 Nacos 配置中心 `common.yaml` |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
-| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`），支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
+| 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（`feign.circuitbreaker.enabled=true` + `spring-cloud-circuitbreaker-sentinel`）；Hystrix 已 EOL（2021 停止维护），Spring Cloud 2020+ 移除其集成；熔断规则声明式配置（`feign.sentinel.rules`）；AI 问答（DeepSeek 生成）调用经 `CircuitBreakerFactory` 熔断保护（资源 `ai-chat`），不可用时降级返回「AI服务暂时不可用，请稍后再试」；支持 Sentinel Dashboard 可视化（`sentinel-transport-simple-http`，可选，Docker 启动 `docker compose up -d sentinel-dashboard`，控制台 `http://localhost:8858`，账号 `sentinel/sentinel`） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
@@ -359,6 +359,7 @@ spring-ai-rag-demo/
   ├─ ⑤ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
   │
   ├─ ⑥ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  │       · 熔断降级：调用异常/超时或 Sentinel 熔断（资源 ai-chat）→ 返回「AI服务暂时不可用，请稍后再试」
   │
   └─ ⑦ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
 ```
@@ -367,6 +368,7 @@ spring-ai-rag-demo/
 
 **返回结构**：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
 前端可将 `sources` 渲染为可下载/可跳转的引用来源。
+AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）。
 
 ### 3. 文档删除
 
