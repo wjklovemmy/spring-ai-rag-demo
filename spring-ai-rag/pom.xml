@@ -53,11 +53,26 @@
             <artifactId>spring-ai-pdf-document-reader</artifactId>
         </dependency>
 
-        <!-- 对象存储（文档附件存储） -->
+        <!-- 对象存储（文档附件存储）；8.5.12 存在 CVE-2025-59952（XML 值替换），官方修复版为 8.6.0（8.x 分支，API 兼容）；
+             9.x 为重大重构版（API 与 S3 规范同步，partSize 等签名有破坏性变更），暂不采用 -->
         <dependency>
             <groupId>io.minio</groupId>
             <artifactId>minio</artifactId>
-            <version>8.5.12</version>
+            <version>8.6.0</version>
+            <exclusions>
+                <!-- okhttp 5.x 为 Kotlin Multiplatform 库，根 artifact（com.squareup.okhttp3:okhttp）只是空元数据 jar，
+                     不含 JVM 类，会导致 javac 报"无法访问 okhttp3.HttpUrl"；此处回退到 4.x（单 artifact 经典结构，
+                     与 8.5.12 时代的运行组合一致），避免 KMP 元数据 jar 导致的编译/运行时类缺失 -->
+                <exclusion>
+                    <groupId>com.squareup.okhttp3</groupId>
+                    <artifactId>okhttp</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
         </dependency>
 
         <!-- 阿里云 OCR（扫描版 PDF 文字识别） -->
