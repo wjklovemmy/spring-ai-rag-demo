@@ -140,8 +140,7 @@ graph TB
 ```
 spring-ai-rag-demo/
 ├── docker/
-│   ├── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard 编排
-│   └── mysql/init/mysql-schema.sql # Nacos 3.1.1 官方建表脚本（宿主机 MySQL 初始化 nacos_config 库用）
+│   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard 编排
 ├── nacos/
 │   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
 │   └── README.md                   # Nacos 接入说明（启动/初始化/导入/验证）
@@ -248,7 +247,8 @@ spring-ai-rag-demo/
 │           └── LoggingGlobalFilter.java # 全局访问日志过滤器
 └── sql/
     ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
-    └── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
+    ├── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
+    └── mysql-nacos.sql                       # Nacos 3.1.1 官方建表脚本（宿主机 MySQL 初始化 nacos_config 库用）
 ```
 
 ---
@@ -441,7 +441,7 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
 - `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
-- `docker/mysql/init/mysql-schema.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
+- `sql/mysql-nacos.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
 用户服务启动时 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色、权限种子与默认账号（幂等）。
 `kb_member` / `kb_access_log` 中的 `user_id` 为**跨库逻辑引用**（无外键约束），删除用户前由用户服务经 `RagSyncClient` 远程回调 RAG 服务 `POST /internal/kb/deletion-check`（校验）与 `/internal/kb/user-cleanup`（清理 kb_member）完成联动。
@@ -557,8 +557,8 @@ docker-compose up -d
 ```sql
 -- 1. 建库（账号密码与 compose 中 MYSQL_SERVICE_* 一致：nacos/nacos）
 CREATE DATABASE IF NOT EXISTS nacos_config DEFAULT CHARACTER SET utf8mb4;
--- 2. 导入 Nacos 3.1.1 官方 schema（docker/mysql/init/mysql-schema.sql）
---    mysql -uroot -p nacos_config < docker/mysql/init/mysql-schema.sql
+-- 2. 导入 Nacos 3.1.1 官方 schema（sql/mysql-nacos.sql）
+--    mysql -uroot -p nacos_config < sql/mysql-nacos.sql
 --    或通过任意 MySQL 客户端执行该 SQL 文件
 ```
 
