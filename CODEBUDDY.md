@@ -54,7 +54,7 @@ These are normally served from the Nacos config center `common.yaml` (higher pre
 ### Service Topology
 
 ```
-Browser (pages served by RAG :8080, API_BASE = http://localhost:7070)
+Browser (Vue SPA served by standalone spring-ai-web/ :9000, same-origin /api → gateway)
         │
         ▼
 gateway :7070 (JwtAuthGlobalFilter: whitelist register/login/logout/refresh,
@@ -164,12 +164,15 @@ The application uses two distinct AI models with explicit qualification to avoid
 
 **Internal endpoints** (NOT via gateway, `X-Internal-Token` required): user service `/internal/users/{id}/is-admin`, `/internal/users/batch`; RAG `/internal/kb/deletion-check`, `/internal/kb/user-cleanup`, `/internal/kb/audit`.
 
-### Static Frontend
+### Frontend (spring-ai-web/ — Vue 3 SPA)
 
-Two pure HTML pages served from `/static` on port **8080** (all their API calls go to the gateway on **7070** via the `API_BASE` constant):
+Frontend-backend separation: the frontend was extracted from the RAG service's `/static` into a standalone **Vue 3 + Vite** project `spring-ai-web/` (deployed independently, see `spring-ai-web/README.md` and `spring-ai-web/nginx.conf`). All API calls go to the gateway on **7070** via the `API_BASE` constant in `src/api/request.js` (`''` for same-origin Nginx proxy, or `http://localhost:7070` for direct calls with gateway CORS). Vite dev server proxies `/api` → `http://localhost:7070` (`vite.config.js`).
 
-- `login.html` — Login form with animated background, calls `POST /api/login`
-- `index.html` — Dashboard with sidebar navigation (Home, Knowledge Q&A, Upload Document, 系统管理 tabs), checks auth via `GET /api/user`, calls `POST /api/knowledge-document/chat` and `POST /api/knowledge-document/upload`
+- `npm run dev` — Vite dev server (http://localhost:9000, proxy `/api` → 7070); `npm run build` — production build to `dist/` (deployed by Nginx with `/api` reverse proxy to 7070)
+- `src/views/LoginView.vue` — Login/register page with animated background, calls `POST /api/login`
+- `src/views/DashboardView.vue` — Main layout with sidebar navigation (Home, Knowledge Q&A, Upload Document, 系统管理 tabs, lazy-loaded tab components), checks auth via `GET /api/user`
+- Tab components — `ChatTab.vue` (`POST /api/knowledge-document/chat`), `UploadTab.vue` (`POST /api/knowledge-document/upload` + task polling), `DocsTab.vue`, `TasksTab.vue`, `KbTab.vue`, `UsersTab.vue`, `RolesTab.vue`, with modals `TaskDetailModal.vue` / `MemberModal.vue` / `RoleAssignModal.vue`
+- `src/api/request.js` — Token management, 401 auto-refresh with shared-Promise dedup, download helper; `src/utils/` — `toast.js` / `format.js`
 
 ### Databases (two schemas, one MySQL instance, per-service data sources)
 

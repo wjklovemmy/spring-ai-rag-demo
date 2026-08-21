@@ -43,7 +43,7 @@
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（7070）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
-| 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 7070） |
+| 前端 | Vue 3（Vite 5）+ vue-router | 独立工程 `spring-ai-web/`：Vite + Vue 3 SPA（组件化开发），`npm run build` 产物 `dist/`，前后端分离单独部署（Nginx 托管 `dist/` + `/api` 反代网关 7070，或直连网关走 CORS） |
 
 ---
 
@@ -51,9 +51,9 @@
 
 ```mermaid
 graph TB
-    subgraph Frontend["前端（静态页面）"]
-        LOGIN["login.html<br/>登录 / 注册"]
-        INDEX["index.html<br/>问答 / 上传 / 任务进度"]
+    subgraph Frontend["前端 Vue SPA（spring-ai-web/，如 :9000）"]
+        LOGIN["/login<br/>登录 / 注册"]
+        INDEX["/（主界面）<br/>问答 / 上传 / 任务进度 / 管理"]
     end
 
     subgraph Gateway["网关 Spring Cloud Gateway :7070"]
@@ -141,6 +141,7 @@ graph TB
 spring-ai-rag-demo/
 ├── docker/
 │   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard 编排
+├── spring-ai-web/                  # 独立 Vue 3 前端工程（Vite + vue-router）：src/ 组件化开发，npm run build 产物 dist/；nginx.conf / README.md
 ├── nacos/
 │   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
 │   └── README.md                   # Nacos 接入说明（启动/初始化/导入/验证）
@@ -364,7 +365,7 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 注册/登录由**独立服务 `spring-ai-user`**（8082，经 Nacos 注册）签发 JWT（`UserService`：BCrypt 校验密码、签发 Access Token、刷新/登出维护 Redis 黑名单），此后所有 `/api/**` 请求统一经网关 7070 进入：
 
 ```
-访问  /api/**            请求头携带 Authorization: Bearer <token>（页面从 8080 加载，接口走 7070）
+访问  /api/**            请求头携带 Authorization: Bearer <token>（页面由 spring-ai-web 前端加载，接口统一走 7070）
                             ↓
               网关 JwtAuthGlobalFilter（7070，GlobalFilter order=-200）
               · 白名单放行：/api/register、/api/login、/api/logout、/api/refresh
@@ -423,7 +424,7 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 - **分配功能角色**：在用户列表中对指定用户勾选角色（`sys_user_role` 覆盖式重写），并保护"最后一个 ADMIN"不会被降权/禁用/删除；
 - **数据权限**：知识库列表每行「成员」按钮 → 搜索用户 + 选择 `VIEWER/EDITOR/OWNER` 授权，可移除成员（最后一个 OWNER 保护）。
 
-前端 `index.html` 通过 `fetchApi()` 统一在请求头注入 Token，登出时清除 `localStorage`；`/api/user` 返回 `isAdmin`，据此控制「系统管理」菜单显隐。
+前端（`spring-ai-web/` Vue 工程）通过 `src/api/request.js` 的 `fetchApi()` 统一在请求头注入 Token，登出时清除 `localStorage`；`/api/user` 返回 `isAdmin`，据此控制「系统管理」菜单显隐。
 
 ---
 
@@ -655,10 +656,19 @@ cd ../gateway
 > 三个服务的 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；这些密钥默认从 Nacos 配置中心 `common.yaml` 拉取（Nacos 可用时优先生效），本地 `application.yaml` 保留兜底值。
 > 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 7070。
 
-### 4. 访问页面
+### 4. 启动前端（前后端分离）并访问
 
-- 页面（由 RAG 服务提供）：http://localhost:8080/login.html、http://localhost:8080/index.html
-- API（统一经网关）：http://localhost:7070/api/** —— 前端已内置 `API_BASE = 'http://localhost:7070'`，页面加载后所有接口请求自动经网关转发
+前端为独立 Vue 3 工程 `spring-ai-web/`（Vite 构建，详见 `spring-ai-web/README.md`）：
+
+```bash
+cd spring-ai-web
+npm install          # 安装依赖（首次）
+npm run dev          # 开发模式：Vite 代理 /api → http://localhost:7070，访问 http://localhost:9000
+npm run build        # 生产构建，产物在 dist/
+```
+
+- 生产部署：按 `spring-ai-web/nginx.conf` 托管 `dist/`（静态资源 + `/api` 反代网关 7070），访问 http://localhost:9000
+- API（统一经网关）：http://localhost:7070/api/**
 
 ---
 
@@ -717,6 +727,6 @@ cd ../gateway
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
 15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
-16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 7070，CORS 由网关 `globalcors` 统一放行。
+16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。前端已前后端分离（独立 Vue 3 工程 `spring-ai-web/`，Vite 构建，经 Nginx 同源代理 `/api` 或直连网关走 CORS），接口统一走 7070。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
