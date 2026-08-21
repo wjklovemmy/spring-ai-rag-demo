@@ -5,19 +5,6 @@ spring:
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
-  data:
-    redis:
-      host: localhost
-      port: 6379
-      # 如 Redis 设置过密码请在此配置，未设置则留空
-      password:
-      database: 0
-      timeout: 3s
-      lettuce:
-        pool:
-          max-active: 8
-          max-idle: 8
-          min-idle: 0
   ai:
     deepseek:
       base-url: https://api.deepseek.com
@@ -45,17 +32,11 @@ spring:
           port: 19530
   datasource:
     # 主数据源：RAG 业务库（由 DataSourceConfig 绑定到 HikariCP）
+    # 用户域独立库 spring_ai_user 由独立服务 spring-ai-user（8082）连接，本服务不再持有
     url: jdbc:mysql://localhost:3306/knowledge_base?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
     username: root
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
-    # 用户域独立数据源（spring-ai-user 共享 jar 使用，由 UserDataSourceConfig 绑定）
-    # 建库脚本见 sql/user.sql，5 张表：sys_user / sys_role / sys_permission / sys_user_role / sys_role_permission
-    user:
-      url: jdbc:mysql://localhost:3306/spring_ai_user?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
-      username: root
-      password: root
-      driver-class-name: com.mysql.cj.jdbc.Driver
     # 连接池参数（自定义，由 DataSourceConfig 绑定到 HikariCP）
   task:
     # Embedding 异步任务线程池参数（自定义，由 AsyncTaskConfig 绑定）
@@ -175,19 +156,17 @@ rag:
         min-segment-chars: 20
         fallback-on-error: true
 
-# ==================== JWT 配置 ====================
-# JWT 校验已上移到 Gateway；本服务仍负责签发（登录/注册/刷新），故保留 secret
-jwt:
-  # 密钥（至少 256 位 / 32 字节），生产环境请使用强随机字符串并保密
-  # 必须与 gateway 模块的 jwt.secret 完全一致，否则网关无法校验签名
-  secret: R4gD3m0-K3y-32ch4rs-L0ng-S3cur3!!
-  # 访问令牌（Access Token）过期时间（毫秒），默认 30 分钟
-  expiration-ms: 1800000
-  # 刷新令牌（Refresh Token）过期时间（毫秒），默认 7 天
-  refresh-expiration-ms: 604800000
-
 # ==================== 网关信任配置 ====================
 # 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，
 # 确认请求经由本服务网关转发（防绕过网关直连伪造身份），必须与 gateway 模块一致
 gateway:
   internal-token: rag-gw-trust-2026
+
+# ==================== 用户服务协作配置 ====================
+# 用户域由独立服务 spring-ai-user（8082）承担：ADMIN 判定与用户摘要经内部接口远程查询
+user-service:
+  internal-url: http://localhost:8082
+
+# 服务间内部调用令牌：本服务 /internal/kb/** 校验用户服务传来的 X-Internal-Token；
+# 本服务调用用户服务 /internal/users/** 时也携带此令牌，两端必须一致
+internal-token: rag-internal-2026

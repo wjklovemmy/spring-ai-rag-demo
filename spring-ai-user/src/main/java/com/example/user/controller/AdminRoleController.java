@@ -10,8 +10,8 @@ import com.example.user.service.SysPermissionService;
 import com.example.user.service.SysRolePermissionService;
 import com.example.user.service.SysRoleService;
 import com.example.user.service.SysUserRoleService;
+import com.example.user.config.RagSyncClient;
 import com.example.user.service.UserService;
-import com.example.user.spi.UserAdminAuditHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -44,7 +44,7 @@ public class AdminRoleController {
     private final SysUserRoleService sysUserRoleService;
     private final SysPermissionService sysPermissionService;
     private final SysRolePermissionService sysRolePermissionService;
-    private final UserAdminAuditHandler auditHandler;
+    private final RagSyncClient ragSyncClient;
 
     /** 角色列表（含每个角色的用户数） */
     @GetMapping
@@ -97,7 +97,7 @@ public class AdminRoleController {
         if (!saved) {
             return ResponseEntity.internalServerError().body(Map.of("success", false, "message", "创建角色失败"));
         }
-        auditHandler.audit("ROLE_CREATE", "创建功能角色 " + code);
+        ragSyncClient.audit("ROLE_CREATE", "创建功能角色 " + code);
         log.info("创建角色: code={}, name={}", code, name);
         return ResponseEntity.ok(Map.of("success", true, "message", "创建成功", "id", entity.getId()));
     }
@@ -121,7 +121,7 @@ public class AdminRoleController {
         }
         role.setUpdateTime(new Date());
         sysRoleService.updateById(role);
-        auditHandler.audit("ROLE_UPDATE", "更新角色 " + role.getCode());
+        ragSyncClient.audit("ROLE_UPDATE", "更新角色 " + role.getCode());
         return ResponseEntity.ok(Map.of("success", true, "message", "更新成功"));
     }
 
@@ -139,7 +139,7 @@ public class AdminRoleController {
         sysUserRoleService.lambdaUpdate().eq(SysUserRoleEntity::getRoleId, id).remove();
         sysRolePermissionService.lambdaUpdate().eq(SysRolePermissionEntity::getRoleId, id).remove();
         sysRoleService.removeById(id);
-        auditHandler.audit("ROLE_DELETE", "删除功能角色 " + role.getCode());
+        ragSyncClient.audit("ROLE_DELETE", "删除功能角色 " + role.getCode());
         log.info("删除角色: id={}, code={}", id, role.getCode());
         return ResponseEntity.ok(Map.of("success", true, "message", "角色已删除"));
     }
@@ -223,7 +223,7 @@ public class AdminRoleController {
             }).toList();
             sysRolePermissionService.saveBatch(binds);
         }
-        auditHandler.audit("ROLE_GRANT_PERMISSION",
+        ragSyncClient.audit("ROLE_GRANT_PERMISSION",
                 "为角色 " + role.getCode() + " 分配权限 " + permissionIds);
         log.info("角色权限分配: roleId={}, permissionIds={}", id, permissionIds);
         return ResponseEntity.ok(Map.of("success", true, "message", "权限分配成功"));

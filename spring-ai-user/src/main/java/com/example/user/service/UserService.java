@@ -7,10 +7,10 @@ import com.example.user.entity.SysPermissionEntity;
 import com.example.user.entity.SysRoleEntity;
 import com.example.user.entity.SysRolePermissionEntity;
 import com.example.user.entity.SysUserRoleEntity;
+import com.example.user.config.RagSyncClient;
 import com.example.user.entity.UserEntity;
 import com.example.user.mapper.UserMapper;
 import com.example.user.security.UserContext;
-import com.example.user.spi.UserDeletionGuard;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -19,9 +19,9 @@ import java.util.Date;
 import java.util.List;
 
 /**
- * 用户服务（用户域）：
+ * 用户服务（用户域，独立服务）：
  * 注册、登录、双 Token 签发与刷新续期；全局角色（ADMIN）判定；
- * 用户删除时通过 {@link UserDeletionGuard} 扩展点联动业务模块（RAG）清理跨域数据。
+ * 用户删除时经 {@link RagSyncClient} 远程联动 RAG 服务（删除前校验 / 删除后清理知识库授权）。
  */
 @Slf4j
 @Service
@@ -37,7 +37,7 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
     private final SysUserRoleService sysUserRoleService;
     private final SysPermissionService sysPermissionService;
     private final SysRolePermissionService sysRolePermissionService;
-    private final List<UserDeletionGuard> deletionGuards;
+    private final RagSyncClient ragSyncClient;
 
     public UserService(PasswordEncoder passwordEncoder, JwtUtil jwtUtil,
                        RedisRefreshTokenService refreshTokenService,
@@ -45,7 +45,7 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
                        SysUserRoleService sysUserRoleService,
                        SysPermissionService sysPermissionService,
                        SysRolePermissionService sysRolePermissionService,
-                       List<UserDeletionGuard> deletionGuards) {
+                       RagSyncClient ragSyncClient) {
         this.passwordEncoder = passwordEncoder;
         this.jwtUtil = jwtUtil;
         this.refreshTokenService = refreshTokenService;
@@ -53,7 +53,7 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
         this.sysUserRoleService = sysUserRoleService;
         this.sysPermissionService = sysPermissionService;
         this.sysRolePermissionService = sysRolePermissionService;
-        this.deletionGuards = deletionGuards;
+        this.ragSyncClient = ragSyncClient;
     }
 
     /**
@@ -229,24 +229,20 @@ public class UserService extends ServiceImpl<UserMapper, UserEntity> {
     }
 
     /**
-     * 删除用户（联动业务模块清理）：
+     * 删除用户（远程联动 RAG 服务清理知识库授权）：
      * <ol>
-     *   <li>依次调用各 {@link UserDeletionGuard#validateDeletion} 前置校验（不满足则抛异常阻止删除）</li>
+     *   <li>{@link RagSyncClient#validateDeletion} 远程前置校验（如知识库最后一个 OWNER 不允许删除）</li>
      *   <li>清理功能角色关联（sys_user_role）</li>
      *   <li>删除用户本体</li>
-     *   <li>依次调用各 {@link UserDeletionGuard#onUserDeleted} 清理跨域数据（如知识库成员授权）</li>
+     *   <li>{@link RagSyncClient#onUserDeleted} 远程清理知识库授权（kb_member）</li>
      * </ol>
      */
     public void deleteUser(Long userId) {
-        for (UserDeletionGuard guard : deletionGuards) {
-            guard.validateDeletion(userId);
-        }
+        ragSyncClient.validateDeletion(userId);
         sysUserRoleService.remove(new LambdaQueryWrapper<SysUserRoleEntity>()
                 .eq(SysUserRoleEntity::getUserId, userId));
         removeById(userId);
-        for (UserDeletionGuard guard : deletionGuards) {
-            guard.onUserDeleted(userId);
-        }
+        ragSyncClient.onUserDeleted(userId);
         log.info("用户已删除: userId={}", userId);
     }
 

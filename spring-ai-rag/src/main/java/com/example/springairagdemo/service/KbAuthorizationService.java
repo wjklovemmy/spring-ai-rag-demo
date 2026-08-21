@@ -3,9 +3,8 @@ package com.example.springairagdemo.service;
 import com.example.springairagdemo.entity.KbAccessLogEntity;
 import com.example.springairagdemo.entity.KbMemberEntity;
 import com.example.springairagdemo.security.KbRole;
-import com.example.user.security.ForbiddenException;
-import com.example.user.security.UserContext;
-import com.example.user.service.UserService;
+import com.example.springairagdemo.security.ForbiddenException;
+import com.example.springairagdemo.security.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -18,34 +17,35 @@ import java.util.stream.Collectors;
 /**
  * 知识库授权核心服务（RAG 业务域）：
  * <ul>
- *   <li>垂直权限：全局角色（ADMIN 可管理一切知识库），判定委托用户域 {@link UserService}</li>
+ *   <li>垂直权限：全局角色（ADMIN 可管理一切知识库），判定经 {@link UserClient} 远程委托用户服务</li>
  *   <li>水平/数据权限：kb_member 显式授权（OWNER / EDITOR / VIEWER），唯一权威</li>
  *   <li>安全审计：关键操作与越权拒绝（ACCESS_DENIED）落库</li>
  * </ul>
  * 所有「用户对某知识库是否有权限」的判定都必须经过本服务，禁止在业务代码中自行推断。
+ * 用户域由独立服务 spring-ai-user（8082）承担：ADMIN 判定与用户摘要经 /internal/users/** 远程查询。
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class KbAuthorizationService {
 
-    /** 内置全局管理员角色编码（常量收敛到用户域，此处仅做兼容引用） */
-    public static final String ADMIN_ROLE_CODE = UserService.ADMIN_ROLE_CODE;
+    /** 内置全局管理员角色编码（与用户服务 sys_role.code 的 ADMIN 一致） */
+    public static final String ADMIN_ROLE_CODE = "ADMIN";
 
     private final KbMemberService kbMemberService;
     private final KbAccessLogService kbAccessLogService;
-    private final UserService userService;
+    private final UserClient userClient;
 
     // ==================== 全局角色（垂直权限） ====================
 
-    /** 当前登录用户是否为 ADMIN（委托用户域判定） */
+    /** 当前登录用户是否为 ADMIN（远程委托用户服务判定） */
     public boolean isAdmin() {
-        return userService.isAdmin();
+        return userClient.isAdmin(UserContext.getUserId());
     }
 
-    /** 指定用户是否为 ADMIN（委托用户域判定） */
+    /** 指定用户是否为 ADMIN（远程委托用户服务判定） */
     public boolean isAdmin(Long userId) {
-        return userService.isAdmin(userId);
+        return userClient.isAdmin(userId);
     }
 
     // ==================== 数据权限判定（水平/对象级） ====================
@@ -180,14 +180,25 @@ public class KbAuthorizationService {
 
     // ==================== 审计 ====================
 
+    /** 当前请求上下文的审计（操作者取自 UserContext） */
     public void audit(String action, Long kbId, Long documentId, String detail) {
+        auditAs(action, kbId, documentId, detail,
+                UserContext.getUserId(), UserContext.getUsername(), UserContext.clientIp());
+    }
+
+    /**
+     * 显式操作者的审计：供用户服务经 {@code /internal/kb/audit} 远程上报管理操作
+     * （此时本服务 UserContext 为空，操作者由调用方显式传入）。
+     */
+    public void auditAs(String action, Long kbId, Long documentId, String detail,
+                        Long operatorId, String operatorName, String operatorIp) {
         KbAccessLogEntity logEntity = new KbAccessLogEntity();
-        logEntity.setUserId(UserContext.getUserId());
-        logEntity.setUsername(UserContext.getUsername());
+        logEntity.setUserId(operatorId);
+        logEntity.setUsername(operatorName);
         logEntity.setAction(action);
         logEntity.setKbId(kbId);
         logEntity.setDocumentId(documentId);
-        logEntity.setIp(UserContext.clientIp());
+        logEntity.setIp(operatorIp);
         logEntity.setDetail(detail == null || detail.length() <= 500 ? detail : detail.substring(0, 500));
         logEntity.setCreateTime(new Date());
         try {

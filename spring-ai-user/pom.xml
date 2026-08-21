@@ -10,7 +10,7 @@
     </parent>
     <artifactId>spring-ai-user</artifactId>
     <name>spring-ai-user</name>
-    <description>用户域共享模块（library）：用户 / 角色 / JWT / 登录态与身份上下文，被 spring-ai-rag 依赖</description>
+    <description>用户服务（独立部署，默认 8082）：认证 / 用户 / 角色管理，独立数据库 spring_ai_user；RAG 服务通过网关透传身份与内部接口协作</description>
 
     <!--
       依赖版本统一由父工程/Spring Boot BOM 管理：
@@ -65,13 +65,10 @@
 
     <build>
         <plugins>
-            <!-- library 模块无启动类，不参与 Spring Boot repackage -->
+            <!-- 独立服务：参与 Spring Boot repackage，打包为可执行 jar -->
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
-                <configuration>
-                    <skip>true</skip>
-                </configuration>
             </plugin>
         </plugins>
     </build>

@@ -1,0 +1,99 @@
+package com.example.springairagdemo.security;
+
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.List;
+
+/**
+ * 网关信任过滤器（RAG 本地版，认证已上移到 Gateway，本服务只消费身份）：
+ * <ul>
+ *   <li>校验请求携带网关内部信任令牌 {@code X-Gateway-Token}，确认请求来自网关
+ *       （防止绕过网关直连本服务伪造身份头）；</li>
+ *   <li>从网关注入的 {@code X-User-Id} / {@code X-Username} / {@code X-Permissions} 头
+ *       读取当前用户，注入 {@link UserContext}（ThreadLocal）与 Request 属性，请求结束自动清理；</li>
+ *   <li>仅处理 {@code /api/**} 请求；{@code /internal/**}（服务间内部接口）不经过网关，
+ *       由内部接口自行校验 X-Internal-Token，本过滤器直接放行。</li>
+ * </ul>
+ */
+@Slf4j
+@Component
+public class GatewayIdentityFilter implements Filter {
+
+    public static final String HEADER_USER_ID = "X-User-Id";
+    public static final String HEADER_USERNAME = "X-Username";
+    public static final String HEADER_GATEWAY_TOKEN = "X-Gateway-Token";
+    /** 权限码头：网关从 JWT 中解出后透传（逗号分隔），本服务直接消费，无需再查库 */
+    public static final String HEADER_PERMISSIONS = "X-Permissions";
+
+    @Value("${gateway.internal-token}")
+    private String gatewayToken;
+
+    @Override
+    public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
+            throws IOException, ServletException {
+
+        HttpServletRequest httpRequest = (HttpServletRequest) request;
+        HttpServletResponse httpResponse = (HttpServletResponse) response;
+        String path = httpRequest.getRequestURI();
+
+        // 仅对 /api/ 开头的请求校验（/internal/** 服务间内部接口直接放行，自行校验内部令牌）
+        if (!path.startsWith("/api/")) {
+            chain.doFilter(request, response);
+            return;
+        }
+
+        // 校验网关信任令牌：只有携带正确令牌的请求（即经由网关转发）才被信任，
+        // 否则视为绕过网关直连，拒绝（防伪造 X-User-* 头）
+        String token = httpRequest.getHeader(HEADER_GATEWAY_TOKEN);
+        if (gatewayToken == null || !gatewayToken.equals(token)) {
+            sendUnauthorized(httpResponse, "拒绝访问：仅允许通过网关访问", "GATEWAY_REQUIRED");
+            return;
+        }
+
+        // 从网关注入的身份头读取当前用户
+        String userIdStr = httpRequest.getHeader(HEADER_USER_ID);
+        String username = httpRequest.getHeader(HEADER_USERNAME);
+        if (userIdStr == null || userIdStr.isBlank() || username == null || username.isBlank()) {
+            sendUnauthorized(httpResponse, "认证信息缺失", "TOKEN_INVALID");
+            return;
+        }
+
+        // 权限码由网关从 JWT 中解出透传（逗号分隔），作为鉴权缓存直接消费
+        String permissionsStr = httpRequest.getHeader(HEADER_PERMISSIONS);
+        List<String> permissions = permissionsStr == null || permissionsStr.isBlank()
+                ? List.of()
+                : Arrays.stream(permissionsStr.split(","))
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .toList();
+
+        Long userId = Long.valueOf(userIdStr);
+        httpRequest.setAttribute("userId", userId);
+        httpRequest.setAttribute("username", username);
+        httpRequest.setAttribute("permissions", permissions);
+        try {
+            UserContext.set(new LoginUser(userId, username, permissions));
+            chain.doFilter(request, response);
+        } finally {
+            UserContext.clear();
+        }
+    }
+
+    private void sendUnauthorized(HttpServletResponse response, String message, String code) throws IOException {
+        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+        response.setContentType("application/json;charset=UTF-8");
+        response.getWriter().write(
+                "{\"success\":false,\"message\":\"" + message + "\",\"code\":\"" + code + "\"}");
+    }
+}

@@ -6,6 +6,7 @@ import com.example.user.entity.SysRolePermissionEntity;
 import com.example.user.entity.SysUserRoleEntity;
 import com.example.user.entity.UserEntity;
 import lombok.RequiredArgsConstructor;
+import org.springframework.lang.Nullable;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -24,7 +25,7 @@ import java.util.stream.Collectors;
  * 3. 系统无任何用户时创建内置管理员 admin / admin123（首次启动引导，生产环境请立即修改密码）
  * 4. 确保 admin 账号已绑定 ADMIN 角色（防注册页抢注导致“假 admin”）
  * <p>
- * 该初始化类随 spring-ai-user 被宿主应用（RAG）扫描而自动执行。
+ * 该初始化类随 spring-ai-user 服务独立启动时自动执行。
  */
 @Slf4j
 @Component
@@ -39,7 +40,7 @@ public class UserDataInitializer implements ApplicationRunner {
     private final PasswordEncoder passwordEncoder;
 
     @Override
-    public void run(ApplicationArguments args) {
+    public void run(@Nullable ApplicationArguments args) {
         ensureAdminRole();
         ensurePermissionSeeds();
         ensureBootstrapAdmin();

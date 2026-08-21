@@ -4,11 +4,10 @@ import com.example.springairagdemo.entity.KbMemberEntity;
 import com.example.springairagdemo.entity.KnowledgeBaseEntity;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.RequireKbRole;
+import com.example.springairagdemo.security.UserContext;
 import com.example.springairagdemo.service.KbAuthorizationService;
 import com.example.springairagdemo.service.KnowledgeBaseService;
-import com.example.user.entity.UserEntity;
-import com.example.user.security.UserContext;
-import com.example.user.service.UserService;
+import com.example.springairagdemo.service.UserClient;
 import com.example.springairagdemo.service.VectorStoreService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -29,7 +28,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.stream.Collectors;
 
 /**
  * 知识库 CRUD REST API（含 Milvus collection 管理 + 成员授权）
@@ -45,7 +43,7 @@ public class KnowledgeBaseController {
     private final KnowledgeBaseService knowledgeBaseService;
     private final VectorStoreService vectorStoreService;
     private final KbAuthorizationService kbAuthorizationService;
-    private final UserService userService;
+    private final UserClient userClient;
 
     /**
      * 创建知识库 — 同时在 Milvus 中创建对应 collection 和索引。
@@ -157,8 +155,9 @@ public class KnowledgeBaseController {
         List<Long> creatorIds = list.stream().map(KnowledgeBaseEntity::getCreateUser)
                 .filter(Objects::nonNull).distinct().toList();
         if (!creatorIds.isEmpty()) {
-            userService.listByIds(creatorIds).forEach(u ->
-                    userNames.put(u.getId(), u.getNickname() != null ? u.getNickname() : u.getUsername()));
+            userClient.findUsers(creatorIds).forEach((id, brief) ->
+                    userNames.put(id, brief.nickname() != null && !brief.nickname().isBlank()
+                            ? brief.nickname() : brief.username()));
         }
         List<Map<String, Object>> result = list.stream().map(kb -> {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -191,10 +190,9 @@ public class KnowledgeBaseController {
     public ResponseEntity<Map<String, Object>> members(@PathVariable Long id) {
         List<KbMemberEntity> members = kbAuthorizationService.members(id);
         List<Long> userIds = members.stream().map(KbMemberEntity::getUserId).distinct().toList();
-        Map<Long, UserEntity> userMap = userIds.isEmpty()
+        Map<Long, UserClient.UserBrief> userMap = userIds.isEmpty()
                 ? Map.of()
-                : userService.listByIds(userIds).stream()
-                        .collect(Collectors.toMap(UserEntity::getId, u -> u));
+                : userClient.findUsers(userIds);
 
         List<Map<String, Object>> result = members.stream().map(m -> {
             Map<String, Object> item = new LinkedHashMap<>();
@@ -202,9 +200,9 @@ public class KnowledgeBaseController {
             item.put("role", m.getRole());
             item.put("grantUser", m.getGrantUser());
             item.put("createTime", m.getCreateTime());
-            UserEntity u = userMap.get(m.getUserId());
-            item.put("username", u == null ? null : u.getUsername());
-            item.put("nickname", u == null ? null : u.getNickname());
+            UserClient.UserBrief u = userMap.get(m.getUserId());
+            item.put("username", u == null ? null : u.username());
+            item.put("nickname", u == null ? null : u.nickname());
             return item;
         }).toList();
 
@@ -230,7 +228,7 @@ public class KnowledgeBaseController {
         if (role == null) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不支持的成员角色，可选: OWNER/EDITOR/VIEWER"));
         }
-        if (userService.getById(userId) == null) {
+        if (userClient.getById(userId) == null) {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "目标用户不存在"));
         }
 

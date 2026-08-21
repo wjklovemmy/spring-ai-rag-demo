@@ -13,7 +13,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
  *       两套数据源物理隔离。</li>
  * </ul>
  */
-@SpringBootApplication(scanBasePackages = {"com.example.springairagdemo", "com.example.user"})
+@SpringBootApplication(scanBasePackages = {"com.example.springairagdemo"})
 @MapperScan("com.example.springairagdemo.mapper")
 public class SpringAiRagDemoApplication {
 

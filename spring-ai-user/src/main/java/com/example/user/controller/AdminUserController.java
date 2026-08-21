@@ -8,8 +8,8 @@ import com.example.user.security.RequireAdmin;
 import com.example.user.security.UserContext;
 import com.example.user.service.SysRoleService;
 import com.example.user.service.SysUserRoleService;
+import com.example.user.config.RagSyncClient;
 import com.example.user.service.UserService;
-import com.example.user.spi.UserAdminAuditHandler;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
@@ -34,9 +34,8 @@ import java.util.stream.Collectors;
  * 用户管理 REST API（仅 ADMIN 可访问）：
  * 用户列表 / 创建 / 启禁用 / 重置密码 / 删除 / 分配功能角色。
  * <p>
- * 用户域不依赖业务模块：删除用户时的知识库授权校验与清理由宿主应用（RAG）通过
- * {@link com.example.user.spi.UserDeletionGuard} 扩展点实现，审计通过
- * {@link UserAdminAuditHandler} 扩展点上报。
+ * 用户域不依赖业务模块：删除用户时的知识库授权校验与清理、管理操作审计，
+ * 经 {@link RagSyncClient} 远程回调 RAG 服务（/internal/kb/**）完成。
  */
 @RestController
 @RequestMapping("/api/admin/users")
@@ -48,7 +47,7 @@ public class AdminUserController {
     private final SysRoleService sysRoleService;
     private final SysUserRoleService sysUserRoleService;
     private final PasswordEncoder passwordEncoder;
-    private final UserAdminAuditHandler auditHandler;
+    private final RagSyncClient ragSyncClient;
 
     /** 用户列表（可按用户名/昵称模糊搜索），返回每个用户已分配的功能角色 */
     @GetMapping
@@ -128,7 +127,7 @@ public class AdminUserController {
         if (!saved) {
             return ResponseEntity.internalServerError().body(Map.of("success", false, "message", "创建用户失败"));
         }
-        auditHandler.audit("USER_CREATE", "管理员创建用户 " + username);
+        ragSyncClient.audit("USER_CREATE", "管理员创建用户 " + username);
         log.info("管理员创建用户: {}", username);
         return ResponseEntity.ok(Map.of("success", true, "message", "创建成功", "id", entity.getId()));
     }
@@ -156,7 +155,7 @@ public class AdminUserController {
         user.setStatus(status);
         user.setUpdateTime(new Date());
         userService.updateById(user);
-        auditHandler.audit("USER_STATUS",
+        ragSyncClient.audit("USER_STATUS",
                 "管理员" + (status == 1 ? "启用" : "禁用") + "用户 " + user.getUsername());
         log.info("用户状态变更: userId={}, status={}", id, status);
         return ResponseEntity.ok(Map.of("success", true, "message", status == 1 ? "已启用" : "已禁用"));
@@ -178,15 +177,15 @@ public class AdminUserController {
         user.setPassword(passwordEncoder.encode(password));
         user.setUpdateTime(new Date());
         userService.updateById(user);
-        auditHandler.audit("USER_PASSWORD", "管理员重置用户 " + user.getUsername() + " 的密码");
+        ragSyncClient.audit("USER_PASSWORD", "管理员重置用户 " + user.getUsername() + " 的密码");
         log.info("重置用户密码: userId={}", id);
         return ResponseEntity.ok(Map.of("success", true, "message", "密码已重置"));
     }
 
     /**
      * 删除用户：不能删除自己；不能删除最后一个 ADMIN；
-     * “最后一个知识库所有者”保护与 kb_member 清理由 RAG 的 {@link com.example.user.spi.UserDeletionGuard}
-     * 实现（经 userService.deleteUser 触发）。
+     * “最后一个知识库所有者”保护与 kb_member 清理经 {@link RagSyncClient} 远程回调 RAG 服务
+     * （/internal/kb/deletion-check 与 /internal/kb/user-cleanup，由 userService.deleteUser 触发）。
      */
     @DeleteMapping("/{id}")
     @RequireAdmin
@@ -202,7 +201,7 @@ public class AdminUserController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "不能删除最后一个管理员"));
         }
         userService.deleteUser(id);
-        auditHandler.audit("USER_DELETE", "管理员删除用户 " + user.getUsername());
+        ragSyncClient.audit("USER_DELETE", "管理员删除用户 " + user.getUsername());
         log.info("删除用户: userId={}, username={}", id, user.getUsername());
         return ResponseEntity.ok(Map.of("success", true, "message", "用户已删除"));
     }
@@ -266,7 +265,7 @@ public class AdminUserController {
             sysUserRoleService.save(relation);
         }
         String roleCodes = newRoles.stream().map(SysRoleEntity::getCode).collect(Collectors.joining(","));
-        auditHandler.audit("ROLE_ASSIGN",
+        ragSyncClient.audit("ROLE_ASSIGN",
                 "管理员为用户 " + user.getUsername() + " 分配功能角色 [" + roleCodes + "]");
         log.info("分配角色: userId={}, roleIds={}", id, newRoleIds);
         return ResponseEntity.ok(Map.of("success", true, "message", "角色分配成功"));

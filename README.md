@@ -36,8 +36,8 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 元数据 / 用户 / chunk 文本持久化 |
 | 对象存储 | MinIO 8.5.12 | 原始文档文件存储（同时支持本地磁盘模式） |
-| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` 共享 jar（同进程部署），Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
-| 网关 | Spring Cloud Gateway 2025.0.0（gateway-server 4.3.0） | 统一入口（8081）：路由 `/api/**`、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
+| 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
+| 网关 | Spring Cloud Gateway 2025.0.0（gateway-server 4.3.0） | 统一入口（8081）：按路径分流（认证/用户/角色 → 8082，知识库/文档 → 8080）、JWT 校验、Redis 黑名单、CORS、访问日志、可选 IP 限流 |
 | PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
 | 前端 | 原生 HTML / CSS / JS | `login.html` + `index.html` 静态页面（页面由 8080 提供，接口统一走 8081） |
@@ -57,14 +57,16 @@ graph TB
         GWAUTH["JwtAuthGlobalFilter<br/>JWT 校验 + Redis 黑名单 + 注入用户头"]
     end
 
-    subgraph User["用户域 spring-ai-user（共享 jar，同进程 8080）"]
+    subgraph User["用户服务 spring-ai-user :8082（独立服务）"]
         GATE_ID["GatewayIdentityFilter<br/>校验内部令牌 → UserContext"]
         USERCTRL["Auth / AdminUser / AdminRole Controller"]
         ADMINASPECT["AdminAccessAspect<br/>@RequireAdmin AOP 鉴权"]
         USERSVC["UserService / 角色 / 刷新令牌"]
+        INT_USER["InternalUserController<br/>/internal/users/**（供 RAG 查询）"]
     end
 
     subgraph Backend["RAG 服务 spring-ai-rag :8080"]
+        INT_KB["InternalController<br/>/internal/kb/**（删除校验/清理/审计）"]
         CTRL["Controller 层<br/>KnowledgeBase / KnowledgeDocument"]
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
@@ -88,9 +90,12 @@ graph TB
 
     LOGIN --> GWAUTH
     INDEX --> GWAUTH
-    GWAUTH -->|/api/** 转发| GATE_ID
+    GWAUTH -->|认证/用户/角色| GATE_ID
+    GWAUTH -->|知识库/文档| CTRL
     GATE_ID --> USERCTRL
-    USERCTRL --> CTRL
+    INT_USER -.内部接口.-> USERSVC
+    USERCTRL -.RagSyncClient 回调.-> INT_KB
+    CTRL -.UserClient 查询.-> INT_USER
     CTRL --> ASPECT --> AUTHZ --> MYSQL
     AUTHZ --> CTRL
     CTRL --> SVC
@@ -129,12 +134,12 @@ spring-ai-rag-demo/
 ├── logs/                           # 运行日志
 ├── pom.xml                         # 聚合父 POM（Java 17，依赖/版本管理）
 ├── mvnw / mvnw.cmd                 # Maven Wrapper
-├── spring-ai-rag/                  # RAG 服务核心模块（业务代码）
-│   ├── pom.xml                     # 依赖 com.example:spring-ai-user（用户域共享 jar）
+├── spring-ai-rag/                  # RAG 服务（独立部署，端口 8080，不依赖用户域模块）
+│   ├── pom.xml                     # Spring AI/Milvus/MinIO/OCR 依赖（用户域已拆分为独立服务）
 │   └── src/
 │       ├── main/
 │       │   └── java/com/example/springairagdemo/
-│       │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(scanBasePackages 双包)
+│       │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(仅扫描本模块)
 │       │       ├── config/
 │       │       │   ├── AiConfig.java                  # ChatClient / 模型装配
 │       │       │   ├── MilvusConfig.java              # Milvus 客户端
@@ -148,11 +153,15 @@ spring-ai-rag-demo/
 │       │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
 │       │       ├── controller/
 │       │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-│       │       │   └── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
-│       │       ├── security/                          # 防越权（知识库数据授权）
+│       │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
+│       │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
+│       │       ├── security/                          # 防越权 + 本地身份上下文（用户域拆分后自建）
 │       │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
 │       │       │   ├── RequireKbRole.java             # 知识库角色注解（方法级）
-│       │       │   └── KbAccessAspect.java            # @RequireKbRole AOP 切面
+│       │       │   ├── KbAccessAspect.java            # @RequireKbRole AOP 切面
+│       │       │   ├── GatewayIdentityFilter.java     # 校验 X-Gateway-Token + 消费身份头 → UserContext
+│       │       │   ├── LoginUser.java / UserContext.java # 本地登录态（ThreadLocal，来自网关注入）
+│       │       │   └── ForbiddenException.java        # 403 异常（本地版）
 │       │       ├── embedding/
 │       │       │   └── DashScopeEmbeddingModel.java   # 自研 DashScope 向量模型
 │       │       ├── entity/                            # MyBatis-Plus 实体 + 枚举
@@ -190,29 +199,34 @@ spring-ai-rag-demo/
 │       │           ├── KnowledgeChunkEntityService.java
 │       │           ├── KbAuthorizationService.java     # 权限判定中枢（assertRole/visibleKbIds/授权）
 │       │           ├── KbMemberService.java / KbAccessLogService.java
-│       │           ├── KbMemberDeletionGuard.java      # SPI：删用户前最后所有者保护 + 清理 kb_member
-│       │           ├── KbAccessLogAuditHandler.java    # SPI：用户域管理操作审计落库 kb_access_log
+│       │           ├── KbMemberDeletionGuard.java      # 删用户前最后所有者保护 + 清理 kb_member（InternalController 驱动）
+│       │           ├── KbAccessLogAuditHandler.java    # 管理操作审计落库 kb_access_log（InternalController 驱动）
+│       │           ├── UserClient.java                 # 远程查用户服务：isAdmin / 用户摘要（/internal/users/**）
 │       │           └── impl/                           # Service 实现类
 │       └── resources/
 │           ├── application.yaml                        # 全局配置
 │           └── static/
 │               ├── login.html                          # 登录/注册页
 │               └── index.html                          # 问答/上传/任务分阶段进度仪表盘
-├── spring-ai-user/                 # 用户域共享模块（library jar，被 RAG 依赖、同进程 8080 部署）
-│   ├── pom.xml                     # 用户域模块 POM（包 com.example.user）
+├── spring-ai-user/                 # 用户服务（独立部署，端口 8082，独立数据库 spring_ai_user）
+│   ├── pom.xml                     # 用户服务 POM（Spring Boot repackage，可执行 jar）
+│   ├── UserServiceApplication.java # 独立启动类（@MapperScan 用户域 mapper）
 │   └── src/
 │       └── main/
+│           ├── resources/application.yaml   # 端口 / 用户库 / Redis / JWT / 内部令牌
 │           └── java/com/example/user/
-│               ├── config/                             # JWT 与内部信任令牌
-│               │   ├── JwtUtil.java                    # JWT 生成/解析
+│               ├── config/                             # JWT、内部信任令牌、RAG 回调客户端
+│               │   ├── JwtUtil.java                    # JWT 生成/解析（权限码写入 Access Token）
 │               │   ├── JwtConfig.java                  # JWT 配置属性（注册 GatewayIdentityFilter）
-│               │   └── GatewayIdentityFilter.java      # 校验网关内部令牌并注入登录态（UserContext）
+│               │   ├── GatewayIdentityFilter.java      # 校验网关内部令牌并注入登录态（UserContext）
+│               │   └── RagSyncClient.java              # 回调 RAG /internal/kb/**（删除校验/清理/审计）
 │               ├── controller/
 │               │   ├── AuthController.java             # 注册/登录/登出/当前用户/用户搜索
-│               │   ├── AdminUserController.java        # 系统管理-用户（需 ADMIN，经 SPI 联动业务域）
-│               │   └── AdminRoleController.java        # 系统管理-角色（需 ADMIN）
+│               │   ├── AdminUserController.java        # 系统管理-用户（需 ADMIN，经 RagSyncClient 联动 RAG）
+│               │   ├── AdminRoleController.java        # 系统管理-角色（需 ADMIN）
+│               │   └── InternalUserController.java     # /internal/users/**（供 RAG 查 isAdmin/用户摘要）
 │               ├── security/                           # 认证上下文 + ADMIN 切面
-│               │   ├── LoginUser.java                  # 登录用户模型（id/username/nickname）
+│               │   ├── LoginUser.java                  # 登录用户模型（id/username/permissions）
 │               │   ├── UserContext.java                # ThreadLocal 当前用户上下文
 │               │   ├── ForbiddenException.java         # 403 业务异常
 │               │   ├── RequireAdmin.java               # ADMIN 功能角色注解（方法级）
@@ -225,30 +239,27 @@ spring-ai-rag-demo/
 │               │   ├── UserMapper.java
 │               │   ├── SysRoleMapper.java
 │               │   └── SysUserRoleMapper.java
-│               ├── service/
-│               │   ├── UserService.java                # 注册/登录/删除用户/isAdmin（JWT + BCrypt）
-│               │   ├── SysRoleService.java / SysUserRoleService.java
-│               │   ├── RedisRefreshTokenService.java   # 刷新令牌 + 登出黑名单
-│               │   └── UserDataInitializer.java        # 启动初始化（ADMIN 角色/默认账号）
-│               └── spi/                                # 扩展点（业务域实现，用户域只依赖接口）
-│                   ├── UserDeletionGuard.java          # 删除用户前钩子（RAG 侧实现：清理 kb_member）
-│                   └── UserAdminAuditHandler.java      # 用户管理操作审计钩子（RAG 侧实现：落库 kb_access_log）
+│               └── service/
+│                   ├── UserService.java                # 注册/登录/删除用户/isAdmin（JWT + BCrypt）
+│                   ├── SysRoleService.java / SysUserRoleService.java
+│                   ├── RedisRefreshTokenService.java   # 刷新令牌 + 登出黑名单
+│                   └── UserDataInitializer.java        # 启动初始化（ADMIN 角色/默认账号）
 ├── gateway/                        # 网关子模块（Spring Cloud Gateway，端口 8081）
 │   ├── pom.xml                     # 继承父 POM + spring-cloud-dependencies BOM + jjwt 0.12.6
 │   └── src/
 │       ├── main/
 │       │   ├── java/com/example/gateway/
 │       │   │   ├── GatewayApplication.java    # 启动类 + IP 限流 KeyResolver
-│       │   │   ├── security/JwtUtil.java      # JWT 校验工具（secret 与 RAG 共享一致）
+│       │   │   ├── security/JwtUtil.java      # JWT 校验工具（secret 与用户服务共享一致）
 │       │   │   └── filter/
 │       │   │       ├── JwtAuthGlobalFilter.java # 全局认证过滤器（白名单/黑名单/注入用户头）
 │       │   │       └── LoggingGlobalFilter.java # 全局访问日志过滤器
 │       │   └── resources/
-│       │       └── application.yaml          # 路由 / CORS / jwt.secret / Redis / 可选 IP 限流
+│       │       └── application.yaml          # 路由分流 / CORS / jwt.secret / Redis / 可选 IP 限流
 │       └── test/
 ├── sql/
 │   ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
-│   └── user.sql                              # 用户域独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
+│   └── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
 ```
 
 ---
@@ -363,13 +374,13 @@ spring-ai-rag-demo/
                             ↓
               网关 JwtAuthGlobalFilter（8081，GlobalFilter order=-200）
               · 白名单放行：/api/register、/api/login、/api/logout、/api/refresh
-              · 校验 Token 签名与有效期（jjwt，secret 与 RAG 完全一致）
+              · 校验 Token 签名与有效期（jjwt，secret 与用户服务完全一致）
               · 查 Redis 黑名单（登出/刷新后旧 Token 立即失效）
-              · 注入 X-User-Id / X-Username / X-Gateway-Token 后转发
+              · 注入 X-User-Id / X-Username / X-Permissions / X-Gateway-Token 后按路径分流
                             ↓
-              用户域 GatewayIdentityFilter（spring-ai-user，8080）
+              下游服务 GatewayIdentityFilter（spring-ai-user:8082 / spring-ai-rag:8080，各自本地实现）
               · 校验 X-Gateway-Token（内部信任令牌，防绕过网关直连伪造身份）
-              · 构造 LoginUser → UserContext.set() → 进入业务鉴权（RBAC / kb_member）
+              · 构造 LoginUser（含 JWT 中缓存的权限码）→ UserContext.set() → 进入业务鉴权（RBAC / kb_member）
               · 请求结束 finally 中 UserContext.clear()
 ```
 
@@ -424,19 +435,19 @@ spring-ai-rag-demo/
 
 ## 数据库设计
 
-项目采用**双库隔离**（多数据源，同一 MySQL 实例、不同 schema）：
+项目采用**双库隔离**（同一 MySQL 实例、不同 schema，分别由两个服务连接）：
 
-| 库 | 归属 | 数据源配置 | 内容 |
-|----|------|-----------|------|
-| `knowledge_base` | RAG 业务域 | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志 |
-| `spring_ai_user` | 用户域（spring-ai-user 共享 jar） | `spring.datasource.user.*`（UserDataSourceConfig 独立装配） | RBAC 五表：用户/角色/权限/两级关联 |
+| 库 | 归属服务 | 数据源配置 | 内容 |
+|----|---------|-----------|------|
+| `knowledge_base` | RAG 服务 spring-ai-rag（8080） | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志 |
+| `spring_ai_user` | 用户服务 spring-ai-user（8082） | `spring.datasource.*`（标准主数据源，MyBatis-Plus 自动装配） | RBAC 五表：用户/角色/权限/两级关联 |
 
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
 - `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
 
-应用启动时用户域 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色、权限种子与默认账号（幂等）。
-`kb_member` / `kb_access_log` 中的 `user_id` 为**跨库逻辑引用**（无外键约束），删除用户前由 SPI `UserDeletionGuard`（RAG 侧实现）先清理业务域数据。
+用户服务启动时 `UserDataInitializer` 也会自动补齐 `ADMIN` 角色、权限种子与默认账号（幂等）。
+`kb_member` / `kb_access_log` 中的 `user_id` 为**跨库逻辑引用**（无外键约束），删除用户前由用户服务经 `RagSyncClient` 远程回调 RAG 服务 `POST /internal/kb/deletion-check`（校验）与 `/internal/kb/user-cleanup`（清理 kb_member）完成联动。
 
 **RAG 业务库（knowledge_base）**：
 
@@ -505,18 +516,30 @@ spring-ai-rag-demo/
 | `rag.document.chunk.semantic.threshold` | 相邻段落相似度断点阈值（默认 0.55） |
 | `rag.document.chunk.semantic.batch-size` | 段落 embedding 批量大小（默认 10） |
 | `rag.document.chunk.semantic.fallback-on-error` | 语义切片失败降级 token 切分（默认 true） |
-| `jwt.secret` / `jwt.expiration-ms` | JWT 密钥（≥32 字节）与过期时间（**必须与 gateway 模块完全一致**，否则网关无法校验签名） |
-| `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），用户域 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
+| `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 与用户服务的 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
+| `user-service.internal-url` | 用户服务地址（RAG 调 `/internal/users/**` 查询 isAdmin / 用户摘要） |
+| `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时携带，两端必须一致） |
+
+**spring-ai-user 用户服务（`spring-ai-user/src/main/resources/application.yaml`）关键配置：**
+
+| 配置项 | 说明 |
+|--------|------|
+| `server.port` | 服务端口（8082） |
+| `spring.datasource.*` | MySQL 连接（`spring_ai_user` 库，标准主数据源） |
+| `spring.data.redis.*` | Redis（Refresh Token 会话存储 + 登出黑名单） |
+| `jwt.secret` / `jwt.expiration-ms` / `jwt.refresh-expiration-ms` | JWT 密钥与过期时间（签发侧，secret 必须与 gateway 一致） |
+| `rag.internal-url` | RAG 服务地址（回调 `/internal/kb/**` 做删除前校验/清理/审计） |
+| `gateway.internal-token` / `internal-token` | 与 RAG/网关一致的内部令牌 |
 
 **gateway 模块（`gateway/src/main/resources/application.yaml`）关键配置：**
 
 | 配置项 | 说明 |
 |--------|------|
-| `spring.cloud.gateway.server.webflux.routes` | 路由：`/api/**` → `http://localhost:8080`（RAG 服务） |
+| `spring.cloud.gateway.server.webflux.routes` | 路由分流：认证/用户/角色（`/api/login,/api/register,/api/refresh,/api/logout,/api/user,/api/users/**,/api/admin/**`）→ `http://localhost:8082`（用户服务）；其余 `/api/**` → `http://localhost:8080`（RAG 服务） |
 | `spring.cloud.gateway.server.webflux.globalcors` | 跨域：放行所有来源（页面从 8080 加载、接口走 8081） |
-| `jwt.secret` / `jwt.expiration-ms` | 与 RAG 模块一致（网关侧仅校验、不签发） |
-| `spring.data.redis.*` | 与 RAG 同一 Redis 实例（Token 黑名单） |
-| `gateway.internal-token` | 与 RAG 模块一致的内部信任令牌 |
+| `jwt.secret` / `jwt.expiration-ms` | 与用户服务一致（网关侧仅校验、不签发） |
+| `spring.data.redis.*` | Redis（Token 黑名单） |
+| `gateway.internal-token` / `internal-token` | 与 RAG、用户服务一致的内部令牌 |
 
 > 注意：Spring Cloud 2025.0 起 `spring.cloud.gateway.*` 配置前缀已废弃，网关配置统一使用 `spring.cloud.gateway.server.webflux.*`。
 > Rerank 复用 `spring.ai.dashscope.api-key`，无需单独配置 key；
@@ -589,16 +612,20 @@ export ALIYUN_OCR_SK=xxxx
 
 > **重要（已有数据的升级提示）**：collection 按知识库**动态创建**（`kb_{id}`），已存在时直接复用跳过，无需手工清理。由旧版本创建的 collection 若缺少 BM25 字段（`text`/`sparse`），BM25 检索路会失败并**自动降级为纯向量检索**（不再有旧 collection 兼容适配代码）；如需完整 Hybrid，请删除旧 collection（或删除知识库后重建）并重新上传文档。
 
-### 3. 启动应用（两个服务都要启动）
+### 3. 启动应用（三个服务都要启动）
 
-仓库根目录为聚合父工程：`spring-ai-rag`（RAG 服务，依赖用户域 `spring-ai-user` 共享 jar）、`spring-ai-user`（用户域 library 模块，**无需单独启动**，随 RAG 同进程部署）与 `gateway`（网关）。**网关对外提供 8081 统一入口，RAG 服务（含用户域）在 8080**，需分别启动 RAG 与网关（建议开两个终端）。推荐在根目录用 `-pl` 指定子模块启动：
+仓库根目录为聚合父工程，三个模块均为**独立服务**：`spring-ai-rag`（RAG 服务，8080）、`spring-ai-user`（用户服务，8082）、`gateway`（网关，8081）。**网关对外提供 8081 统一入口，按路径分流到用户服务与 RAG**，需分别启动三个服务（建议开三个终端）。推荐在根目录用 `-pl` 指定子模块启动：
 
 ```bash
 # 终端 1：RAG 服务（8080）
 mvnw.cmd -pl spring-ai-rag spring-boot:run     # Windows
 ./mvnw -pl spring-ai-rag spring-boot:run       # Linux/macOS
 
-# 终端 2：网关（8081，对外统一入口）
+# 终端 2：用户服务（8082，认证/用户/角色）
+mvnw.cmd -pl spring-ai-user spring-boot:run    # Windows
+./mvnw -pl spring-ai-user spring-boot:run      # Linux/macOS
+
+# 终端 3：网关（8081，对外统一入口）
 mvnw.cmd -pl gateway spring-boot:run           # Windows
 ./mvnw -pl gateway spring-boot:run             # Linux/macOS
 ```
@@ -610,13 +637,18 @@ cd spring-ai-rag
 ..\mvnw.cmd spring-boot:run    # Windows
 ../mvnw spring-boot:run        # Linux/macOS
 
+cd ../spring-ai-user
+..\mvnw.cmd spring-boot:run    # Windows
+../mvnw spring-boot:run        # Linux/macOS
+
 cd ../gateway
 ..\mvnw.cmd spring-boot:run    # Windows
 ../mvnw spring-boot:run        # Linux/macOS
 ```
 
 > 注意：运行相对路径（如上传临时目录）基于进程工作目录，建议始终从根目录用 `-pl` 方式启动，保持行为与旧版本一致。
-> 仅直连调试 RAG（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
+> 三个服务的 `application.yaml` 中 `jwt.secret` / `gateway.internal-token` / `internal-token` 必须一致；用户服务与 RAG 的服务间地址（`rag.internal-url` / `user-service.internal-url`）按实际部署调整。
+> 仅直连调试 RAG / 用户服务（不走网关）时，`GatewayIdentityFilter` 会因缺少 `X-Gateway-Token` 返回 401，因此日常访问请一律通过网关 8081。
 
 ### 4. 访问页面
 
@@ -627,7 +659,7 @@ cd ../gateway
 
 ## REST API 一览
 
-> 以下接口统一由**网关 8081** 暴露并转发至 RAG 服务（8080，含用户域）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，用户域（spring-ai-user）`GatewayIdentityFilter` 二次校验内部令牌。
+> 以下接口统一由**网关 8081** 暴露，按路径分流：认证/用户/角色（`/api/register`、`/api/login`、`/api/logout`、`/api/refresh`、`/api/user`、`/api/users/**`、`/api/admin/**`）→ 用户服务（8082）；知识库/文档（`/api/knowledge-*`）→ RAG 服务（8080）。`register / login / logout / refresh` 为网关白名单（无需 Token）；其余接口需携带 `Authorization: Bearer <token>`，由网关 `JwtAuthGlobalFilter` 校验后转发，下游服务 `GatewayIdentityFilter` 二次校验内部令牌。
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
@@ -680,5 +712,5 @@ cd ../gateway
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
 15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
-16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；RAG 服务仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 8081，CORS 由网关 `globalcors` 统一放行。
-17. **用户域模块化（SPI 解耦）**：认证/用户/角色/系统管理抽为 `spring-ai-user` 共享 jar（包 `com.example.user`），依赖方向单向（业务 → 用户域）；RAG 侧通过 SPI 扩展点（`UserDeletionGuard` 删除用户前清理 `kb_member` 并保护最后所有者、`UserAdminAuditHandler` 将用户管理操作审计落库 `kb_access_log`）联动业务数据，用户域不反向依赖任何业务模块。主类 `@SpringBootApplication(scanBasePackages)` 与 `@MapperScan` 同时扫描双包。
+16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。页面由 RAG 8080 提供、接口统一走 8081，CORS 由网关 `globalcors` 统一放行。
+17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
