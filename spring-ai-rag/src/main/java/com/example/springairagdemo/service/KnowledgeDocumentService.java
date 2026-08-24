@@ -21,6 +21,7 @@ import java.util.concurrent.CompletableFuture;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
+import reactor.core.publisher.Flux;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -895,6 +896,16 @@ public abstract class KnowledgeDocumentService {
     public record ChatResult(String answer, List<SourceInfo> sources) {}
 
     /**
+     * 流式问答结果：token 增量流 + 完整引用来源
+     * <p>流式输出无法在生成前预知回答实际引用了哪些来源，因此来源编号不重排，
+     * 直接按检索精排顺序返回全部候选，供前端渲染"引用来源"列表。
+     */
+    public record ChatStreamResult(Flux<String> stream, List<SourceInfo> sources) {}
+
+    /** 检索上下文：上下文文本 + 完整来源列表（context 为空表示知识库中无可用内容） */
+    private record RetrievalContext(String context, List<SourceInfo> sources) {}
+
+    /**
      * 引用来源信息
      *
      * @param refIndex 原始来源编号（1-based，与回答中 [来源N] 对应）
@@ -911,6 +922,76 @@ public abstract class KnowledgeDocumentService {
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
 
+        // 1. 检索召回 + 构建上下文（与流式问答共用）
+        RetrievalContext rc = retrieveContext(question, knowledgeBaseId);
+        String systemPrompt = rc.context().isEmpty() ? null : buildSystemPrompt(rc.context());
+
+        // 2. LLM 生成回答（同步，带 Sentinel 熔断降级）
+        String answer = callLlm(systemPrompt, question);
+
+        // AI 服务不可用（DeepSeek 调用异常/熔断）时降级：不展示引用来源
+        if (AI_SERVICE_UNAVAILABLE.equals(answer)) {
+            log.warn("AI 服务不可用，知识问答降级处理：knowledgeBaseId={}, question={}", knowledgeBaseId, question);
+            return new ChatResult(answer, List.of());
+        }
+
+        // 兜底清理：LLM 偶尔仍会输出 Markdown 加粗/行内代码符号，统一移除，保持纯文本展示
+        if (answer != null) {
+            answer = answer.replace("**", "").replace("`", "");
+        }
+
+        List<SourceInfo> sources = rc.sources();
+
+        // 3. 从回答中提取实际引用的来源编号，只保留精准来源（TreeSet 保证按来源编号升序返回）
+        Set<Integer> citedRefs = new TreeSet<>();
+        Matcher m = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
+        while (m.find()) {
+            citedRefs.add(Integer.parseInt(m.group(1)));
+        }
+
+        // 被引用来源重新编号为从 1 开始的连续编号（旧编号 → 新编号），并同步改写回答中的 [来源N]
+        Map<Integer, Integer> refMap = new HashMap<>();
+        int newRef = 1;
+        for (int idx : citedRefs) {
+            if (idx >= 1 && idx <= sources.size()) {
+                refMap.put(idx, newRef++);
+            }
+        }
+        if (!refMap.isEmpty()) {
+            Matcher rm = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
+            StringBuilder sb = new StringBuilder();
+            while (rm.find()) {
+                int oldRef = Integer.parseInt(rm.group(1));
+                Integer mapped = refMap.get(oldRef);
+                if (mapped != null) {
+                    rm.appendReplacement(sb, Matcher.quoteReplacement("[来源" + mapped + "]"));
+                } else {
+                    rm.appendReplacement(sb, Matcher.quoteReplacement(rm.group()));
+                }
+            }
+            rm.appendTail(sb);
+            answer = sb.toString();
+        }
+
+        List<SourceInfo> citedSources = new ArrayList<>();
+        for (int idx : citedRefs) {
+            if (idx >= 1 && idx <= sources.size()) {
+                SourceInfo s = sources.get(idx - 1);
+                citedSources.add(new SourceInfo(s.documentId(), s.documentName(), s.pageNo(),
+                        s.snippet(), refMap.get(idx)));
+            }
+        }
+
+        return new ChatResult(answer, citedSources);
+    }
+
+    /**
+     * 检索召回 + 构建问答上下文（同步/流式问答共用）：
+     * 混合检索 → 过滤失效文档/同名多版本 → Rerank 精排 → 组装 [来源N] 上下文
+     *
+     * @return context 为空字符串表示知识库中没有可用内容
+     */
+    private RetrievalContext retrieveContext(String question, Long knowledgeBaseId) {
         // 1. 检索召回：启用 Hybrid Search 时走「Dense + BM25 + RRF 融合」，否则纯向量检索
         //    召回 candidateTopK 个候选，供后续 Rerank 精排
         RagConfigProperties.Rerank rerankConfig = ragConfig.getRerank();
@@ -924,8 +1005,7 @@ public abstract class KnowledgeDocumentService {
         }
 
         if (searchResults.isEmpty()) {
-            String answer = callLlm(null, question);
-            return new ChatResult(answer, List.of());
+            return new RetrievalContext("", List.of());
         }
 
         // 2. 从 MySQL 获取 chunk 内容
@@ -1029,14 +1109,14 @@ public abstract class KnowledgeDocumentService {
                     ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
         }
 
-        String context = contextBuilder.toString();
-        if (context.isEmpty()) {
-            String answer = callLlm(null, question);
-            return new ChatResult(answer, List.of());
-        }
+        return new RetrievalContext(contextBuilder.toString(), sources);
+    }
 
-        // 3. LLM 生成回答
-        String systemPrompt = String.format(
+    /**
+     * 构建系统提示：严格基于知识库内容回答、禁止 Markdown、标注 [来源N]
+     */
+    private String buildSystemPrompt(String context) {
+        return String.format(
                 "你是一个基于知识库的问答助手。请严格根据以下知识库内容回答用户问题。%n"
                 + "回答时，请在引用知识库内容的地方用方括号标注来源编号，例如[来源1]、[来源2]。%n"
                 + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。%n"
@@ -1044,61 +1124,44 @@ public abstract class KnowledgeDocumentService {
                 + "%n"
                 + "知识库内容：%n"
                 + "%s", context);
+    }
 
-        String answer = callLlm(systemPrompt, question);
+    /**
+     * 在指定知识库中进行流式问答（SSE）：检索逻辑与 {@link #chat} 完全一致，
+     * 回答以 token 增量流式返回；AI 服务异常时流中输出降级提示，不会中断连接。
+     *
+     * @return token 增量流 + 完整引用来源（编号不重排，见 {@link ChatStreamResult}）
+     */
+    public ChatStreamResult chatStream(String question, Long knowledgeBaseId) {
+        // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
+        kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
 
-        // AI 服务不可用（DeepSeek 调用异常/熔断）时降级：不展示引用来源
-        if (AI_SERVICE_UNAVAILABLE.equals(answer)) {
-            log.warn("AI 服务不可用，知识问答降级处理：knowledgeBaseId={}, question={}", knowledgeBaseId, question);
-            return new ChatResult(answer, List.of());
+        // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
+        expireOverdueDocuments();
+
+        // 1. 检索召回 + 构建上下文（与同步问答共用）
+        RetrievalContext rc = retrieveContext(question, knowledgeBaseId);
+        String systemPrompt = rc.context().isEmpty() ? null : buildSystemPrompt(rc.context());
+
+        // 2. LLM 流式生成回答
+        return new ChatStreamResult(streamLlm(systemPrompt, question), rc.sources());
+    }
+
+    /**
+     * 流式调用 LLM（DeepSeek）：逐 token 输出增量文本；
+     * 调用异常/网络中断时降级为 {@link #AI_SERVICE_UNAVAILABLE}，避免连接异常中断前端。
+     */
+    private Flux<String> streamLlm(String systemPrompt, String question) {
+        ChatClient.ChatClientRequestSpec spec = chatClient.prompt().user(question);
+        if (systemPrompt != null && !systemPrompt.isBlank()) {
+            spec = spec.system(systemPrompt);
         }
-
-        // 兜底清理：LLM 偶尔仍会输出 Markdown 加粗/行内代码符号，统一移除，保持纯文本展示
-        if (answer != null) {
-            answer = answer.replace("**", "").replace("`", "");
-        }
-
-        // 从回答中提取实际引用的来源编号，只保留精准来源（TreeSet 保证按来源编号升序返回）
-        Set<Integer> citedRefs = new TreeSet<>();
-        Matcher m = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
-        while (m.find()) {
-            citedRefs.add(Integer.parseInt(m.group(1)));
-        }
-
-        // 被引用来源重新编号为从 1 开始的连续编号（旧编号 → 新编号），并同步改写回答中的 [来源N]
-        Map<Integer, Integer> refMap = new HashMap<>();
-        int newRef = 1;
-        for (int idx : citedRefs) {
-            if (idx >= 1 && idx <= sources.size()) {
-                refMap.put(idx, newRef++);
-            }
-        }
-        if (!refMap.isEmpty()) {
-            Matcher rm = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
-            StringBuilder sb = new StringBuilder();
-            while (rm.find()) {
-                int oldRef = Integer.parseInt(rm.group(1));
-                Integer mapped = refMap.get(oldRef);
-                if (mapped != null) {
-                    rm.appendReplacement(sb, Matcher.quoteReplacement("[来源" + mapped + "]"));
-                } else {
-                    rm.appendReplacement(sb, Matcher.quoteReplacement(rm.group()));
-                }
-            }
-            rm.appendTail(sb);
-            answer = sb.toString();
-        }
-
-        List<SourceInfo> citedSources = new ArrayList<>();
-        for (int idx : citedRefs) {
-            if (idx >= 1 && idx <= sources.size()) {
-                SourceInfo s = sources.get(idx - 1);
-                citedSources.add(new SourceInfo(s.documentId(), s.documentName(), s.pageNo(),
-                        s.snippet(), refMap.get(idx)));
-            }
-        }
-
-        return new ChatResult(answer, citedSources);
+        return spec.stream()
+                .content()
+                // 兜底清理：LLM 偶尔仍会输出 Markdown 加粗/行内代码符号，统一移除，保持纯文本展示
+                .map(content -> content == null ? "" : content.replace("**", "").replace("`", ""))
+                .doOnError(t -> log.error("AI 流式调用（DeepSeek）失败，问答降级处理：{}", t.getMessage()))
+                .onErrorResume(t -> Flux.just(AI_SERVICE_UNAVAILABLE));
     }
 
     /**

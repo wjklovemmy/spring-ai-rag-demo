@@ -22,6 +22,7 @@ import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -41,6 +42,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import reactor.core.publisher.Flux;
 
 /**
  * 知识文档 REST API
@@ -274,13 +276,20 @@ public class KnowledgeDocumentController {
     }
 
     /**
-     * 基于指定知识库进行问答（需要 VIEWER 及以上）
+     * 基于指定知识库进行问答（需要 VIEWER 及以上），SSE 流式输出
+     * <p>事件流格式（data 为 JSON 对象）：
+     * <ul>
+     *   <li>{@code {"type":"delta","content":"..."}} — 增量文本（逐 token）</li>
+     *   <li>{@code {"type":"sources","sources":[...]}} — 完整引用来源（结束前发送）</li>
+     *   <li>{@code {"type":"done"}} — 流结束标记</li>
+     *   <li>{@code {"type":"error","message":"..."}} — 参数错误 / 降级提示</li>
+     * </ul>
      *
      * @param request JSON body，包含 question 和 knowledgeBaseId 字段
      */
     @PostMapping("/chat")
     @RequireKbRole(value = KbRole.VIEWER, kbParam = "knowledgeBaseId")
-    public ResponseEntity<Map<String, Object>> chat(@RequestBody Map<String, Object> request) {
+    public Object chat(@RequestBody Map<String, Object> request) {
         String question = (String) request.get("question");
         Object kbIdObj = request.get("knowledgeBaseId");
 
@@ -300,34 +309,71 @@ public class KnowledgeDocumentController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "知识库 ID 格式错误"));
         }
 
-        try {
-            KnowledgeDocumentService.ChatResult chatResult =
-                    knowledgeDocumentService.chat(question, knowledgeBaseId);
-
-            List<Map<String, Object>> sources = chatResult.sources().stream().map(s -> {
-                Map<String, Object> src = new LinkedHashMap<>();
-                src.put("documentId", s.documentId());
-                src.put("documentName", s.documentName());
-                src.put("pageNo", s.pageNo());
-                src.put("snippet", s.snippet());
-                src.put("refIndex", s.refIndex());
-                return src;
-            }).toList();
-
-            return ResponseEntity.ok(Map.of(
-                    "success", true,
-                    "question", question,
-                    "knowledgeBaseId", knowledgeBaseId,
-                    "answer", chatResult.answer(),
-                    "sources", sources
-            ));
-        } catch (Exception e) {
-            log.error("知识文档问答处理失败", e);
-            return ResponseEntity.internalServerError().body(Map.of(
-                    "success", false,
-                    "message", "问答处理失败: " + e.getMessage()
-            ));
+        // 回答方式：stream=true（默认）SSE 流式输出；stream=false 一次性返回完整 JSON
+        boolean stream = true;
+        Object streamObj = request.get("stream");
+        if (streamObj != null) {
+            stream = streamObj instanceof Boolean ? (Boolean) streamObj : Boolean.parseBoolean(streamObj.toString());
         }
+
+        if (!stream) {
+            try {
+                KnowledgeDocumentService.ChatResult chatResult =
+                        knowledgeDocumentService.chat(question, knowledgeBaseId);
+                List<Map<String, Object>> sources = chatResult.sources().stream().map(s -> {
+                    Map<String, Object> src = new LinkedHashMap<>();
+                    src.put("documentId", s.documentId());
+                    src.put("documentName", s.documentName());
+                    src.put("pageNo", s.pageNo());
+                    src.put("snippet", s.snippet());
+                    src.put("refIndex", s.refIndex());
+                    return src;
+                }).toList();
+                return ResponseEntity.ok(Map.of(
+                        "success", true,
+                        "question", question,
+                        "knowledgeBaseId", knowledgeBaseId,
+                        "answer", chatResult.answer(),
+                        "sources", sources
+                ));
+            } catch (Exception e) {
+                log.error("知识文档问答处理失败（同步）", e);
+                return ResponseEntity.internalServerError().body(Map.of(
+                        "success", false,
+                        "message", "问答处理失败: " + e.getMessage()
+                ));
+            }
+        }
+
+        // ===== 流式（SSE）=====
+        KnowledgeDocumentService.ChatStreamResult chatResult =
+                knowledgeDocumentService.chatStream(question, knowledgeBaseId);
+
+        List<Map<String, Object>> sources = chatResult.sources().stream().map(s -> {
+            Map<String, Object> src = new LinkedHashMap<>();
+            src.put("documentId", s.documentId());
+            src.put("documentName", s.documentName());
+            src.put("pageNo", s.pageNo());
+            src.put("snippet", s.snippet());
+            src.put("refIndex", s.refIndex());
+            return src;
+        }).toList();
+
+        // SSE 事件流：先逐 token 输出增量文本，最后携带引用来源与结束标记
+        Flux<ServerSentEvent<Map<String, Object>>> flux = chatResult.stream()
+                .map(delta -> sseEvent(Map.<String, Object>of("type", "delta", "content", delta)))
+                .concatWith(Flux.just(
+                        sseEvent(Map.<String, Object>of("type", "sources", "sources", sources)),
+                        sseEvent(Map.<String, Object>of("type", "done"))));
+
+        return ResponseEntity.ok()
+                .contentType(MediaType.TEXT_EVENT_STREAM)
+                .body(flux);
+    }
+
+    /** 构建 SSE 事件（data 为 JSON 对象，统一 Map<String,Object> 避免泛型推断冲突） */
+    private ServerSentEvent<Map<String, Object>> sseEvent(Map<String, Object> data) {
+        return ServerSentEvent.builder(data).build();
     }
 
     /**
