@@ -94,8 +94,9 @@ async function tryRefresh(refreshToken) {
       body: JSON.stringify({ refreshToken })
     })
     const data = await res.json()
-    if (data.success && data.data && data.data.token) {
-      setAuth(data.data.token, data.data.refreshToken, data.data.username)
+    // 后端 /api/refresh 返回扁平结构 {success, token, refreshToken, username}
+    if (data.success && data.token) {
+      setAuth(data.token, data.refreshToken, data.username)
       router.replace('/')
     } else {
       clearAuth()
@@ -115,8 +116,9 @@ async function handleLogin() {
       body: JSON.stringify({ username: loginForm.username, password: loginForm.password })
     })
     const data = await res.json()
-    if (!data.success || !data.data) { showAlert(data.message || '登录失败', 'error'); return }
-    setAuth(data.data.token, data.data.refreshToken, data.data.username)
+    // 后端 /api/login 返回扁平结构 {success, token, refreshToken, username}
+    if (!data.success || !data.token) { showAlert(data.message || '登录失败', 'error'); return }
+    setAuth(data.token, data.refreshToken, data.username)
     router.replace('/')
   } catch (e) {
     showAlert('网络异常，请稍后重试', 'error')

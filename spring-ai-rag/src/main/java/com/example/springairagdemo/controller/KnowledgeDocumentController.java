@@ -34,6 +34,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -368,7 +369,7 @@ public class KnowledgeDocumentController {
             return ResponseEntity.ok()
                     .contentType(MediaType.parseMediaType(contentType))
                     .header(HttpHeaders.CONTENT_DISPOSITION,
-                            ContentDisposition.attachment().filename(fileName).build().toString())
+                            ContentDisposition.attachment().filename(fileName, StandardCharsets.UTF_8).build().toString())
                     .body(resource);
 
         } catch (Exception e) {

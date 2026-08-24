@@ -39,11 +39,12 @@ export async function refreshAccessToken(refreshToken) {
           body: JSON.stringify({ refreshToken })
         })
         const data = await res.json()
-        if (!data.success || !data.data || !data.data.token) {
+        // 后端 /api/refresh 返回扁平结构 {success, token, refreshToken, username}
+        if (!data.success || !data.token) {
           throw new Error(data.message || '刷新失败')
         }
-        setAuth(data.data.token, data.data.refreshToken, data.data.username)
-        return data.data.token
+        setAuth(data.token, data.refreshToken, data.username)
+        return data.token
       } finally {
         refreshPromise = null
       }
