@@ -287,6 +287,27 @@ public class KnowledgeDocumentController {
      *
      * @param request JSON body，包含 question 和 knowledgeBaseId 字段
      */
+    /**
+     * 清除指定会话的多轮对话记忆（Redis key = rag:chat:memory:{userId}:{sessionId}）。
+     * 前端「清空对话」时调用：先删旧记忆再换新会话 ID，避免旧数据残留至 TTL 过期。
+     * 不需要知识库权限（仅与当前登录用户自己的会话相关，身份由网关注入）。
+     *
+     * @param request JSON body，可选字段 sessionId（缺省清除默认会话）
+     */
+    @PostMapping("/chat/clear-memory")
+    public ResponseEntity<Map<String, Object>> clearChatMemory(@RequestBody Map<String, Object> request) {
+        String sessionId = null;
+        Object sObj = request.get("sessionId");
+        if (sObj != null) {
+            String s = sObj.toString().trim();
+            if (!s.isEmpty()) {
+                sessionId = s.length() > 128 ? s.substring(0, 128) : s;
+            }
+        }
+        knowledgeDocumentService.clearMemory(sessionId);
+        return ResponseEntity.ok(Map.of("success", true));
+    }
+
     @PostMapping("/chat")
     @RequireKbRole(value = KbRole.VIEWER, kbParam = "knowledgeBaseId")
     public Object chat(@RequestBody Map<String, Object> request) {
@@ -309,6 +330,16 @@ public class KnowledgeDocumentController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "知识库 ID 格式错误"));
         }
 
+        // 会话 ID：多轮对话记忆的 key（不传则服务端用默认会话）；限长 128 防滥用
+        String sessionId = null;
+        Object sObj = request.get("sessionId");
+        if (sObj != null) {
+            String s = sObj.toString().trim();
+            if (!s.isEmpty()) {
+                sessionId = s.length() > 128 ? s.substring(0, 128) : s;
+            }
+        }
+
         // 回答方式：stream=true（默认）SSE 流式输出；stream=false 一次性返回完整 JSON
         boolean stream = true;
         Object streamObj = request.get("stream");
@@ -319,7 +350,7 @@ public class KnowledgeDocumentController {
         if (!stream) {
             try {
                 KnowledgeDocumentService.ChatResult chatResult =
-                        knowledgeDocumentService.chat(question, knowledgeBaseId);
+                        knowledgeDocumentService.chat(question, knowledgeBaseId, sessionId);
                 List<Map<String, Object>> sources = chatResult.sources().stream().map(s -> {
                     Map<String, Object> src = new LinkedHashMap<>();
                     src.put("documentId", s.documentId());
@@ -347,7 +378,7 @@ public class KnowledgeDocumentController {
 
         // ===== 流式（SSE）=====
         KnowledgeDocumentService.ChatStreamResult chatResult =
-                knowledgeDocumentService.chatStream(question, knowledgeBaseId);
+                knowledgeDocumentService.chatStream(question, knowledgeBaseId, sessionId);
 
         List<Map<String, Object>> sources = chatResult.sources().stream().map(s -> {
             Map<String, Object> src = new LinkedHashMap<>();

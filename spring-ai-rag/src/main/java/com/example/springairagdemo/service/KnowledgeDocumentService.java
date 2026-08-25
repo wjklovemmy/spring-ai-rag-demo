@@ -8,8 +8,11 @@ import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
 import com.example.springairagdemo.security.KbRole;
+import com.example.springairagdemo.security.UserContext;
+import com.example.springairagdemo.tools.KbQueryTools;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
@@ -84,6 +87,9 @@ public abstract class KnowledgeDocumentService {
 
     @Autowired
     protected ChatClient chatClient;
+
+    @Autowired
+    protected ChatMemory chatMemory;
 
     /** Sentinel 熔断降级器工厂（spring-cloud-circuitbreaker-sentinel 实现） */
     @Autowired
@@ -914,20 +920,26 @@ public abstract class KnowledgeDocumentService {
 
     /**
      * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
+     *
+     * @param sessionId 会话 ID（多轮对话记忆 key，null/空则用默认会话）
      */
-    public ChatResult chat(String question, Long knowledgeBaseId) {
+    public ChatResult chat(String question, Long knowledgeBaseId, String sessionId) {
         // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
 
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
 
-        // 1. 检索召回 + 构建上下文（与流式问答共用）
+        // 1. 检索召回 + 构建上下文（与流式问答共用）；
+        //    不做问题类型预判（关键词路由不可扩展），由模型自主决定是否调用工具；
+        //    检索为空时给出引导性系统提示（可调用工具查询清单类信息）
         RetrievalContext rc = retrieveContext(question, knowledgeBaseId);
-        String systemPrompt = rc.context().isEmpty() ? null : buildSystemPrompt(rc.context());
+        String systemPrompt = rc.context().isEmpty()
+                ? buildEmptyContextSystemPrompt()
+                : buildSystemPrompt(rc.context());
 
-        // 2. LLM 生成回答（同步，带 Sentinel 熔断降级）
-        String answer = callLlm(systemPrompt, question);
+        // 2. LLM 生成回答（同步，带 Sentinel 熔断降级 + 多轮记忆）
+        String answer = callLlm(systemPrompt, question, sessionId, knowledgeBaseId);
 
         // AI 服务不可用（DeepSeek 调用异常/熔断）时降级：不展示引用来源
         if (AI_SERVICE_UNAVAILABLE.equals(answer)) {
@@ -1121,9 +1133,29 @@ public abstract class KnowledgeDocumentService {
                 + "回答时，请在引用知识库内容的地方用方括号标注来源编号，例如[来源1]、[来源2]。%n"
                 + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。%n"
                 + "如果知识库中没有相关信息，请如实告知用户\"知识库中暂无相关信息\"。%n"
+                + "如果用户的问题中存在指代不清（如\"这些内容\"\"上面提到的\"\"刚才说的\"等），"
+                + "且当前对话上下文（本问题和检索内容）无法明确其具体所指，"
+                + "请直接向用户确认所指内容，而不要从检索内容中猜测作答。%n"
                 + "%n"
                 + "知识库内容：%n"
                 + "%s", context);
+    }
+
+    /**
+     * 检索为空时的引导性系统提示：
+     * 不预设问题类型（关键词路由不可扩展），而是引导模型——若问题属于文档清单等
+     * 结构化枚举类，可调用可用工具查询；确无相关内容则如实告知。
+     */
+    private String buildEmptyContextSystemPrompt() {
+        return "你是一个基于知识库的问答助手。本次对知识库正文的检索没有找到相关片段。\n"
+                + "若用户的问题涉及文档清单、文件列表等结构化信息（例如“知识库中有哪些文档”、"
+                + "“有没有某份文档”），请调用可用的工具查询后再回答。\n"
+                +                 "若工具查询也没有结果，或用户的问题确与知识库内容无关，请如实告知用户"
+                + "“知识库中暂无相关信息”。\n"
+                + "如果用户的问题中存在指代不清（如“这些内容”“上面提到的”“刚才说的”等），"
+                + "且当前对话上下文无法明确其具体所指，请直接向用户确认所指内容，"
+                + "而不要猜测作答。\n"
+                + "回答请使用纯文本，禁止使用任何 Markdown 格式。";
     }
 
     /**
@@ -1132,27 +1164,34 @@ public abstract class KnowledgeDocumentService {
      *
      * @return token 增量流 + 完整引用来源（编号不重排，见 {@link ChatStreamResult}）
      */
-    public ChatStreamResult chatStream(String question, Long knowledgeBaseId) {
+    public ChatStreamResult chatStream(String question, Long knowledgeBaseId, String sessionId) {
         // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
 
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
 
-        // 1. 检索召回 + 构建上下文（与同步问答共用）
+        // 1. 检索召回 + 构建上下文（与同步问答共用）；
+        //    不做问题类型预判（关键词路由不可扩展），由模型自主决定是否调用工具；
+        //    检索为空时给出引导性系统提示（可调用工具查询清单类信息）
         RetrievalContext rc = retrieveContext(question, knowledgeBaseId);
-        String systemPrompt = rc.context().isEmpty() ? null : buildSystemPrompt(rc.context());
+        String systemPrompt = rc.context().isEmpty()
+                ? buildEmptyContextSystemPrompt()
+                : buildSystemPrompt(rc.context());
 
-        // 2. LLM 流式生成回答
-        return new ChatStreamResult(streamLlm(systemPrompt, question), rc.sources());
+        // 2. LLM 流式生成回答（多轮记忆：Advisor 按 sessionId 注入历史）
+        return new ChatStreamResult(streamLlm(systemPrompt, question, sessionId, knowledgeBaseId), rc.sources());
     }
 
     /**
      * 流式调用 LLM（DeepSeek）：逐 token 输出增量文本；
      * 调用异常/网络中断时降级为 {@link #AI_SERVICE_UNAVAILABLE}，避免连接异常中断前端。
      */
-    private Flux<String> streamLlm(String systemPrompt, String question) {
-        ChatClient.ChatClientRequestSpec spec = chatClient.prompt().user(question);
+    private Flux<String> streamLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId) {
+        ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
+                .user(question)
+                .toolContext(toolContext(knowledgeBaseId))
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId(sessionId)));
         if (systemPrompt != null && !systemPrompt.isBlank()) {
             spec = spec.system(systemPrompt);
         }
@@ -1170,12 +1209,16 @@ public abstract class KnowledgeDocumentService {
      *
      * @param systemPrompt 系统提示（无检索上下文时传 null）
      * @param question     用户问题
+     * @param sessionId    会话 ID（多轮记忆）
      * @return LLM 回答；AI 服务不可用时返回 {@link #AI_SERVICE_UNAVAILABLE}
      */
-    private String callLlm(String systemPrompt, String question) {
+    private String callLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId) {
         return circuitBreakerFactory.create(AiConfig.AI_CHAT_RESOURCE).run(
                 () -> {
-                    ChatClient.ChatClientRequestSpec spec = chatClient.prompt().user(question);
+                    ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
+                            .user(question)
+                            .toolContext(toolContext(knowledgeBaseId))
+                            .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId(sessionId)));
                     if (systemPrompt != null && !systemPrompt.isBlank()) {
                         spec = spec.system(systemPrompt);
                     }
@@ -1192,6 +1235,39 @@ public abstract class KnowledgeDocumentService {
     }
 
     // ===================== 辅助方法 =====================
+
+    /**
+     * 会话 ID 归一化：拼入当前用户 ID，记忆 key 形如 {@code rag:chat:memory:{userId}:{sessionId}}，
+     * 实现会话按用户隔离（不同用户即使 sessionId 相同也不会串号）。
+     * 注意：必须在请求线程内调用（UserContext 为 ThreadLocal），
+     * 拼装结果经 advisor param 传递，后续读写不依赖线程上下文。
+     */
+    private String conversationId(String sessionId) {
+        Long userId = UserContext.getUserId();
+        String sid = (sessionId == null || sessionId.isBlank()) ? "default" : sessionId;
+        return (userId == null ? "anon" : userId) + ":" + sid;
+    }
+
+    /**
+     * 清除指定会话的多轮对话记忆（Redis key = rag:chat:memory:{userId}:{sessionId}）。
+     * 前端「清空对话」时调用：先删除旧会话的 Redis 历史，再更换新的会话 ID，
+     * 避免旧数据残留至 7 天 TTL 过期。
+     */
+    public void clearMemory(String sessionId) {
+        chatMemory.clear(conversationId(sessionId));
+    }
+
+    /**
+     * 工具调用上下文：把当前请求的知识库 ID 与用户 ID 放入 ToolContext。
+     * 必须在请求线程内调用（UserContext 为 ThreadLocal）；工具回调线程不在此上下文内，
+     * KbQueryTools 从 ToolContext 而非 UserContext 读取身份信息，避免线程切换导致权限校验失效。
+     */
+    private Map<String, Object> toolContext(Long knowledgeBaseId) {
+        Map<String, Object> ctx = new HashMap<>(4);
+        ctx.put(KbQueryTools.KB_ID_KEY, knowledgeBaseId);
+        ctx.put(KbQueryTools.USER_ID_KEY, UserContext.getUserId());
+        return ctx;
+    }
 
     /**
      * 从 Document metadata 中提取页码，取不到时从 chunk 索引反推

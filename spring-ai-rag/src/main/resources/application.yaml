@@ -66,6 +66,21 @@ spring:
     password: root
     driver-class-name: com.mysql.cj.jdbc.Driver
     # 连接池参数（自定义，由 DataSourceConfig 绑定到 HikariCP）
+    # Redis：多轮对话记忆（ChatMemory）存储，与用户服务/网关共用同一实例
+    #（key：rag:chat:memory:{userId}:{sessionId}，按用户隔离，TTL 7 天）
+    data:
+      redis:
+        host: localhost
+        port: 6379
+        # 如 Redis 设置过密码请在此配置，未设置则留空
+        password:
+        database: 0
+        timeout: 3s
+        lettuce:
+          pool:
+            max-active: 8
+            max-idle: 8
+            min-idle: 0
   task:
     # Embedding 异步任务线程池参数（自定义，由 AsyncTaskConfig 绑定）
     embedding:

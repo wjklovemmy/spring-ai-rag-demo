@@ -36,6 +36,7 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（同时支持本地磁盘模式） |
+| 会话记忆 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池） | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{会话ID}` 存取、用户隔离，TTL 7 天）；与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
@@ -78,13 +79,15 @@ graph TB
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
-        CHAT["ChatClient<br/>deepseek-chat"]
+        CHAT["ChatClient<br/>deepseek-chat<br/>+ MessageChatMemoryAdvisor"]
+        MEM["RedisChatMemory<br/>ChatMemory 多轮记忆"]
     end
 
     subgraph Storage["存储层"]
         MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member<br/>用户域: RBAC 五表")]
         MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
         MINIO[("MinIO<br/>原始 PDF 文件")]
+        REDIS[("Redis<br/>对话记忆 rag:chat:memory:{userId}:*<br/>TTL 7 天")]
     end
 
     subgraph Registry["注册中心 / 配置中心"]
@@ -115,6 +118,7 @@ graph TB
     SPLIT --> EMBED --> DS
     EMBED --> MILVUS
     SVC --> CHAT --> AI
+    CHAT --> MEM --> REDIS
     MILVUS --> SVC
     SVC --> RERANK --> DS
     RERANK --> SVC
@@ -151,7 +155,7 @@ spring-ai-rag-demo/
 │   └── src/main/java/com/example/springairagdemo/
 │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(仅扫描本模块)
 │       ├── config/
-│       │   ├── AiConfig.java                  # ChatClient / 模型装配 + Sentinel 熔断规则（ai-chat / dashscope-embedding）
+│       │   ├── AiConfig.java                  # ChatClient / 模型装配 + MessageChatMemoryAdvisor（多轮记忆）+ Sentinel 熔断规则（ai-chat / dashscope-embedding）
 │       │   ├── MilvusConfig.java              # Milvus 客户端
 │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（rerank/hybrid/ocr/storage/chunk 等）
 │       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
@@ -164,7 +168,7 @@ spring-ai-rag-demo/
 │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
 │       ├── controller/
 │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-│       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答/删除/下载
+│       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载
 │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
 │       ├── security/                          # 防越权 + 本地身份上下文
 │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
@@ -190,11 +194,13 @@ spring-ai-rag-demo/
 │       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
 │       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建
 │       │   └── SemanticSplitter.java          # 语义切片（段落聚类 + 断点）
+│       ├── memory/
+│       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
 │       └── service/
-│           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（抽象类）
+│           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（流式/同步 + 多轮记忆，抽象类）
 │           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
 │           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
 │           ├── HybridSearchService.java           # 混合检索编排（RRF 融合 + 异常降级）
@@ -318,37 +324,45 @@ spring-ai-rag-demo/
 
 ### 2. 知识问答（Q&A）
 
-`KnowledgeDocumentService.chat(question, knowledgeBaseId)`（入口先执行 `assertRole(kbId, VIEWER)`，需 VIEWER 及以上）：
+`KnowledgeDocumentService.chat(question, knowledgeBaseId, sessionId)`（同步） / `chatStream(...)`（流式，入口先执行 `assertRole(kbId, VIEWER)`，需 VIEWER 及以上）：
 
 ```
-用户问题
+用户问题 + 会话 ID（sessionId：前端 crypto.randomUUID 生成、localStorage 持久化）
   │
-  ├─ ① 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
+  ├─ ① 会话记忆   MessageChatMemoryAdvisor 按会话 ID 从 Redis（key rag:chat:memory:{userId}:{sessionId}，
+  │       userId 由服务端 UserContext 注入，会话按用户隔离）读取历史（仅 user/assistant 消息，
+  │       窗口保护最近 100 条，TTL 7 天）注入 prompt，实现多轮上下文连贯；
+  │       · system 检索上下文不落库（避免污染记忆）；「清空对话」= 前端更换新 sessionId 并清空消息
+  │
+  ├─ ② 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
   │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
   │       · rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
   │
-  ├─ ② 过滤       状态白名单：仅 SUCCESS(3) / DEPRECATED(5) 参与问答（排除处理中/失败/过期）
+  ├─ ③ 过滤       状态白名单：仅 SUCCESS(3) / DEPRECATED(5) 参与问答（排除处理中/失败/过期）
   │       · 懒标记过期：chat 开头将 TTL 到期的旧版本标记为 EXPIRED(6) 并过滤
   │       · 同名多版本只保留版本号最高的检索结果（新版优先，防止新旧混召）
   │
-  ├─ ③ 取回文本   按 chunk_id 从 MySQL 回查完整 chunk 内容
+  ├─ ④ 取回文本   按 chunk_id 从 MySQL 回查完整 chunk 内容
   │
-  ├─ ④ Rerank 精排 百炼 gte-rerank 对 "问题 vs 候选" 逐对打分，
+  ├─ ⑤ Rerank 精排 百炼 gte-rerank 对 "问题 vs 候选" 逐对打分，
   │       按相关性降序取 topN=5（失败自动降级为向量排序）
   │
-  ├─ ⑤ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
+  ├─ ⑥ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
   │
-  ├─ ⑥ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  ├─ ⑦ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  │       · 流式（默认 stream=true）：SSE（text/event-stream）逐 token 输出，降低首字延迟
+  │       · 同步（stream=false）：一次性返回完整 JSON
   │       · 熔断降级：调用异常/超时或 Sentinel 熔断（资源 ai-chat）→ 返回「AI服务暂时不可用，请稍后再试」
   │
-  └─ ⑦ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
+  └─ ⑧ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
 ```
 
 **检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
 
-**返回结构**：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
-前端可将 `sources` 渲染为可下载/可跳转的引用来源。
-AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）。
+**返回结构**：
+- 流式（默认）：SSE 事件序列——`{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"sources","sources":[...]}`（生成完毕下发候选，前端按回答实际引用的 [来源N] 过滤展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
+- 同步（`stream=false`）：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
+- 前端将 `sources` 渲染为可点击高亮/可下载的引用来源（`.source-ref` 标签与来源列表编号对应）；AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）
 
 ### 3. 文档删除
 
@@ -485,6 +499,7 @@ AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
 | `spring.datasource.pool.*` | HikariCP 连接池（maximum-pool-size=10、minimum-idle=2、连接/空闲/存活超时等） |
 | `spring.task.embedding.*` | 摄取异步任务线程池（core=2/max=4/queue=50/命名 rag-embedding-N/优雅停机等待） |
+| `spring.data.redis.*` | Redis 多轮对话记忆（`RedisChatMemory`：host/port、db 0、Lettuce 连接池；key 前缀 `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天；与用户服务/网关共用同一实例） |
 | `spring.servlet.multipart.*` | 上传大小限制（50MB） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 | `spring.cloud.sentinel.*` | Sentinel transport（Dashboard 上报，`eager` 启动即注册，可选） |
@@ -549,7 +564,7 @@ cd docker
 docker-compose up -d
 ```
 
-会启动：Milvus 2.6.0（+ etcd / MinIO / Attu）、doc-minio（9002/9003，bucket `knowledge-documents` 自动创建）、Redis（6379）、**Nacos（8848/9848，注册中心 + 配置中心）**、Sentinel Dashboard（8858）。
+会启动：Milvus 2.6.0（+ etcd / MinIO / Attu）、doc-minio（9002/9003，bucket `knowledge-documents` 自动创建）、Redis（6379，网关 Token 黑名单 / 用户服务刷新令牌 / **RAG 多轮对话记忆**共用）、**Nacos（8848/9848，注册中心 + 配置中心）**、Sentinel Dashboard（8858）。
 
 > 若只想启动部分服务：`docker compose up -d nacos redis standalone` 等按需指定服务名。
 
@@ -695,7 +710,7 @@ npm run build        # 生产构建，产物在 dist/
 | POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
-| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId"}`，返回 answer + sources 来源列表） |
+| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`delta`/`sources`/`done`/`error` 事件；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆） |
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
 | GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤，含 statusText/version/进度等） |
@@ -733,3 +748,5 @@ npm run build        # 生产构建，产物在 dist/
 16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。前端已前后端分离（独立 Vue 3 工程 `spring-ai-web/`，Vite 构建，经 Nginx 同源代理 `/api` 或直连网关走 CORS），接口统一走 7070。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
+19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文不落库**（避免污染记忆）。前端用 `crypto.randomUUID()` 生成会话 ID（localStorage 简单保存 `chatSessionId`），换账号登录由后端 userId 维度自动隔离，「清空对话」即更换新 ID，天然支持多会话隔离。
+20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步链路复用同一 `retrieveContext` 检索逻辑）。来源列表在生成完毕后随 `sources` 事件下发，前端按回答实际引用的 `[来源N]` 过滤展示，流式模式下也能保证溯源精准。

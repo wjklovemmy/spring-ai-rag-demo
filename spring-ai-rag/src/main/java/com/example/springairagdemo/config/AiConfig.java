@@ -4,11 +4,16 @@ import com.alibaba.csp.sentinel.slots.block.RuleConstant;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRule;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRuleManager;
 import com.example.springairagdemo.embedding.DashScopeEmbeddingModel;
+import com.example.springairagdemo.tools.KbQueryTools;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.tool.ToolCallbackProvider;
+import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -35,9 +40,26 @@ public class AiConfig {
      * 显式使用 DeepSeek 的 ChatModel 创建 ChatClient，
      * 避免因多 ChatModel Bean 导致歧义
      */
+    /**
+     * 注册知识库查询工具集（KbQueryTools）为 ToolCallbackProvider：
+     * 模型可自主调用工具查询 MySQL（文档清单、文件名搜索等），
+     * 解决"知识库中有哪些文档"等纯向量检索无法回答的枚举类问题。
+     * 请求级上下文（knowledgeBaseId/userId）由 Service 层经 prompt.toolContext() 注入。
+     */
     @Bean
-    public ChatClient chatClient(@Qualifier("deepSeekChatModel") ChatModel chatModel) {
-        return ChatClient.builder(chatModel).build();
+    public ToolCallbackProvider kbQueryToolCallbacks(KbQueryTools tools) {
+        return MethodToolCallbackProvider.builder().toolObjects(tools).build();
+    }
+
+    @Bean
+    public ChatClient chatClient(@Qualifier("deepSeekChatModel") ChatModel chatModel, ChatMemory chatMemory,
+                                 ToolCallbackProvider toolCallbackProvider) {
+        // 挂载多轮对话记忆 Advisor：按会话 ID（chat_memory_conversation_id）存取历史消息，
+        // 历史中的 user/assistant 消息自动注入 prompt；检索上下文（system 消息）不进记忆
+        return ChatClient.builder(chatModel)
+                .defaultAdvisors(MessageChatMemoryAdvisor.builder(chatMemory).build())
+                .defaultToolCallbacks(toolCallbackProvider)
+                .build();
     }
 
     /**

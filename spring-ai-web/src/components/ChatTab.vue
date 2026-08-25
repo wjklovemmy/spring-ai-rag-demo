@@ -48,6 +48,9 @@
         <button class="btn btn-primary" @click="ask" :disabled="asking">
           {{ asking ? '生成中…' : '发送' }}
         </button>
+        <button class="btn btn-outline btn-sm" @click="resetSession" :disabled="asking || messages.length === 0" title="清空当前会话的对话历史">
+          清空对话
+        </button>
       </div>
     </div>
 
@@ -81,13 +84,44 @@ const chatBox = ref(null)
 const asking = ref(false)
 // 回答方式：默认流式（SSE），关闭后走一次性 JSON；localStorage 记忆用户偏好
 const streamMode = ref(localStorage.getItem('chatStreamMode') !== '0')
+// 会话 ID：多轮对话记忆的 key，刷新页面保持同一会话；清空对话时更换新 ID
+// 后端按 userId 隔离记忆（key = rag:chat:memory:{userId}:{sessionId}），
+// 前端仅保存随机的会话 ID，换账号登录由后端 userId 维度自动隔离
+const sessionId = ref(localStorage.getItem('chatSessionId') || genSessionId())
 // 来源高亮定位：点击回答中 [来源N] 后，对应来源条目临时高亮并滚动到可视区
 const hlMsgIdx = ref(-1)
 const hlSourceIdx = ref(-1)
 
+function genSessionId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID()
+  return 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10)
+}
+
 function toggleStreamMode(v) {
   streamMode.value = v
   localStorage.setItem('chatStreamMode', v ? '1' : '0')
+}
+
+/**
+ * 清空对话：先通知后端删除该会话的多轮记忆（Redis key），
+ * 再更换会话 ID（后端按 ID 隔离历史）+ 清空本地消息。
+ * 删除失败不阻塞（TTL 7 天会自动过期兜底）。
+ */
+async function resetSession() {
+  try {
+    await fetchApi('/api/knowledge-document/chat/clear-memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionId: sessionId.value })
+    })
+  } catch (e) {
+    console.warn('清除会话记忆失败（TTL 会自动兜底过期）', e)
+  }
+  const id = genSessionId()
+  sessionId.value = id
+  localStorage.setItem('chatSessionId', id)
+  messages.value = []
+  nextTick(scroll)
 }
 
 /** 将回答文本按 [来源N] 拆分为 文本/引用 片段，供模板高亮渲染 */
@@ -158,7 +192,7 @@ async function ask() {
     const res = await fetchApi('/api/knowledge-document/chat', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question: q, knowledgeBaseId: Number(kbId.value), stream: streamMode.value })
+      body: JSON.stringify({ question: q, knowledgeBaseId: Number(kbId.value), stream: streamMode.value, sessionId: sessionId.value })
     })
     const ct = (res.headers.get('content-type') || '').toLowerCase()
     if (!ct.includes('text/event-stream')) {

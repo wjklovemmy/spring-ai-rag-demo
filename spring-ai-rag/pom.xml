@@ -68,6 +68,16 @@
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
         </dependency>
+        <!-- Redis：多轮对话记忆（ChatMemory）持久化，与用户服务/网关共用同一实例 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
+        </dependency>
+        <!-- Lettuce 连接池（配合 spring.data.redis.lettuce.pool 配置；与 spring-ai-user 一致） -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-pool2</artifactId>
+        </dependency>
 
         <!-- ==================== AI / 向量 / 解析（RAG 专用） ==================== -->
         <dependency>
