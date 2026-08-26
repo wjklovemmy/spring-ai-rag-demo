@@ -16,6 +16,7 @@
   - [2. 知识问答（Q&A）](#2-知识问答qa)
   - [3. 文档删除](#3-文档删除)
   - [4. 用户认证与授权（JWT + RBAC）](#4-用户认证与授权jwt--rbac)
+  - [5. 聊天会话管理](#5-聊天会话管理)
 - [数据库设计](#数据库设计)
 - [配置说明](#配置说明)
 - [快速开始](#快速开始)
@@ -176,7 +177,8 @@ spring-ai-rag-demo/
 │       ├── controller/
 │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
 │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载/清空记忆
-│       │   ├── ChatSessionController.java     # 聊天会话管理（创建/列表/消息/删除）
+│       │   ├── ChatSessionController.java     # 聊天会话管理（创建/列表/消息/删除，历史消息引用来源回补）
+│       │   ├── AgentTaskController.java       # Agent 任务可观测性（列表/详情含步骤轨迹）
 │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
 │       ├── security/                          # 防越权 + 本地身份上下文
 │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
@@ -195,8 +197,10 @@ spring-ai-rag-demo/
 │       │   ├── DocumentStatus.java            # 文档状态枚举（0上传中~6已过期）
 │       │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
 │       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
-│       │   └── KbAccessLogEntity.java         # 访问审计日志
-│       │   └── ChatSessionEntity.java         # 聊天会话元数据（标题/关联知识库/时间）
+│       │   ├── KbAccessLogEntity.java         # 访问审计日志
+│       │   ├── ChatSessionEntity.java         # 聊天会话元数据（标题/关联知识库/时间）
+│       │   ├── AgentTaskEntity.java           # Agent 任务（一次提问的执行审计单元）
+│       │   └── AgentTaskStepEntity.java       # Agent 任务步骤（工具调用轨迹）
 │       ├── mapper/                            # MyBatis-Plus Mapper（业务表，含 ChatSessionMapper）
 │       ├── parser/
 │       │   ├── DocumentParser.java            # 解析接口
@@ -206,11 +210,12 @@ spring-ai-rag-demo/
 │       ├── memory/
 │       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库）
 │       ├── tools/
-│       │   └── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments）
+│       │   └── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments）+ 显式文档解析（问题点名文档时限定召回）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
 │       └── service/
+│           ├── AgentTaskService.java             # Agent 任务/步骤落库 + 按会话回补引用来源快照
 │           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（流式/同步 + 多轮记忆，抽象类）
 │           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
 │           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
@@ -351,6 +356,11 @@ spring-ai-rag-demo/
   ├─ ② 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
   │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
   │       · rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
+  │       · 显式文档限定：问题点名某份文档（带扩展名完整文件名 / 书名号）时，先用 Milvus filter
+  │         把召回限定在目标文档内（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索），
+  │         从源头杜绝名称相近文档（如"纯图片产品说明书_扫描件.pdf"）的 chunk 混入引用来源
+  │       · 多轮指代：当轮未点名但含指代/续问词（如"上面的问题再查一遍"）时，回看会话记忆
+  │         中最近一轮用户问题，沿用其显式文档限定，避免检索退化为全库召回
   │
   ├─ ③ 过滤       状态白名单：仅 SUCCESS(3) / DEPRECATED(5) 参与问答（排除处理中/失败/过期）
   │       · 懒标记过期：chat 开头将 TTL 到期的旧版本标记为 EXPIRED(6) 并过滤
@@ -366,21 +376,28 @@ spring-ai-rag-demo/
   ├─ ⑦ 工具调用   （可选，信号驱动）若检索为空，改用"空上下文系统提示词"引导模型自主决定：
   │       涉及文档清单/文件搜索等结构化信息时调用 KbQueryTools（listDocuments / searchDocuments），
   │       userId/kbId 经 ToolContext 注入，回调线程内显式校验 VIEWER 权限；
-  │       新增查询类型只需加 @Tool 方法，无需穷举关键词
+  │       新增查询类型只需加 @Tool 方法，无需穷举关键词；
+  │       回答核心信息来自工具结果时，提示词要求在末尾统一标注相关检索片段
+  │       （"以上内容详见[来源1][来源2][来源3]"）
   │
   ├─ ⑧ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
   │       · 流式（默认 stream=true）：SSE（text/event-stream）逐 token 输出，降低首字延迟
   │       · 同步（stream=false）：一次性返回完整 JSON
   │       · 熔断降级：调用异常/超时或 Sentinel 熔断（资源 ai-chat）→ 返回「AI服务暂时不可用，请稍后再试」
+  │       · 综合引用：多相关片段须分别标注 [来源1][来源2][来源3]，禁止只引其一
   │
-  └─ ⑨ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
+  └─ ⑨ 来源溯源   返回检索/精排后的全部候选来源列表（不再按回答中的 [来源N] 过滤，避免漏显）；
+        引用编号经 alignCitations 对齐校验（逐字引用片段与来源内容匹配，纠正张冠李戴）；
+        历史消息回显时从 agent_task 引用来源快照回补
 ```
 
 **检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
 
+**显式文档限定**：问题明确点名文档（"xx.pdf 里写了什么"）时，先经 `resolveExplicitDocuments`（带扩展名完整文件名 / 书名号归一化四级匹配）定位目标文档，用 Milvus filter 把召回限制在目标文档内——杜绝名称相近文档的 chunk 因关键词命中（如"说明书"）混入引用来源；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题，沿用其显式文档限定（`resolveExplicitDocumentsWithHistory`）。
+
 **返回结构**：
-- 流式（默认）：SSE 事件序列——`{"type":"tool","name":...,"status":"running|done|error","args":...,"result":...}`（模型自主调用工具的过程，先于内容下发）→ `{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"final","content":...}`（引用对齐校验后的最终全文，前端覆盖显示）→ `{"type":"sources","sources":[...]}`（生成完毕下发候选，前端按回答实际引用的 [来源N] 过滤展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
-- 同步（`stream=false`）：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
+- 流式（默认）：SSE 事件序列——`{"type":"tool","name":...,"status":"running|done|error","args":...,"result":...}`（模型自主调用工具的过程，先于内容下发）→ `{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"final","content":...}`（引用对齐校验后的最终全文，前端覆盖显示）→ `{"type":"sources","sources":[...]}`（生成完毕下发**全部候选**来源，前端全量展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
+- 同步（`stream=false`）：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`（sources 同样为全部候选）
 - 前端将 `sources` 渲染为可点击高亮/可下载的引用来源（`.source-ref` 标签与来源列表编号对应）；AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）
 
 ### 3. 文档删除
@@ -469,7 +486,7 @@ spring-ai-rag-demo/
 |------|------|
 | `POST /api/chat-session/create` | 创建会话（可选绑定 `knowledgeBaseId`），返回后端生成的 `sessionId` |
 | `GET /api/chat-session/list` | 当前用户会话列表（按最近更新倒序） |
-| `GET /api/chat-session/{sessionId}/messages` | 拉取指定会话历史消息（Redis 记忆，归属校验：仅本人会话） |
+| `GET /api/chat-session/{sessionId}/messages` | 拉取指定会话历史消息（Redis 记忆 + 引用来源回补，归属校验：仅本人会话） |
 | `DELETE /api/chat-session/{sessionId}` | 删除会话：删 MySQL 元数据 + Redis 记忆（联动清除） |
 
 - **元数据与消息分离**：`chat_session` 表（MySQL）只存会话标题/关联知识库/时间，消息历史仍在 Redis（`rag:chat:memory:{userId}:{sessionId}`），两者按 `sessionId` 关联；
@@ -781,11 +798,11 @@ npm run build        # 生产构建，产物在 dist/
 1. **异步任务 + 增量执行**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，`processTaskAsync` 在线程池执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。文档处理流水线经 `processTaskAsync` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
-4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。
+4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。
 5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
 6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
 7. **标题感知注入**：识别数字/中文序数/无序号标题行构建标题链，将所属标题以 `【标题链】正文` 前缀注入 chunk 文本（参与向量化，孤立 chunk 也有上下文）并写 `metadata.heading` 供溯源。
-8. **来源溯源**：回答中标注 `[来源n]` 并返回引用列表，LLM 未实际引用的来源会被过滤，保证溯源精准。
+8. **来源溯源（全量返回 + 综合引用引导）**：回答中标注 `[来源n]` 并返回引用列表；引用列表返回**全部候选来源**（不再按回答中的 `[来源N]` 过滤，避免模型漏标导致来源不显示）；系统提示引导"综合引用"——多相关片段分别标注 `[来源1][来源2][来源3]`，工具结果回答末尾统一标注（"以上内容详见[来源1][来源2][来源3]"）；引用编号经 `alignCitations` 对齐校验（逐字引用片段与来源内容包含匹配，纠正张冠李戴，无法判定则保守保留）。
 9. **三存储独立容错**：删除文档时 MySQL/MinIO/Milvus 各自独立处理，单个失败不阻断整体。
 10. **显式 Bean 限定**：多模型场景下用 `@Qualifier` 明确 Chat 与 Embedding 的装配关系。
 11. **纵深防御防越权**：① `@RequireKbRole` AOP 注解拦截入口；② Service 层 `assertRole` 守卫核心业务（含对象级——先查文档所属知识库再校验）；③ 列表/下拉强制按可见知识库集合过滤。三层任一独立可拦截越权。
@@ -797,6 +814,7 @@ npm run build        # 生产构建，产物在 dist/
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
 19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。
-20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步链路复用同一 `retrieveContext` 检索逻辑）。来源列表在生成完毕后随 `sources` 事件下发，前端按回答实际引用的 `[来源N]` 过滤展示，流式模式下也能保证溯源精准。
+20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步链路复用同一 `retrieveContext` 检索逻辑）。来源列表在生成完毕后随 `sources` 事件下发（**全部候选**），前端全量展示，流式/同步/历史回显（agent_task 快照回补）三种场景下引用来源一致、不漏显。
 21. **工具调用（Function Calling）替代关键词穷举**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments`），由模型自主决定是否调用——**信号驱动而非预判**：仅当检索为空时用"空上下文系统提示词"引导模型考虑调工具，新增查询类型只需增加 `@Tool` 方法，零枚举零维护。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
 22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。
+23. **Agent 可观测性（执行轨迹 + 引用来源快照）**：一次提问 = 一条 `agent_task`（question/answer/prompt/model/token 用量/耗时/状态），工具调用每步落一条 `agent_task_step`（工具名/状态/入参/结果/耗时）；同步、流式与熔断降级链路均落库，落库失败不阻塞问答仅告警。引用来源 JSON 快照进 `agent_task.sources`——Redis 记忆只存纯文本，`GET /api/chat-session/{sessionId}/messages` 据此按序回补历史消息的 sources，刷新页面引用来源不丢失。前端「Agent 轨迹」页（`AgentTasksTab.vue` / `AgentTaskDetailModal.vue`）按任务维度查看执行过程与引用来源。
