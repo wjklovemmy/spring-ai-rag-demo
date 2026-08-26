@@ -177,6 +177,26 @@ CREATE TABLE IF NOT EXISTS `kb_access_log` (
     KEY `idx_user` (`user_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识库安全审计日志';
 
+-- ============================================================
+-- 聊天会话（多轮对话会话管理）
+-- 说明：
+--   1. session_id 由后端生成（UUID），作为 Redis 记忆 key 的后缀
+--      （rag:chat:memory:{userId}:{sessionId}），与 KnowledgeDocumentService 拼装规则一致
+--   2. 消息历史仍存 Redis（ChatMemory，TTL 7 天）；本表仅存会话元数据
+--      （标题 / 关联知识库 / 时间），支撑前端会话列表、切换、删除
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `chat_session` (
+    `id`                BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `user_id`           BIGINT      NOT NULL COMMENT '所属用户 ID',
+    `session_id`        VARCHAR(64) NOT NULL COMMENT '会话标识（后端生成 UUID，Redis 记忆 key 后缀）',
+    `title`             VARCHAR(100) DEFAULT '' COMMENT '会话标题（取首个问题截断）',
+    `knowledge_base_id` BIGINT      DEFAULT NULL COMMENT '会话关联知识库 ID',
+    `create_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    UNIQUE KEY `uk_user_session` (`user_id`, `session_id`),
+    KEY `idx_user_update` (`user_id`, `update_time`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='聊天会话';
+
 -- 内置 ADMIN 角色 / 权限种子 / admin 管理员账号及其绑定关系，
 -- 已全部迁移至用户域独立库脚本 sql/user.sql（应用启动时 UserDataInitializer 也会自动补齐）。
 

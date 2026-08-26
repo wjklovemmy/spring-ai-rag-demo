@@ -1,9 +1,13 @@
 package com.example.springairagdemo.tools;
 
+import com.example.springairagdemo.config.RagConfigProperties;
 import com.example.springairagdemo.entity.DocumentStatus;
+import com.example.springairagdemo.entity.KnowledgeChunkEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
+import com.example.springairagdemo.parser.HeadingExtractor;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.service.KbAuthorizationService;
+import com.example.springairagdemo.service.KnowledgeChunkEntityService;
 import com.example.springairagdemo.service.KnowledgeDocumentEntityService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -16,8 +20,11 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * 知识库查询工具集（Spring AI Tool Calling / Function Calling）。
@@ -42,7 +49,21 @@ public class KbQueryTools {
     public static final String USER_ID_KEY = "userId";
 
     private final KnowledgeDocumentEntityService knowledgeDocumentEntityService;
+    private final KnowledgeChunkEntityService knowledgeChunkEntityService;
     private final KbAuthorizationService kbAuthorizationService;
+    private final HeadingExtractor headingExtractor;
+    private final RagConfigProperties config;
+
+    /** 标题链前缀模式：摄取时按 prefixTemplate 【{heading}】注入每个 chunk 文本开头 */
+    private static final Pattern HEADING_PREFIX = Pattern.compile("^【([^】]+)】");
+    /** 单份文档大纲标题数量上限，避免超大文档撑爆上下文 */
+    private static final int OUTLINE_LIMIT = 200;
+    /** 带编号的章节标题模式（数字序号 / 中文数字序数 / 第X章 / （一）），用于过滤封面标题、页眉等无编号标题 */
+    private static final Pattern NUMBERED_HEADING = Pattern.compile(
+            "\\d+(?:\\.\\d+)*\\s*[.、．:：]"
+                    + "|[一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+\\s*[.、．:：]"
+                    + "|第[一二三四五六七八九十百千万\\d]+[章节篇部部分条]"
+                    + "|[（(][一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+[)）]");
 
     /**
      * 列出当前知识库中收录的所有活跃文档（文件名、版本号、内容片段数）。
@@ -86,6 +107,115 @@ public class KbQueryTools {
                     : "未找到文件名包含“" + kw + "”的文档";
         }
         return formatInventory(matched);
+    }
+
+    /**
+     * 查询文档的完整标题大纲（章节/小节结构）。
+     *
+     * <p>标题数据来源：摄取时每个 chunk 文本都按 prefixTemplate 注入了【标题链】前缀，
+     * 因此按页面/序号顺序扫描全量 chunk、提取前缀即可还原文档大纲，无需额外存储、无需重新摄取。
+     */
+    @Tool(description = "查询指定文档的完整标题大纲（章节/小节结构），返回文档包含的标题清单与总数。"
+            + "当用户询问某文档包含几部分/几章/几个小节/哪些章节、文档结构、目录大纲等问题时，必须调用本工具。"
+            + "可传入文档名关键词定位文档；省略时返回当前知识库全部活跃文档的大纲。")
+    public String documentOutline(
+            @ToolParam(description = "文档名关键词，例如软件或说明书；省略则查询当前知识库全部文档") String keyword,
+            ToolContext toolContext) {
+        Long kbId = requireKbId(toolContext);
+        if (kbId == null) {
+            return "当前未指定知识库，无法查询文档大纲";
+        }
+        if (!canView(toolContext, kbId)) {
+            return "无权访问该知识库";
+        }
+        String kw = keyword == null ? "" : keyword.trim();
+        List<KnowledgeDocumentEntity> docs = activeDocuments(kbId);
+        if (docs.isEmpty()) {
+            return "当前知识库中暂无文档";
+        }
+        if (!kw.isEmpty()) {
+            docs = docs.stream()
+                    .filter(d -> d.getFileName() != null
+                            && d.getFileName().toLowerCase().contains(kw.toLowerCase()))
+                    .toList();
+            if (docs.isEmpty()) {
+                return "未找到文件名包含“" + kw + "”的文档";
+            }
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (KnowledgeDocumentEntity doc : docs) {
+            sb.append(buildOutline(doc)).append(System.lineSeparator());
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 构建单份文档的标题大纲文本：按页码/序号扫描全部 chunk，双通道提取标题——
+     * ①【标题链】前缀（摄取时注入）；②正文逐行识别（复用 HeadingExtractor 规则，
+     * 覆盖"标题链未注入前缀"的场景，如每页页眉占位导致所有 chunk 只挂根标题）。
+     * <p>
+     * 输出规则：若识别到带编号的章节标题（"一、""1.1""第一章"等），则过滤掉无编号标题
+     * （多为文档封面标题、页眉等，如文档名/副标题），大纲直接逐行列出标题文本，不带序号。
+     */
+    private String buildOutline(KnowledgeDocumentEntity doc) {
+        List<KnowledgeChunkEntity> chunks = knowledgeChunkEntityService.lambdaQuery()
+                .eq(KnowledgeChunkEntity::getDocumentId, doc.getId())
+                .orderByAsc(KnowledgeChunkEntity::getPageNo)
+                .orderByAsc(KnowledgeChunkEntity::getChunkIndex)
+                .list();
+
+        RagConfigProperties.Heading headingCfg = config.getDocument().getChunk().getHeading();
+
+        // 保持首次出现顺序去重（同一标题会出现在其下多个 chunk 中）
+        LinkedHashSet<String> headings = new LinkedHashSet<>();
+        for (KnowledgeChunkEntity chunk : chunks) {
+            if (chunk.getContent() == null) continue;
+            String content = chunk.getContent();
+            // 通道①：剥离【标题链】前缀，提取前缀标题；前缀不属于正文，剥离后避免重复识别
+            Matcher m = HEADING_PREFIX.matcher(content);
+            if (m.find()) {
+                headings.add(m.group(1).trim());
+                content = content.substring(m.end());
+            }
+            // 通道②：正文逐行识别标题行（与摄取时同一套启发式规则）
+            if (headingCfg.isEnabled()) {
+                for (HeadingExtractor.HeadingLine h : headingExtractor.extract(content, headingCfg)) {
+                    headings.add(h.title().trim());
+                }
+            }
+            if (headings.size() >= OUTLINE_LIMIT) break;
+        }
+
+        // 存在带编号的章节标题时，过滤掉无编号标题（封面标题/页眉等，如文档名、副标题）；
+        // 整篇文档都无编号时（纯无序号版式）则全部保留作为大纲
+        List<String> outline;
+        boolean hasNumbered = headings.stream().anyMatch(this::isNumberedHeading);
+        if (hasNumbered) {
+            outline = headings.stream().filter(this::isNumberedHeading).toList();
+        } else {
+            outline = new ArrayList<>(headings);
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("《").append(doc.getFileName()).append("》");
+        if (outline.isEmpty()) {
+            sb.append("：未识别到标题结构（可能为无标题版式文档）");
+            return sb.toString();
+        }
+        sb.append("共 ").append(outline.size()).append(" 个标题：").append(System.lineSeparator());
+        for (String h : outline) {
+            sb.append(h).append(System.lineSeparator());
+        }
+        if (outline.size() >= OUTLINE_LIMIT) {
+            sb.append("（标题较多，仅列出前 ").append(OUTLINE_LIMIT).append(" 个）");
+        }
+        return sb.toString();
+    }
+
+    /** 标题文本是否带编号（数字序号 / 中文数字序数 / 第X章 / （一）），用于大纲过滤无编号封面/页眉标题 */
+    private boolean isNumberedHeading(String title) {
+        return title != null && NUMBERED_HEADING.matcher(title).find();
     }
 
     /**

@@ -18,6 +18,8 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li>数字序号标题：{@code 1. 概述}、{@code 3.2.1 考勤}，深度 = 序号层级；</li>
  *   <li>中文序数标题：{@code 第一章}、{@code 第三节}、{@code 第五条}，深度 = 1/2/3；</li>
+ *   <li>中文数字序数标题：{@code 一、项目概述}、{@code 十一、系统优化方向}、{@code （一）xxx}，
+ *       须带顿号/点/冒号等分隔符或括号（避免"三十而已"这类无分隔符词组误报），深度 = 1/2；</li>
  *   <li>无序号短句标题（如 "公司考勤管理办法"）：需包含中文字符、不含标点、长度适中，深度取当前栈顶 + 1。</li>
  * </ol>
  */
@@ -30,6 +32,12 @@ public class HeadingExtractor {
     /** 中文序数：第一章/篇/部分/节/条 */
     private static final Pattern CN_NUM_PATTERN = Pattern.compile(
             "^\\s*第([一二三四五六七八九十百千万\\d]+)([章节篇部部分条])");
+    /** 中文数字序数：一、 十一、 贰、 等，后跟 顿号/点/冒号 分隔符 + 标题文本（如 "一、项目概述"） */
+    private static final Pattern CN_ORDINAL_PATTERN = Pattern.compile(
+            "^\\s*([一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)\\s*[、.．:：]\\s*(.+)");
+    /** 括号中文数字序数：（一）（十一） 等，后跟标题文本（如 "（一）项目概述"） */
+    private static final Pattern CN_PAREN_PATTERN = Pattern.compile(
+            "^\\s*[（(]([一二三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)[)）]\\s*(.+)");
     /** 行尾标点：出现这些结尾说明更像正文句子而非标题 */
     private static final Pattern EOL_PUNCT = Pattern.compile("[。！？；，、,.;:!?]$");
     /** 标题链分隔符 */
@@ -113,6 +121,17 @@ public class HeadingExtractor {
                 default -> 1; // 章/篇/部/部分
             };
             return Math.min(base, cfg.getMaxDepth());
+        }
+
+        // 中文数字序数："一、项目概述""十一、系统优化方向"等。必须带分隔符/括号，
+        // 避免 "三十而已""一心一意" 这类无分隔符词组误报；".+)" 要求后面还有标题文本，排除孤立的 "一、"
+        Matcher ordinal = CN_ORDINAL_PATTERN.matcher(line);
+        if (ordinal.find()) {
+            return Math.min(1, cfg.getMaxDepth());
+        }
+        Matcher paren = CN_PAREN_PATTERN.matcher(line);
+        if (paren.find()) {
+            return Math.min(2, cfg.getMaxDepth());
         }
 
         // 无序号标题：包含中文字符、不含标点、非纯数字英文

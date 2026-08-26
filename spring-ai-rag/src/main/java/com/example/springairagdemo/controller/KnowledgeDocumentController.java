@@ -280,6 +280,7 @@ public class KnowledgeDocumentController {
      * <p>事件流格式（data 为 JSON 对象）：
      * <ul>
      *   <li>{@code {"type":"delta","content":"..."}} — 增量文本（逐 token）</li>
+     *   <li>{@code {"type":"final","content":"..."}} — 引用对齐校验后的最终全文（覆盖显示，强制纠正编号）</li>
      *   <li>{@code {"type":"sources","sources":[...]}} — 完整引用来源（结束前发送）</li>
      *   <li>{@code {"type":"done"}} — 流结束标记</li>
      *   <li>{@code {"type":"error","message":"..."}} — 参数错误 / 降级提示</li>
@@ -390,9 +391,12 @@ public class KnowledgeDocumentController {
             return src;
         }).toList();
 
-        // SSE 事件流：先逐 token 输出增量文本，最后携带引用来源与结束标记
+        // SSE 事件流：先逐 token 输出增量文本，再下发引用对齐校验后的最终全文
+        // （final：强制纠正 [来源N] 编号张冠李戴，前端覆盖显示），最后携带引用来源与结束标记
         Flux<ServerSentEvent<Map<String, Object>>> flux = chatResult.stream()
                 .map(delta -> sseEvent(Map.<String, Object>of("type", "delta", "content", delta)))
+                .concatWith(chatResult.correctedAnswer()
+                        .map(a -> sseEvent(Map.<String, Object>of("type", "final", "content", a))))
                 .concatWith(Flux.just(
                         sseEvent(Map.<String, Object>of("type", "sources", "sources", sources)),
                         sseEvent(Map.<String, Object>of("type", "done"))));

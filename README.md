@@ -29,14 +29,15 @@
 | 分类 | 技术 | 说明 |
 |------|------|------|
 | 框架 | Spring Boot 4.0.7 | 应用基础框架（Java 17） |
-| AI 框架 | Spring AI 2.0.0 | 统一抽象 Chat / Embedding / VectorStore |
+| AI 框架 | Spring AI 2.0.0 | 统一抽象 Chat / Embedding / VectorStore / Tool Calling |
 | 对话模型 | DeepSeek `deepseek-chat` | 问答生成模型 |
+| 工具调用 | Spring AI Tool Calling（`@Tool` / `MethodToolCallbackProvider`） | 文档清单/文件搜索等结构化查询注册为模型可自主调用的工具（`KbQueryTools`），替代关键词穷举兜底 |
 | 向量模型 | DashScope `text-embedding-v3`（1024 维） | 文本向量化（自研 `DashScopeEmbeddingModel`） |
 | 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（同时支持本地磁盘模式） |
-| 会话记忆 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池） | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{会话ID}` 存取、用户隔离，TTL 7 天）；与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
+| 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
@@ -79,15 +80,17 @@ graph TB
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
-        CHAT["ChatClient<br/>deepseek-chat<br/>+ MessageChatMemoryAdvisor"]
+        CHAT["ChatClient<br/>deepseek-chat<br/>+ MessageChatMemoryAdvisor<br/>+ Tool Callbacks"]
+        TOOLS["KbQueryTools<br/>@Tool 文档清单/文件搜索"]
+        SESSION["ChatSessionService<br/>会话列表/切换/删除"]
         MEM["RedisChatMemory<br/>ChatMemory 多轮记忆"]
     end
 
     subgraph Storage["存储层"]
-        MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member<br/>用户域: RBAC 五表")]
+        MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member/chat_session<br/>用户域: RBAC 五表")]
         MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
         MINIO[("MinIO<br/>原始 PDF 文件")]
-        REDIS[("Redis<br/>对话记忆 rag:chat:memory:{userId}:*<br/>TTL 7 天")]
+        REDIS[("Redis<br/>对话记忆 rag:chat:memory:{userId}:{sessionId}<br/>TTL 7 天")]
     end
 
     subgraph Registry["注册中心 / 配置中心"]
@@ -119,6 +122,10 @@ graph TB
     EMBED --> MILVUS
     SVC --> CHAT --> AI
     CHAT --> MEM --> REDIS
+    CHAT -.工具回调.-> TOOLS --> MYSQL
+    SESSION --> MYSQL
+    SESSION -.读/删记忆.-> MEM
+    CTRL --> SESSION
     MILVUS --> SVC
     SVC --> RERANK --> DS
     RERANK --> SVC
@@ -155,7 +162,7 @@ spring-ai-rag-demo/
 │   └── src/main/java/com/example/springairagdemo/
 │       ├── SpringAiRagDemoApplication.java # @SpringBootApplication(仅扫描本模块)
 │       ├── config/
-│       │   ├── AiConfig.java                  # ChatClient / 模型装配 + MessageChatMemoryAdvisor（多轮记忆）+ Sentinel 熔断规则（ai-chat / dashscope-embedding）
+│       │   ├── AiConfig.java                  # ChatClient / 模型装配 + MessageChatMemoryAdvisor（多轮记忆）+ ToolCallbacks（KbQueryTools）+ Sentinel 熔断规则（ai-chat / dashscope-embedding）
 │       │   ├── MilvusConfig.java              # Milvus 客户端
 │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（rerank/hybrid/ocr/storage/chunk 等）
 │       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
@@ -168,7 +175,8 @@ spring-ai-rag-demo/
 │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
 │       ├── controller/
 │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
-│       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载
+│       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载/清空记忆
+│       │   ├── ChatSessionController.java     # 聊天会话管理（创建/列表/消息/删除）
 │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
 │       ├── security/                          # 防越权 + 本地身份上下文
 │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
@@ -188,14 +196,17 @@ spring-ai-rag-demo/
 │       │   ├── KnowledgeEmbeddingTaskStatus.java # 任务状态枚举（0待处理~3失败）
 │       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
 │       │   └── KbAccessLogEntity.java         # 访问审计日志
-│       ├── mapper/                            # MyBatis-Plus Mapper（业务表）
+│       │   └── ChatSessionEntity.java         # 聊天会话元数据（标题/关联知识库/时间）
+│       ├── mapper/                            # MyBatis-Plus Mapper（业务表，含 ChatSessionMapper）
 │       ├── parser/
 │       │   ├── DocumentParser.java            # 解析接口
 │       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
 │       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建
 │       │   └── SemanticSplitter.java          # 语义切片（段落聚类 + 断点）
 │       ├── memory/
-│       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天）
+│       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库）
+│       ├── tools/
+│       │   └── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
@@ -212,6 +223,7 @@ spring-ai-rag-demo/
 │           ├── KnowledgeChunkEntityService.java / impl/
 │           ├── KbAuthorizationService.java        # 权限判定中枢（assertRole/visibleKbIds/授权）
 │           ├── KbMemberService.java / KbAccessLogService.java
+│           ├── ChatSessionService.java / ChatSessionServiceImpl.java # 会话元数据（MySQL）+ 消息联动（创建/列表/消息/删除）
 │           ├── KbMemberDeletionGuard.java         # 删用户前最后所有者保护 + 清理 kb_member
 │           ├── KbAccessLogAuditHandler.java       # 管理操作审计落库 kb_access_log
 │           ├── UserClient.java                    # 远程查用户服务：isAdmin / 用户摘要
@@ -253,7 +265,7 @@ spring-ai-rag-demo/
 │           ├── JwtAuthGlobalFilter.java # 全局认证过滤器（白名单/黑名单/注入用户头）
 │           └── LoggingGlobalFilter.java # 全局访问日志过滤器
 └── sql/
-    ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志）
+    ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志/聊天会话）
     ├── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
     └── mysql-nacos.sql                       # Nacos 3.1.1 官方建表脚本（宿主机 MySQL 初始化 nacos_config 库用）
 ```
@@ -327,12 +339,14 @@ spring-ai-rag-demo/
 `KnowledgeDocumentService.chat(question, knowledgeBaseId, sessionId)`（同步） / `chatStream(...)`（流式，入口先执行 `assertRole(kbId, VIEWER)`，需 VIEWER 及以上）：
 
 ```
-用户问题 + 会话 ID（sessionId：前端 crypto.randomUUID 生成、localStorage 持久化）
+用户问题 + 会话 ID（sessionId 由后端生成：POST /api/chat-session/create，前端存 localStorage；
+            旧版本前端残留的随机 ID 首次问答时自动补建会话记录，平滑接入会话列表）
   │
-  ├─ ① 会话记忆   MessageChatMemoryAdvisor 按会话 ID 从 Redis（key rag:chat:memory:{userId}:{sessionId}，
+  ├─ ① 会话记忆   进入问答先 touchOnChat 落会话元数据（首个问题截断为标题、补 knowledge_base_id）；
+  │       MessageChatMemoryAdvisor 按会话 ID 从 Redis（key rag:chat:memory:{userId}:{sessionId}，
   │       userId 由服务端 UserContext 注入，会话按用户隔离）读取历史（仅 user/assistant 消息，
   │       窗口保护最近 100 条，TTL 7 天）注入 prompt，实现多轮上下文连贯；
-  │       · system 检索上下文不落库（避免污染记忆）；「清空对话」= 前端更换新 sessionId 并清空消息
+  │       · system 检索上下文不落库（避免污染记忆）；「清空对话」= 后端删 Redis 记忆 + 前端清空消息
   │
   ├─ ② 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
   │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
@@ -349,12 +363,17 @@ spring-ai-rag-demo/
   │
   ├─ ⑥ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
   │
-  ├─ ⑦ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  ├─ ⑦ 工具调用   （可选，信号驱动）若检索为空，改用"空上下文系统提示词"引导模型自主决定：
+  │       涉及文档清单/文件搜索等结构化信息时调用 KbQueryTools（listDocuments / searchDocuments），
+  │       userId/kbId 经 ToolContext 注入，回调线程内显式校验 VIEWER 权限；
+  │       新增查询类型只需加 @Tool 方法，无需穷举关键词
+  │
+  ├─ ⑧ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
   │       · 流式（默认 stream=true）：SSE（text/event-stream）逐 token 输出，降低首字延迟
   │       · 同步（stream=false）：一次性返回完整 JSON
   │       · 熔断降级：调用异常/超时或 Sentinel 熔断（资源 ai-chat）→ 返回「AI服务暂时不可用，请稍后再试」
   │
-  └─ ⑧ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
+  └─ ⑨ 来源溯源   从回答中正则提取实际引用的 [来源n]，返回精准来源列表
 ```
 
 **检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
@@ -442,19 +461,38 @@ spring-ai-rag-demo/
 
 ---
 
+### 5. 聊天会话管理
+
+会话由**后端生成 ID**（`POST /api/chat-session/create`，UUID 无横线），前端只负责存取与展示：
+
+| 接口 | 说明 |
+|------|------|
+| `POST /api/chat-session/create` | 创建会话（可选绑定 `knowledgeBaseId`），返回后端生成的 `sessionId` |
+| `GET /api/chat-session/list` | 当前用户会话列表（按最近更新倒序） |
+| `GET /api/chat-session/{sessionId}/messages` | 拉取指定会话历史消息（Redis 记忆，归属校验：仅本人会话） |
+| `DELETE /api/chat-session/{sessionId}` | 删除会话：删 MySQL 元数据 + Redis 记忆（联动清除） |
+
+- **元数据与消息分离**：`chat_session` 表（MySQL）只存会话标题/关联知识库/时间，消息历史仍在 Redis（`rag:chat:memory:{userId}:{sessionId}`），两者按 `sessionId` 关联；
+- **自动补建**：问答入口 `touchOnChat` 发现未知 sessionId（旧版本前端 localStorage 残留）自动补插会话记录，旧数据平滑接入会话列表；
+- **标题自动生成**：会话标题取首个问题的前 30 字（去空白、截断加省略号）；
+- **归属隔离**：列表/消息/删除均按 `UserContext` 的 userId 过滤，只能操作自己的会话；
+- **清空对话**：`POST /api/knowledge-document/chat/clear-memory` 删除 Redis 记忆（会话记录保留，前端更换新 ID 继续提问）。
+
+---
+
 ## 数据库设计
 
 项目采用**双库隔离**（同一 MySQL 实例、不同 schema，分别由两个服务连接）：
 
 | 库 | 归属服务 | 数据源配置 | 内容 |
 |----|---------|-----------|------|
-| `knowledge_base` | RAG 服务 spring-ai-rag（8080） | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志 |
+| `knowledge_base` | RAG 服务 spring-ai-rag（8080） | `spring.datasource.*`（主数据源 @Primary，DataSourceConfig 装配） | 知识库/文档/分块/向量化任务/成员授权/审计日志/聊天会话 |
 | `spring_ai_user` | 用户服务 spring-ai-user（8082） | `spring.datasource.*`（标准主数据源，MyBatis-Plus 自动装配） | RBAC 五表：用户/角色/权限/两级关联 |
 
 另外 **Nacos 配置中心**也使用同一 MySQL 实例中的 `nacos_config` 库存储配置（见 [快速开始](#快速开始) 第 1 步）。
 
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
-- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log`。
+- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session`。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
 - `sql/mysql-nacos.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
@@ -471,6 +509,7 @@ spring-ai-rag-demo/
 | `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status(0待处理/1处理中/2成功/3失败)、total/success/fail_chunk、**parse/split/chunk/embed/milvus_progress（阶段进度 0-100）**、retry_count、error_message、cost_time |
 | `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
+| `chat_session` | 聊天会话元数据 | user_id、session_id(后端 UUID 唯一，`uk_user_session`)、title(首个问题截断 30 字)、knowledge_base_id、create_time/update_time |
 
 **用户域独立库（spring_ai_user）—— RBAC 经典五表**：
 
@@ -710,7 +749,12 @@ npm run build        # 生产构建，产物在 dist/
 | POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
-| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`delta`/`sources`/`done`/`error` 事件；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆） |
+| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`delta`/`final`/`sources`/`done`/`error` 事件，其中 `final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆；检索为空时引导模型调用工具回答文档清单类问题） |
+| POST | `/api/knowledge-document/chat/clear-memory` | 是 | 清空指定会话的 Redis 记忆（body `{sessionId}` 可选，缺省清当前会话；会话记录保留） |
+| POST | `/api/chat-session/create` | 是 | 创建聊天会话（可选 body `{knowledgeBaseId}`），返回后端生成的 `sessionId`/`title` |
+| GET | `/api/chat-session/list` | 是 | 当前用户会话列表（按最近更新倒序） |
+| GET | `/api/chat-session/{sessionId}/messages` | 是 | 拉取指定会话历史消息（仅本人会话，归属校验 404） |
+| DELETE | `/api/chat-session/{sessionId}` | 是 | 删除会话：MySQL 元数据 + Redis 记忆联动清除 |
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
 | GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤，含 statusText/version/进度等） |
@@ -748,5 +792,7 @@ npm run build        # 生产构建，产物在 dist/
 16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。前端已前后端分离（独立 Vue 3 工程 `spring-ai-web/`，Vite 构建，经 Nginx 同源代理 `/api` 或直连网关走 CORS），接口统一走 7070。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
-19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文不落库**（避免污染记忆）。前端用 `crypto.randomUUID()` 生成会话 ID（localStorage 简单保存 `chatSessionId`），换账号登录由后端 userId 维度自动隔离，「清空对话」即更换新 ID，天然支持多会话隔离。
+19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。
 20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步链路复用同一 `retrieveContext` 检索逻辑）。来源列表在生成完毕后随 `sources` 事件下发，前端按回答实际引用的 `[来源N]` 过滤展示，流式模式下也能保证溯源精准。
+21. **工具调用（Function Calling）替代关键词穷举**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments`），由模型自主决定是否调用——**信号驱动而非预判**：仅当检索为空时用"空上下文系统提示词"引导模型考虑调工具，新增查询类型只需增加 `@Tool` 方法，零枚举零维护。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
+22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。

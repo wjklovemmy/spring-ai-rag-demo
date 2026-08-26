@@ -25,6 +25,7 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -90,6 +91,9 @@ public abstract class KnowledgeDocumentService {
 
     @Autowired
     protected ChatMemory chatMemory;
+
+    @Autowired
+    protected ChatSessionService chatSessionService;
 
     /** Sentinel 熔断降级器工厂（spring-cloud-circuitbreaker-sentinel 实现） */
     @Autowired
@@ -905,11 +909,16 @@ public abstract class KnowledgeDocumentService {
      * 流式问答结果：token 增量流 + 完整引用来源
      * <p>流式输出无法在生成前预知回答实际引用了哪些来源，因此来源编号不重排，
      * 直接按检索精排顺序返回全部候选，供前端渲染"引用来源"列表。
+     *
+     * @param stream          逐 token 增量文本流（与 correctedAnswer 共享同一数据源，可先订阅 delta）
+     * @param sources         全部候选来源（编号不重排）
+     * @param correctedAnswer 生成完毕后对完整回答做引用对齐校验（{@link #alignCitations}）后的全文，
+     *                        供前端最终覆盖显示（强制纠正 [来源N] 编号张冠李戴）
      */
-    public record ChatStreamResult(Flux<String> stream, List<SourceInfo> sources) {}
+    public record ChatStreamResult(Flux<String> stream, List<SourceInfo> sources, Mono<String> correctedAnswer) {}
 
     /** 检索上下文：上下文文本 + 完整来源列表（context 为空表示知识库中无可用内容） */
-    private record RetrievalContext(String context, List<SourceInfo> sources) {}
+    private record RetrievalContext(String context, List<SourceInfo> sources, List<String> fullContents) {}
 
     /**
      * 引用来源信息
@@ -926,6 +935,8 @@ public abstract class KnowledgeDocumentService {
     public ChatResult chat(String question, Long knowledgeBaseId, String sessionId) {
         // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
+        // 会话联动：补建/刷新会话元数据（标题、知识库、时间），旧 sessionId 平滑接入会话列表
+        chatSessionService.touchOnChat(UserContext.getUserId(), sessionId, knowledgeBaseId, question);
 
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
@@ -951,6 +962,11 @@ public abstract class KnowledgeDocumentService {
         if (answer != null) {
             answer = answer.replace("**", "").replace("`", "");
         }
+
+        // 引用对齐校验（兜底）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注 B 的编号）。
+        // 因提示词要求"逐字引用原文"，取每个 [来源N] 后一小段文本与各来源完整内容做包含匹配，
+        // 仅当唯一命中且与原编号不符时纠正；无法判定则保持原编号（保守，不误伤）
+        answer = alignCitations(answer, rc);
 
         List<SourceInfo> sources = rc.sources();
 
@@ -1017,7 +1033,7 @@ public abstract class KnowledgeDocumentService {
         }
 
         if (searchResults.isEmpty()) {
-            return new RetrievalContext("", List.of());
+            return new RetrievalContext("", List.of(), List.of());
         }
 
         // 2. 从 MySQL 获取 chunk 内容
@@ -1100,6 +1116,7 @@ public abstract class KnowledgeDocumentService {
 
         // 构建来源信息
         List<SourceInfo> sources = new ArrayList<>();
+        List<String> fullContents = new ArrayList<>();
         StringBuilder contextBuilder = new StringBuilder();
         int refIndex = 1;
 
@@ -1115,13 +1132,71 @@ public abstract class KnowledgeDocumentService {
 
             int ref = refIndex++;
             sources.add(new SourceInfo(r.getDocumentId(), docName, r.getPageNo(), snippet, ref));
+            fullContents.add(chunk.getContent());
 
             // 在上下文中标记来源
             contextBuilder.append(String.format("[来源%d] 文档：%s，第%d页%n%s%n%n",
                     ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
         }
 
-        return new RetrievalContext(contextBuilder.toString(), sources);
+        return new RetrievalContext(contextBuilder.toString(), sources, fullContents);
+    }
+
+    /**
+     * 引用对齐校验（兜底）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注了 B 片段的编号）。
+     * 因系统提示要求"逐字引用原文"，取每个 [来源N] 之后的一小段文本（遇下一个 [ 停止，最多 80 字符），
+     * 与各来源完整内容做包含匹配：仅当唯一命中且与原编号不符时纠正为命中编号；
+     * 命中 0 个或多个（无法判定）则保持原编号，避免误伤正常引用。
+     */
+    private String alignCitations(String answer, RetrievalContext rc) {
+        if (answer == null || answer.isBlank() || rc.fullContents().isEmpty()) {
+            return answer;
+        }
+        List<SourceInfo> sources = rc.sources();
+        // 归一化（去空白）后做包含匹配：模型逐字引用原文时可能省略缩进/换行等
+        List<String> normContents = rc.fullContents().stream()
+                .map(c -> c == null ? "" : c.replaceAll("\\s+", ""))
+                .toList();
+
+        Map<Integer, Integer> correction = new HashMap<>(); // 原编号 -> 正确编号
+        Matcher m = Pattern.compile("\\[来源(\\d+)\\]([^\\[]{0,80})").matcher(answer);
+        while (m.find()) {
+            int citedRef = Integer.parseInt(m.group(1));
+            if (citedRef < 1 || citedRef > sources.size()) {
+                continue;
+            }
+            String citedText = m.group(2).replaceAll("\\s+", "");
+            // 引用文本过短（如紧跟句末）无法可靠判定，跳过
+            if (citedText.length() < 8) {
+                continue;
+            }
+            List<Integer> hits = new ArrayList<>();
+            for (int i = 0; i < normContents.size(); i++) {
+                if (!normContents.get(i).isEmpty() && normContents.get(i).contains(citedText)) {
+                    hits.add(i + 1); // 1-based 来源编号
+                }
+            }
+            if (hits.size() == 1 && hits.get(0) != citedRef) {
+                correction.put(citedRef, hits.get(0));
+            }
+        }
+        if (correction.isEmpty()) {
+            return answer;
+        }
+
+        Matcher rm = Pattern.compile("\\[来源(\\d+)\\]").matcher(answer);
+        StringBuilder sb = new StringBuilder();
+        while (rm.find()) {
+            int oldRef = Integer.parseInt(rm.group(1));
+            Integer mapped = correction.get(oldRef);
+            if (mapped != null) {
+                rm.appendReplacement(sb, Matcher.quoteReplacement("[来源" + mapped + "]"));
+            } else {
+                rm.appendReplacement(sb, Matcher.quoteReplacement(rm.group()));
+            }
+        }
+        rm.appendTail(sb);
+        return sb.toString();
     }
 
     /**
@@ -1130,7 +1205,16 @@ public abstract class KnowledgeDocumentService {
     private String buildSystemPrompt(String context) {
         return String.format(
                 "你是一个基于知识库的问答助手。请严格根据以下知识库内容回答用户问题。%n"
+                + "回答方式：当检索到的知识库内容能直接回答用户问题时，请逐字引用原文片段作答，"
+                + "不要用自己的话总结、概括、润色或扩展原文内容；多个相关片段可按原文顺序拼接，"
+                + "仅用最少的衔接词连接；仅当用户明确要求\"总结\"\"概括\"等时，才可以在引用原文之后附加简要总结。%n"
+                + "完整性规则：当问题需要文档级全量或结构信息（如文档一共有几部分/几章、全部章节标题、"
+                + "完整目录大纲等），仅凭检索到的少量片段不足以回答时，必须调用可用的工具"
+                + "（如查询文档大纲的工具）获取完整信息，严禁仅根据不完整的检索片段猜测或只回答片段中出现的部分。%n"
                 + "回答时，请在引用知识库内容的地方用方括号标注来源编号，例如[来源1]、[来源2]。%n"
+                + "引用规范：每个[来源N]编号必须与实际引用的片段严格对应——你引用了哪个片段的内容，"
+                + "就必须标注哪个片段的编号，严禁引用了 A 片段却标注 B 片段（或其他未引用片段）的编号；"
+                + "若无法确定对应片段，宁可不标注编号，也不可标错。%n"
                 + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。%n"
                 + "如果知识库中没有相关信息，请如实告知用户\"知识库中暂无相关信息\"。%n"
                 + "如果用户的问题中存在指代不清（如\"这些内容\"\"上面提到的\"\"刚才说的\"等），"
@@ -1148,8 +1232,10 @@ public abstract class KnowledgeDocumentService {
      */
     private String buildEmptyContextSystemPrompt() {
         return "你是一个基于知识库的问答助手。本次对知识库正文的检索没有找到相关片段。\n"
-                + "若用户的问题涉及文档清单、文件列表等结构化信息（例如“知识库中有哪些文档”、"
-                + "“有没有某份文档”），请调用可用的工具查询后再回答。\n"
+                + "若用户的问题涉及文档清单、文件列表、文档结构/章节大纲等结构化信息"
+                + "（例如“知识库中有哪些文档”“有没有某份文档”“某文档一共有几部分/几章、有哪些章节标题”），"
+                + "请调用可用的工具（文档清单/搜索/大纲）查询后再回答。\n"
+                + "工具查询返回的结果（如文档清单）请直接原样呈现，不要自行总结或加工。\n"
                 +                 "若工具查询也没有结果，或用户的问题确与知识库内容无关，请如实告知用户"
                 + "“知识库中暂无相关信息”。\n"
                 + "如果用户的问题中存在指代不清（如“这些内容”“上面提到的”“刚才说的”等），"
@@ -1167,6 +1253,8 @@ public abstract class KnowledgeDocumentService {
     public ChatStreamResult chatStream(String question, Long knowledgeBaseId, String sessionId) {
         // 服务层权限守卫（纵深防御）：问答/检索需要 VIEWER 及以上
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
+        // 会话联动：补建/刷新会话元数据（标题、知识库、时间），旧 sessionId 平滑接入会话列表
+        chatSessionService.touchOnChat(UserContext.getUserId(), sessionId, knowledgeBaseId, question);
 
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
@@ -1180,7 +1268,18 @@ public abstract class KnowledgeDocumentService {
                 : buildSystemPrompt(rc.context());
 
         // 2. LLM 流式生成回答（多轮记忆：Advisor 按 sessionId 注入历史）
-        return new ChatStreamResult(streamLlm(systemPrompt, question, sessionId, knowledgeBaseId), rc.sources());
+        //    cache() 共享同一数据源：Controller 先订阅 delta 逐 token 输出，
+        //    完成后 correctedAnswer 从缓存收集完整回答并做引用对齐校验（强制纠正编号）
+        Flux<String> cached = streamLlm(systemPrompt, question, sessionId, knowledgeBaseId).cache();
+        Mono<String> correctedAnswer = cached.collectList()
+                .map(list -> {
+                    String full = String.join("", list);
+                    if (full.isBlank() || AI_SERVICE_UNAVAILABLE.equals(full)) {
+                        return full; // 降级/空回答无需纠正
+                    }
+                    return alignCitations(full, rc);
+                });
+        return new ChatStreamResult(cached, rc.sources(), correctedAnswer);
     }
 
     /**

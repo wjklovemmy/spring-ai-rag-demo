@@ -54,18 +54,41 @@
       </div>
     </div>
 
-    <!-- 知识库选择侧栏 -->
-    <div class="card chat-aside">
-      <div class="card-title">选择知识库</div>
-      <select class="select" v-model="kbId" :disabled="kbList.length === 0">
-        <option value="">-- 请选择 --</option>
-        <option v-for="kb in kbList" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
-      </select>
-      <div v-if="kbList.length === 0" class="msg-info info" style="margin-top: 10px;">
-        暂无可用知识库，请先联系管理员创建。
+    <!-- 会话列表 + 知识库选择侧栏 -->
+    <div class="chat-aside">
+      <div class="card sessions-card">
+        <div class="card-title">会话列表</div>
+        <button class="btn btn-primary btn-sm new-session-btn" @click="createNewSession" :disabled="asking">
+          ＋ 新建对话
+        </button>
+        <div class="session-list" v-if="sessions.length">
+          <div
+            v-for="s in sessions"
+            :key="s.sessionId"
+            class="session-item"
+            :class="{ active: s.sessionId === sessionId }"
+            @click="selectSession(s)"
+          >
+            <span class="session-title" :title="s.title">{{ s.title }}</span>
+            <span class="session-del" title="删除会话" @click.stop="deleteSession(s)">✕</span>
+          </div>
+        </div>
+        <div v-else class="msg-info info" style="margin-top: 10px;">
+          暂无会话，点击「新建对话」开始。
+        </div>
       </div>
-      <div class="msg-info info" style="margin-top: 14px; line-height: 1.8;">
-        💡 提示：回答仅基于所选知识库中的文档内容。可通过「文档列表」查看已入库文档。
+      <div class="card kb-card">
+        <div class="card-title">选择知识库</div>
+        <select class="select" v-model="kbId" :disabled="kbList.length === 0">
+          <option value="">-- 请选择 --</option>
+          <option v-for="kb in kbList" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
+        </select>
+        <div v-if="kbList.length === 0" class="msg-info info" style="margin-top: 10px;">
+          暂无可用知识库，请先联系管理员创建。
+        </div>
+        <div class="msg-info info" style="margin-top: 14px; line-height: 1.8;">
+          💡 提示：回答仅基于所选知识库中的文档内容。可通过「文档列表」查看已入库文档。
+        </div>
       </div>
     </div>
   </div>
@@ -84,44 +107,140 @@ const chatBox = ref(null)
 const asking = ref(false)
 // 回答方式：默认流式（SSE），关闭后走一次性 JSON；localStorage 记忆用户偏好
 const streamMode = ref(localStorage.getItem('chatStreamMode') !== '0')
-// 会话 ID：多轮对话记忆的 key，刷新页面保持同一会话；清空对话时更换新 ID
-// 后端按 userId 隔离记忆（key = rag:chat:memory:{userId}:{sessionId}），
-// 前端仅保存随机的会话 ID，换账号登录由后端 userId 维度自动隔离
-const sessionId = ref(localStorage.getItem('chatSessionId') || genSessionId())
+// 会话 ID：由后端生成（POST /api/chat-session/create），前端仅保存当前会话 ID
+// 用于刷新页面恢复；多轮记忆按 userId 隔离（key = rag:chat:memory:{userId}:{sessionId}）
+const sessionId = ref(localStorage.getItem('chatSessionId') || '')
+// 当前用户会话列表（后端 chat_session 元数据，消息历史存 Redis）
+const sessions = ref([])
 // 来源高亮定位：点击回答中 [来源N] 后，对应来源条目临时高亮并滚动到可视区
 const hlMsgIdx = ref(-1)
 const hlSourceIdx = ref(-1)
-
-function genSessionId() {
-  if (window.crypto && crypto.randomUUID) return crypto.randomUUID()
-  return 's-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10)
-}
 
 function toggleStreamMode(v) {
   streamMode.value = v
   localStorage.setItem('chatStreamMode', v ? '1' : '0')
 }
 
+/** 创建会话的并发锁：onMounted/onActivated 可能并发触发，避免重复建会话 */
+let sessionCreateInFlight = false
+
 /**
- * 清空对话：先通知后端删除该会话的多轮记忆（Redis key），
- * 再更换会话 ID（后端按 ID 隔离历史）+ 清空本地消息。
- * 删除失败不阻塞（TTL 7 天会自动过期兜底）。
+ * 加载当前用户会话列表；校验当前会话 ID 是否仍有效（不在列表中则重置为空，
+ * 会话改为「新建对话」或首次提问时惰性创建，避免进页面就写库、并发重复建）。
+ * 未登录（接口 401）时静默跳过，保持旧的无会话模式可用。
  */
-async function resetSession() {
+async function loadSessions() {
   try {
-    await fetchApi('/api/knowledge-document/chat/clear-memory', {
+    const res = await fetchApi('/api/chat-session/list')
+    if (!res.ok) return
+    const data = await res.json()
+    if (!Array.isArray(data)) return
+    sessions.value = data
+    if (sessionId.value && !data.some(s => s.sessionId === sessionId.value)) {
+      sessionId.value = ''
+      localStorage.removeItem('chatSessionId')
+      messages.value = []
+    }
+  } catch (e) {
+    console.warn('加载会话列表失败，保持当前会话', e)
+  }
+}
+
+/** 新建会话：后端生成 sessionId，清空本地消息；并发调用等待在途创建完成后返回 */
+async function createNewSession() {
+  while (sessionCreateInFlight) {
+    await new Promise(r => setTimeout(r, 50))
+  }
+  sessionCreateInFlight = true
+  try {
+    const res = await fetchApi('/api/chat-session/create', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ sessionId: sessionId.value })
+      body: JSON.stringify({ knowledgeBaseId: kbId.value ? Number(kbId.value) : null })
     })
+    if (!res.ok) return
+    const data = await res.json()
+    if (!data || !data.sessionId) return
+    sessionId.value = data.sessionId
+    localStorage.setItem('chatSessionId', data.sessionId)
+    messages.value = []
+    loadSessions()
+    nextTick(scroll)
   } catch (e) {
-    console.warn('清除会话记忆失败（TTL 会自动兜底过期）', e)
+    console.warn('创建会话失败', e)
+  } finally {
+    sessionCreateInFlight = false
   }
-  const id = genSessionId()
-  sessionId.value = id
-  localStorage.setItem('chatSessionId', id)
+}
+
+/**
+ * 拉取当前会话的历史消息（Redis 记忆）回显。
+ * 404 = 会话已被删除（归属校验失败）→ 重置为无会话状态。
+ */
+async function loadMessages() {
+  if (!sessionId.value) {
+    messages.value = []
+    return
+  }
+  try {
+    const res = await fetchApi(`/api/chat-session/${sessionId.value}/messages`)
+    if (res.ok) {
+      const data = await res.json()
+      if (Array.isArray(data)) {
+        messages.value = data.map(m => ({
+          role: m.role,
+          text: m.content || '',
+          sources: [],
+          error: false
+        }))
+      }
+    } else if (res.status === 404) {
+      sessionId.value = ''
+      localStorage.removeItem('chatSessionId')
+      messages.value = []
+    }
+  } catch (e) {
+    console.warn('拉取会话历史失败', e)
+  }
+}
+
+/** 切换会话：恢复 sessionId 与关联知识库，并拉取该会话的历史消息（点击当前会话也会刷新回显） */
+async function selectSession(s) {
+  sessionId.value = s.sessionId
+  localStorage.setItem('chatSessionId', s.sessionId)
+  if (s.knowledgeBaseId) kbId.value = String(s.knowledgeBaseId)
   messages.value = []
+  await loadMessages()
   nextTick(scroll)
+}
+
+/** 删除会话（后端删 MySQL 元数据 + Redis 记忆）；删除的是当前会话则新建一个 */
+async function deleteSession(s) {
+  if (!window.confirm(`确定删除会话「${s.title}」？删除后历史不可恢复。`)) return
+  try {
+    await fetchApi(`/api/chat-session/${s.sessionId}`, { method: 'DELETE' })
+  } catch (e) {
+    console.warn('删除会话失败', e)
+    return
+  }
+  sessions.value = sessions.value.filter(x => x.sessionId !== s.sessionId)
+  if (s.sessionId === sessionId.value) {
+    sessionId.value = ''
+    localStorage.removeItem('chatSessionId')
+    messages.value = []
+    createNewSession()
+  }
+}
+
+/** 清空当前对话：等价于「删除当前会话并新建」 */
+async function resetSession() {
+  const cur = sessions.value.find(s => s.sessionId === sessionId.value)
+  if (cur) {
+    await deleteSession(cur)
+  } else {
+    messages.value = []
+    createNewSession()
+  }
 }
 
 /** 将回答文本按 [来源N] 拆分为 文本/引用 片段，供模板高亮渲染 */
@@ -182,6 +301,14 @@ async function ask() {
     showToast('请先选择知识库', 'error')
     return
   }
+  // 尚无会话 ID（首次提问/原会话已失效）时先由后端创建，保证会话列表与记忆落库
+  if (!sessionId.value) {
+    await createNewSession()
+    if (!sessionId.value) {
+      showToast('创建会话失败，请重试', 'error')
+      return
+    }
+  }
   messages.value.push({ role: 'user', text: q })
   const idx = messages.value.push({ role: 'assistant', text: '', sources: [], error: false }) - 1
   question.value = ''
@@ -218,6 +345,8 @@ async function ask() {
   } finally {
     asking.value = false
     scroll()
+    // 首问后会话标题由后端生成，刷新列表保持最新
+    loadSessions()
   }
 }
 
@@ -262,6 +391,12 @@ function handleSseEvent(raw, idx) {
   if (evt.type === 'delta') {
     m.text += evt.content || ''
     scroll()
+  } else if (evt.type === 'final') {
+    // 生成完毕后后端下发的引用对齐校验后的完整回答，整体覆盖增量拼接结果（强制纠正编号）
+    if (evt.content) {
+      m.text = evt.content
+      scroll()
+    }
   } else if (evt.type === 'sources') {
     const all = Array.isArray(evt.sources) ? evt.sources : []
     // 只保留回答中实际引用的来源：流式模式下后端返回全部候选（生成前无法预知引用），
@@ -285,8 +420,14 @@ async function handleDownload(s) {
   if (!ok) showToast('下载失败', 'error')
 }
 
-onMounted(loadKbSelectors)
-onActivated(loadKbSelectors)
+async function initChatTab() {
+  loadKbSelectors()
+  await loadSessions()
+  // 刷新页面后自动回显当前会话历史（sessionId 已存 localStorage）
+  loadMessages()
+}
+onMounted(initChatTab)
+onActivated(initChatTab)
 </script>
 
 <style scoped>
@@ -346,5 +487,78 @@ onActivated(loadKbSelectors)
   outline: 2px solid #2563eb;
   background: #eff6ff;
   border-radius: 6px;
+}
+
+/* ===== 会话列表 + 知识库侧栏 ===== */
+.chat-aside {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 260px;
+  flex-shrink: 0;
+}
+.sessions-card,
+.kb-card {
+  padding: 16px;
+}
+.session-list {
+  margin-top: 10px;
+  max-height: 300px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.session-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+  color: #334155;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  transition: background 0.15s;
+}
+.session-item:hover {
+  background: #f1f5f9;
+}
+.session-item.active {
+  background: #dbeafe;
+  border-color: #93c5fd;
+  color: #1d4ed8;
+  font-weight: 600;
+}
+.session-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-del {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  line-height: 16px;
+  text-align: center;
+  border-radius: 50%;
+  color: #94a3b8;
+  font-size: 12px;
+  visibility: hidden;
+}
+.session-item:hover .session-del,
+.session-item.active .session-del {
+  visibility: visible;
+}
+.session-del:hover {
+  background: #fecaca;
+  color: #dc2626;
+}
+.new-session-btn {
+  margin-top: 10px;
+  width: 100%;
 }
 </style>
