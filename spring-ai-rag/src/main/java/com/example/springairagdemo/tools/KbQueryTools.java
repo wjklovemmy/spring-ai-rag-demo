@@ -74,8 +74,6 @@ public class KbQueryTools {
 
     /** 标题链前缀模式：摄取时按 prefixTemplate 【{heading}】注入每个 chunk 文本开头 */
     private static final Pattern HEADING_PREFIX = Pattern.compile("^【([^】]+)】");
-    /** 单份文档大纲标题数量上限，避免超大文档撑爆上下文 */
-    private static final int OUTLINE_LIMIT = 200;
     /** 带编号的章节标题模式（数字序号 / 中文数字序数 / 第X章 / （一）），用于过滤封面标题、页眉等无编号标题 */
     private static final Pattern NUMBERED_HEADING = Pattern.compile(
             "\\d+(?:\\.\\d+)*\\s*[.、．:：]"
@@ -86,8 +84,9 @@ public class KbQueryTools {
     /**
      * 列出当前知识库中收录的所有活跃文档（文件名、版本号、内容片段数）。
      */
-    @Tool(description = "列出当前知识库中收录的所有活跃文档清单（文件名、版本号、内容片段数）。"
-            + "当用户询问知识库中有哪些文档/文件、文档列表/清单、收录/上传了什么文档等问题时，必须调用本工具。")
+    @Tool(description = "列出当前知识库中收录的活跃文档清单（文件名、版本号、内容片段数）。"
+            + "当用户询问知识库中有哪些文档/文件、文档列表/清单、收录/上传了什么文档等问题时，必须调用本工具。"
+            + "文档较多时仅返回部分清单（超限自动截断并提示），用户想找具体文档时改用 searchDocuments 按文件名关键词定位。")
     public String listDocuments(ToolContext toolContext) {
         emitToolEvent(toolContext, "listDocuments", "running", "查询知识库文档清单", null);
         String result;
@@ -144,10 +143,12 @@ public class KbQueryTools {
     @Tool(description = "查询指定文档的完整标题大纲（章节/小节结构），返回文档包含的标题清单与总数。"
             + "当用户询问某文档包含几部分/几章/几个小节/哪些章节、文档结构、目录大纲等问题时，必须调用本工具。"
             + "问题中明确提到具体文件名时，必须传入完整文件名（不含扩展名，如 软件技术说明书），"
-            + "禁止省略成仅个别字词（如 说明书），否则可能误命中名称相近的其他文档；省略时返回当前知识库全部活跃文档的大纲。")
+            + "禁止省略成仅个别字词（如 说明书），否则可能误命中名称相近的其他文档；"
+            + "省略时仅当知识库文档较少才返回全部文档大纲，文档较多时本工具会拒绝枚举并要求指定文档名。")
     public String documentOutline(
             @ToolParam(description = "文档名关键词，问题中明确提到文件名时传完整文件名（不含扩展名，"
-                    + "如 软件技术说明书），禁止省略为个别字词；模糊记忆时可传部分字词；省略则查询当前知识库全部文档") String keyword,
+                    + "如 软件技术说明书），禁止省略为个别字词；模糊记忆时可传部分字词；"
+                    + "省略则仅当知识库文档较少时返回全部文档大纲，文档较多时必须先通过 listDocuments/searchDocuments 定位具体文档") String keyword,
             ToolContext toolContext) {
         emitToolEvent(toolContext, "documentOutline", "running",
                 "查询文档大纲，关键词：" + (keyword == null ? "" : keyword.trim()), null);
@@ -162,14 +163,19 @@ public class KbQueryTools {
             List<KnowledgeDocumentEntity> docs = activeDocuments(kbId);
             if (docs.isEmpty()) {
                 result = "当前知识库中暂无文档";
+            } else if (kw.isEmpty()) {
+                // 未指定文档：文档较少时直接给全部大纲；文档较多时拒绝枚举，
+                // 引导用户/模型指定具体文档名，避免上万文档的大纲拼接撑爆上下文
+                if (docs.size() > config.getTools().getMaxOutlineDocs()) {
+                    result = "当前知识库共有 " + docs.size() + " 份活跃文档，文档较多，无法一次性列出全部文档结构。"
+                            + "请用户指定具体文档名（如：《软件技术说明书》的结构/包含几部分），或先用文档清单/文档搜索定位目标文档。";
+                } else {
+                    result = buildOutlines(docs);
+                }
             } else {
-                if (!kw.isEmpty()) {
-                    docs = matchDocuments(docs, kw);
-                    if (docs.isEmpty()) {
-                        result = "未找到文件名包含“" + kw + "”的文档";
-                    } else {
-                        result = buildOutlines(docs);
-                    }
+                docs = matchDocuments(docs, kw);
+                if (docs.isEmpty()) {
+                    result = "未找到文件名包含“" + kw + "”的文档";
                 } else {
                     result = buildOutlines(docs);
                 }
@@ -214,7 +220,7 @@ public class KbQueryTools {
                     headings.add(h.title().trim());
                 }
             }
-            if (headings.size() >= OUTLINE_LIMIT) break;
+            if (headings.size() >= config.getTools().getOutlineLimit()) break;
         }
 
         // 存在带编号的章节标题时，过滤掉无编号标题（封面标题/页眉等，如文档名、副标题）；
@@ -237,8 +243,8 @@ public class KbQueryTools {
         for (String h : outline) {
             sb.append(h).append(System.lineSeparator());
         }
-        if (outline.size() >= OUTLINE_LIMIT) {
-            sb.append("（标题较多，仅列出前 ").append(OUTLINE_LIMIT).append(" 个）");
+        if (outline.size() >= config.getTools().getOutlineLimit()) {
+            sb.append("（标题较多，仅列出前 ").append(config.getTools().getOutlineLimit()).append(" 个）");
         }
         return sb.toString();
     }
@@ -248,11 +254,25 @@ public class KbQueryTools {
         return title != null && NUMBERED_HEADING.matcher(title).find();
     }
 
-    /** 拼接多份文档的大纲文本 */
+    /** 拼接多份文档的大纲文本：文档数 + 总字符数双上限，超限截断并提示，防止工具结果撑爆上下文 */
     private String buildOutlines(List<KnowledgeDocumentEntity> docs) {
         StringBuilder sb = new StringBuilder();
+        int shown = 0;
         for (KnowledgeDocumentEntity doc : docs) {
-            sb.append(buildOutline(doc)).append(System.lineSeparator());
+            if (shown >= config.getTools().getMaxOutlineDocs()) {
+                break;
+            }
+            String outline = buildOutline(doc);
+            // 第一条超限也保留（至少给出内容），后续超限则截断
+            if (sb.length() > 0 && sb.length() + outline.length() > config.getTools().getMaxOutlineChars()) {
+                break;
+            }
+            sb.append(outline).append(System.lineSeparator());
+            shown++;
+        }
+        if (shown < docs.size()) {
+            sb.append("（文档较多/大纲较长，仅列出前 ").append(shown)
+                    .append(" 份，可指定文档名查询具体结构）");
         }
         return sb.toString();
     }
@@ -461,13 +481,16 @@ public class KbQueryTools {
         return FILE_EXT.matcher(fileName).replaceAll("").toLowerCase();
     }
 
-    /** 格式化文档清单文本 */
+    /** 格式化文档清单文本：条目数上限截断，防止上万文档清单撑爆工具结果/SSE 帧 */
     private String formatInventory(List<KnowledgeDocumentEntity> docs) {
         StringBuilder sb = new StringBuilder();
-        sb.append("当前知识库中收录了以下 ").append(docs.size())
+        int total = docs.size();
+        int shown = Math.min(total, config.getTools().getMaxInventoryDocs());
+        sb.append("当前知识库中收录了以下 ").append(total)
                 .append(" 份文档：").append(System.lineSeparator());
         int idx = 1;
-        for (KnowledgeDocumentEntity doc : docs) {
+        for (int i = 0; i < shown; i++) {
+            KnowledgeDocumentEntity doc = docs.get(i);
             sb.append(idx++).append(". ").append(doc.getFileName());
             if (doc.getVersion() != null && doc.getVersion() > 1) {
                 sb.append("（版本 ").append(doc.getVersion()).append("）");
@@ -476,6 +499,10 @@ public class KbQueryTools {
                 sb.append("，共 ").append(doc.getChunkCount()).append(" 个内容片段");
             }
             sb.append(System.lineSeparator());
+        }
+        if (total > shown) {
+            sb.append("…（文档较多，仅显示前 ").append(shown)
+                    .append(" 份，可用文件名关键词进一步定位）").append(System.lineSeparator());
         }
         return sb.toString();
     }

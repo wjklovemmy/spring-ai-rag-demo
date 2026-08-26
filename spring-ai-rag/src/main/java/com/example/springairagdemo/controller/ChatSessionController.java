@@ -1,10 +1,13 @@
 package com.example.springairagdemo.controller;
 
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.toolkit.Wrappers;
 import com.example.springairagdemo.entity.AgentTaskEntity;
 import com.example.springairagdemo.entity.ChatSessionEntity;
 import com.example.springairagdemo.security.UserContext;
 import com.example.springairagdemo.service.AgentTaskService;
 import com.example.springairagdemo.service.ChatSessionService;
+import com.example.springairagdemo.service.KnowledgeDocumentService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -45,6 +48,8 @@ public class ChatSessionController {
 
     /**
      * 创建新会话：后端生成 sessionId，返回给前端作为聊天会话标识。
+     * 若该用户在该知识库下已存在"空会话"（从未问答、Redis 无消息历史），
+     * 直接复用返回，避免反复点击"新建对话"堆积空白会话。
      *
      * @param body 可选 {knowledgeBaseId}
      */
@@ -58,17 +63,28 @@ public class ChatSessionController {
         if (body != null && body.get("knowledgeBaseId") != null) {
             kbId = ((Number) body.get("knowledgeBaseId")).longValue();
         }
+        // 复用现有空会话：同一用户 + 同一知识库 + Redis 无消息（从未问答）
+        LambdaQueryWrapper<ChatSessionEntity> qw = Wrappers.<ChatSessionEntity>lambdaQuery()
+                .eq(ChatSessionEntity::getUserId, userId);
+        if (kbId == null) {
+            qw.isNull(ChatSessionEntity::getKnowledgeBaseId);
+        } else {
+            qw.eq(ChatSessionEntity::getKnowledgeBaseId, kbId);
+        }
+        qw.orderByDesc(ChatSessionEntity::getUpdateTime);
+        for (ChatSessionEntity e : chatSessionService.list(qw)) {
+            if (chatMemory.get(memoryKey(userId, e.getSessionId())).isEmpty()) {
+                log.debug("复用空会话：userId={}, sessionId={}", userId, e.getSessionId());
+                return ResponseEntity.ok(toSession(e));
+            }
+        }
         ChatSessionEntity s = chatSessionService.createSession(userId, kbId);
-        Map<String, Object> data = new LinkedHashMap<>();
-        data.put("sessionId", s.getSessionId());
-        data.put("title", s.getTitle());
-        data.put("knowledgeBaseId", s.getKnowledgeBaseId());
-        data.put("createTime", s.getCreateTime());
-        return ResponseEntity.ok(data);
+        return ResponseEntity.ok(toSession(s));
     }
 
     /**
-     * 当前用户会话列表（按最近更新倒序）
+     * 当前用户会话列表（按最近更新倒序）。
+     * 过滤空会话：从未问答（Redis 无消息）的会话不返回，避免列表堆积空白会话。
      */
     @GetMapping("/list")
     public ResponseEntity<List<Map<String, Object>>> list() {
@@ -82,15 +98,24 @@ public class ChatSessionController {
                 .list();
         List<Map<String, Object>> data = new ArrayList<>();
         for (ChatSessionEntity s : sessions) {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("sessionId", s.getSessionId());
-            m.put("title", s.getTitle() == null || s.getTitle().isBlank() ? "新对话" : s.getTitle());
-            m.put("knowledgeBaseId", s.getKnowledgeBaseId());
-            m.put("createTime", s.getCreateTime());
-            m.put("updateTime", s.getUpdateTime());
-            data.add(m);
+            // 空会话（从未问答）不出现在会话列表
+            if (chatMemory.get(memoryKey(userId, s.getSessionId())).isEmpty()) {
+                continue;
+            }
+            data.add(toSession(s));
         }
         return ResponseEntity.ok(data);
+    }
+
+    /** 会话元数据 → 接口返回结构（create / list 共用） */
+    private Map<String, Object> toSession(ChatSessionEntity s) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("sessionId", s.getSessionId());
+        m.put("title", s.getTitle() == null || s.getTitle().isBlank() ? "新对话" : s.getTitle());
+        m.put("knowledgeBaseId", s.getKnowledgeBaseId());
+        m.put("createTime", s.getCreateTime());
+        m.put("updateTime", s.getUpdateTime());
+        return m;
     }
 
     /**
@@ -119,7 +144,12 @@ public class ChatSessionController {
                     && !(m instanceof AssistantMessage am && am.hasToolCalls())) {
                 Map<String, Object> am = msg("assistant", m.getText());
                 if (taskIdx < tasks.size()) {
-                    am.put("sources", parseSources(tasks.get(taskIdx++).getSources()));
+                    AgentTaskEntity task = tasks.get(taskIdx++);
+                    // 引用来源仅随实际引用展示：回答中无 [来源N]（澄清性提问等）回补为空，
+                    // 与实时问答的展示规则保持一致（agent_task 快照仍保留完整候选供审计查看）
+                    List<Map<String, Object>> srcs = KnowledgeDocumentService.hasSourceRefs(task.getAnswer())
+                            ? parseSources(task.getSources()) : List.of();
+                    am.put("sources", srcs);
                 }
                 data.add(am);
             }
@@ -165,7 +195,8 @@ public class ChatSessionController {
             if (s == null) {
                 continue;
             }
-            chatSessionService.removeById(s.getId());
+            // 逻辑删除：会话 + 级联 Agent 任务/步骤（记录删除人/时间，数据保留供审计追溯）
+            chatSessionService.logicalDelete(userId, sessionId, userId);
             chatMemory.clear(memoryKey(userId, sessionId));
             deleted++;
         }
@@ -185,7 +216,8 @@ public class ChatSessionController {
         if (s == null) {
             return ResponseEntity.status(HttpStatus.NOT_FOUND).build();
         }
-        chatSessionService.removeById(s.getId());
+        // 逻辑删除：会话 + 级联 Agent 任务/步骤（记录删除人/时间，数据保留供审计追溯）
+        chatSessionService.logicalDelete(userId, sessionId, userId);
         chatMemory.clear(memoryKey(userId, sessionId));
         return ResponseEntity.ok(Map.of("success", true));
     }

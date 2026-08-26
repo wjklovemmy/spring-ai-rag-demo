@@ -395,6 +395,8 @@ public class KnowledgeDocumentController {
         // SSE 事件流：先并行下发工具调用事件（模型自主调用 KbQueryTools 的过程，先于内容产生）
         // 与逐 token 增量文本；内容流结束后合并下发引用对齐校验后的最终全文（final：强制纠正
         // [来源N] 编号张冠李戴，前端覆盖显示），最后携带引用来源与结束标记。
+        // 引用来源仅随实际引用展示：final 回答中无 [来源N]（澄清性提问/告知无信息/AI 降级）时
+        // sources 下发空列表，避免把与回答无关的检索候选展示给用户（final 先于 sources，时序天然正确）。
         // 时序保证：工具调用全部发生在内容生成之前，merge 顺序天然正确；内容流完成时
         // complete 工具 Sink，使 merge 完成、后续 concatWith 链继续。
         Flux<ServerSentEvent<Map<String, Object>>> toolStream = chatResult.toolEvents()
@@ -409,10 +411,11 @@ public class KnowledgeDocumentController {
 
         Flux<ServerSentEvent<Map<String, Object>>> flux = Flux.merge(toolStream, deltaStream)
                 .concatWith(chatResult.correctedAnswer()
-                        .map(a -> sseEvent(Map.<String, Object>of("type", "final", "content", a))))
-                .concatWith(Flux.just(
-                        sseEvent(Map.<String, Object>of("type", "sources", "sources", sources)),
-                        sseEvent(Map.<String, Object>of("type", "done"))));
+                        .flatMapMany(a -> Flux.just(
+                                sseEvent(Map.<String, Object>of("type", "final", "content", a)),
+                                sseEvent(Map.<String, Object>of("type", "sources", "sources",
+                                        KnowledgeDocumentService.hasSourceRefs(a) ? sources : List.of())),
+                                sseEvent(Map.<String, Object>of("type", "done")))));
 
         return ResponseEntity.ok()
                 .contentType(MediaType.TEXT_EVENT_STREAM)

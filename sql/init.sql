@@ -193,6 +193,9 @@ CREATE TABLE IF NOT EXISTS `chat_session` (
     `knowledge_base_id` BIGINT      DEFAULT NULL COMMENT '会话关联知识库 ID',
     `create_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
     `update_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `deleted`           TINYINT     NOT NULL DEFAULT 0 COMMENT '逻辑删除：0 正常 / 1 已删除（删除会话时置 1，MyBatis-Plus 自动过滤）',
+    `deleted_by`        BIGINT      DEFAULT NULL COMMENT '删除人用户 ID',
+    `delete_time`       DATETIME    DEFAULT NULL COMMENT '删除时间',
     UNIQUE KEY `uk_user_session` (`user_id`, `session_id`),
     KEY `idx_user_update` (`user_id`, `update_time`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='聊天会话';
@@ -225,6 +228,9 @@ CREATE TABLE IF NOT EXISTS `agent_task` (
     `start_ms`         BIGINT       NOT NULL COMMENT '开始时间戳（毫秒）',
     `create_time`      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开始时间',
     `finish_time`      DATETIME     DEFAULT NULL COMMENT '结束时间',
+    `deleted`          TINYINT      NOT NULL DEFAULT 0 COMMENT '逻辑删除：0 正常 / 1 已删除（随所属会话删除置 1，MyBatis-Plus 自动过滤）',
+    `deleted_by`       BIGINT       DEFAULT NULL COMMENT '删除人用户 ID',
+    `delete_time`      DATETIME     DEFAULT NULL COMMENT '删除时间',
     KEY `idx_user_time` (`user_id`, `create_time`),
     KEY `idx_session` (`session_id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 任务';
@@ -242,6 +248,9 @@ CREATE TABLE IF NOT EXISTS `agent_task_step` (
     `result`      TEXT         DEFAULT NULL COMMENT '工具返回结果',
     `latency_ms`  BIGINT       DEFAULT NULL COMMENT '该步耗时（毫秒，done 时回填）',
     `create_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '发生时间',
+    `deleted`     TINYINT      NOT NULL DEFAULT 0 COMMENT '逻辑删除：0 正常 / 1 已删除（随所属任务删除置 1，MyBatis-Plus 自动过滤）',
+    `deleted_by`  BIGINT       DEFAULT NULL COMMENT '删除人用户 ID',
+    `delete_time` DATETIME     DEFAULT NULL COMMENT '删除时间',
     KEY `idx_task` (`task_id`, `id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 任务步骤轨迹';
 

@@ -27,6 +27,9 @@ public class RagConfigProperties {
     /** 混合检索（Hybrid Search：Dense 向量 + BM25 全文检索 + RRF 融合）配置 */
     private Hybrid hybrid = new Hybrid();
 
+    /** 工具调用（Tool Calling）限制配置：防止枚举/大纲类工具在大数据量下撑爆上下文 */
+    private Tools tools = new Tools();
+
     @Data
     public static class DocumentGlobal {
         /** 文档版本共存天数：旧版本在新版本上传后 N 天内仍可检索，超期后自动过滤（默认30天） */
@@ -150,5 +153,17 @@ public class RagConfigProperties {
         private int minSegmentChars = 20;
         /** 语义切片失败时是否降级为 token 切分（默认降级） */
         private boolean fallbackOnError = true;
+    }
+
+    @Data
+    public static class Tools {
+        /** 单份文档大纲标题数量上限：超过即停止扫描并提示截断，避免超大文档撑爆上下文 */
+        private int outlineLimit = 200;
+        /** 一次大纲查询最多处理的文档数：文档过多时引导用户/模型指定具体文档，避免枚举全部文档撑爆上下文 */
+        private int maxOutlineDocs = 20;
+        /** 大纲结果文本总长度上限（字符）：防止多文档/超大文档拼接出超大工具结果 */
+        private int maxOutlineChars = 12000;
+        /** 文档清单最多展示条数：上万文档场景下列全部会撑爆工具结果，超限截断并引导关键词定位 */
+        private int maxInventoryDocs = 200;
     }
 }

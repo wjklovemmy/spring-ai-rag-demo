@@ -95,8 +95,8 @@ services:
     restart: unless-stopped
 
   # Nacos 注册中心 + 配置中心（standalone 单机模式）
-  # 控制台：http://localhost:8848/nacos（默认账号 nacos/nacos）
-  # 客户端需同时连通 8848（HTTP）与 9848（gRPC），缺失 9848 会导致服务发现/配置拉取失败
+  # 控制台：http://localhost:8090/nacos（默认账号 nacos/nacos）
+  # 客户端需同时连通 8848（HTTP API）与 9848（gRPC），缺失 9848 会导致服务发现/配置拉取失败
   nacos:
     container_name: knowledge-nacos
     image: nacos/nacos-server:v3.1.1

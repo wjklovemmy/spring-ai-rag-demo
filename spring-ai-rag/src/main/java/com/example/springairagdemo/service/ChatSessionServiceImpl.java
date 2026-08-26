@@ -3,6 +3,7 @@ package com.example.springairagdemo.service;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.example.springairagdemo.entity.ChatSessionEntity;
 import com.example.springairagdemo.mapper.ChatSessionMapper;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.util.Date;
@@ -17,6 +18,9 @@ public class ChatSessionServiceImpl extends ServiceImpl<ChatSessionMapper, ChatS
 
     /** 会话标题最大长度（取首个问题截断） */
     private static final int TITLE_MAX = 30;
+
+    @Autowired
+    private AgentTaskService agentTaskService;
 
     @Override
     public ChatSessionEntity createSession(Long userId, Long knowledgeBaseId) {
@@ -76,6 +80,21 @@ public class ChatSessionServiceImpl extends ServiceImpl<ChatSessionMapper, ChatS
                 .eq(ChatSessionEntity::getUserId, userId)
                 .eq(ChatSessionEntity::getSessionId, sessionId)
                 .one();
+    }
+
+    @Override
+    public void logicalDelete(Long userId, String sessionId, Long operatorId) {
+        Date now = new Date();
+        // 1. 会话本身逻辑删除（deleted=1 + 删除人/时间）
+        lambdaUpdate()
+                .set(ChatSessionEntity::getDeleted, 1)
+                .set(ChatSessionEntity::getDeletedBy, operatorId)
+                .set(ChatSessionEntity::getDeleteTime, now)
+                .eq(ChatSessionEntity::getUserId, userId)
+                .eq(ChatSessionEntity::getSessionId, sessionId)
+                .update();
+        // 2. 级联逻辑删除该会话下的 Agent 任务与步骤轨迹（记录删除人/时间）
+        agentTaskService.logicalDeleteBySession(userId, sessionId, operatorId);
     }
 
     /** 问题截断为会话标题（单行、去空白） */

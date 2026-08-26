@@ -271,6 +271,7 @@ spring-ai-rag-demo/
 │           └── LoggingGlobalFilter.java # 全局访问日志过滤器
 └── sql/
     ├── init.sql                              # RAG 业务库初始化（知识库/文档/任务/成员授权/审计日志/聊天会话）
+    ├── migration_agent_logic_delete.sql      # 升级脚本：会话/Agent 三表逻辑删除字段（已部署库执行一次）
     ├── user.sql                              # 用户服务独立库初始化（RBAC 五表 + 权限种子 + admin 账号）
     └── mysql-nacos.sql                       # Nacos 3.1.1 官方建表脚本（宿主机 MySQL 初始化 nacos_config 库用）
 ```
@@ -510,6 +511,7 @@ spring-ai-rag-demo/
 
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
 - `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session` / `agent_task` / `agent_task_step`。
+- `sql/migration_agent_logic_delete.sql` — 已按旧版 init.sql 初始化的库升级用：为 `chat_session` / `agent_task` / `agent_task_step` 补充逻辑删除字段（新装库执行 init.sql 即可，无需本脚本）。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
 - `sql/mysql-nacos.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
@@ -526,9 +528,9 @@ spring-ai-rag-demo/
 | `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status(0待处理/1处理中/2成功/3失败)、total/success/fail_chunk、**parse/split/chunk/embed/milvus_progress（阶段进度 0-100）**、retry_count、error_message、cost_time |
 | `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
-| `chat_session` | 聊天会话元数据 | user_id、session_id(后端 UUID 唯一，`uk_user_session`)、title(首个问题截断 30 字)、knowledge_base_id、create_time/update_time |
-| `agent_task` | Agent 任务（一次提问的执行审计单元，可观测性） | user_id、session_id、kb_id、question、answer(LONGTEXT)、sources(引用来源 JSON)、prompt(LLM 实际输入)、model、prompt_tokens/completion_tokens/total_tokens、status(0执行中/1成功/2失败)、tool_count、cost_ms、error_msg、start_ms、create_time/finish_time |
-| `agent_task_step` | Agent 任务步骤轨迹（工具调用过程） | task_id、type(TOOL_CALL)、tool_name、status(running/done/error)、args、result、latency_ms(该步耗时)、create_time |
+| `chat_session` | 聊天会话元数据 | user_id、session_id(后端 UUID 唯一，`uk_user_session`)、title(首个问题截断 30 字)、knowledge_base_id、create_time/update_time、**deleted/deleted_by/delete_time(逻辑删除审计)** |
+| `agent_task` | Agent 任务（一次提问的执行审计单元，可观测性） | user_id、session_id、kb_id、question、answer(LONGTEXT)、sources(引用来源 JSON)、prompt(LLM 实际输入)、model、prompt_tokens/completion_tokens/total_tokens、status(0执行中/1成功/2失败)、tool_count、cost_ms、error_msg、start_ms、create_time/finish_time、**deleted/deleted_by/delete_time(随会话删除置 1)** |
+| `agent_task_step` | Agent 任务步骤轨迹（工具调用过程） | task_id、type(TOOL_CALL)、tool_name、status(running/done/error)、args、result、latency_ms(该步耗时)、create_time、**deleted/deleted_by/delete_time(随任务删除置 1)** |
 
 **用户域独立库（spring_ai_user）—— RBAC 经典五表**：
 
@@ -638,7 +640,7 @@ CREATE DATABASE IF NOT EXISTS nacos_config DEFAULT CHARACTER SET utf8mb4;
 
 > `host.docker.internal` 是 Docker Desktop（Windows/macOS）的内置域名；Linux 下需在 nacos 服务添加 `extra_hosts: ["host.docker.internal:host-gateway"]`。
 
-> Nacos 控制台：http://localhost:8848/nacos（3.x 默认开启鉴权，账号 `nacos/nacos`）。首次使用需在控制台"配置管理 → 新建配置"导入共享配置 `Data ID: common.yaml / Group: DEFAULT_GROUP`（内容见 [`nacos/common.yaml`](../nacos/common.yaml)）。若跳过此步，三个服务使用本地 `application.yaml` 中的兜底密钥，功能不受影响。
+> Nacos 控制台：[http://localhost:8090/nacos](http://localhost:8090/nacos)（3.x 默认开启鉴权，账号 `nacos/nacos`）。首次使用需在控制台"配置管理 → 新建配置"导入共享配置 `Data ID: common.yaml / Group: DEFAULT_GROUP`（内容见 [`nacos/common.yaml`](../nacos/common.yaml)）。若跳过此步，三个服务使用本地 `application.yaml` 中的兜底密钥，功能不受影响。
 
 **业务数据库**（同一 MySQL 实例，需执行一次，均幂等可重复）：
 1. `sql/init.sql` — RAG 业务库：`knowledge_base` 库 + 业务表 + 成员授权 + 审计日志。

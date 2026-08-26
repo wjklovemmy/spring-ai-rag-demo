@@ -3,9 +3,11 @@ spring:
     # 服务名 = Nacos 注册名，与网关 lb://spring-ai-rag 路由、用户服务 RagSyncFeignClient 服务名一致
     name: spring-ai-rag
   config:
-    # 配置中心：拉取共享配置（三端密钥）；optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
+    # 配置中心：拉取共享配置（三端密钥）+ 本服务专属配置（rag.tools 等，Nacos 上修改即热生效）；
+    # optional 前缀保证 Nacos 不可用时本地兜底配置仍可启动
     import:
       - optional:nacos:common.yaml?group=DEFAULT_GROUP&refreshEnabled=true
+      - optional:nacos:spring-ai-rag.yaml?group=DEFAULT_GROUP&refreshEnabled=true
   cloud:
     nacos:
       # Nacos 注册中心 + 配置中心地址（与 docker-compose 中 nacos 服务一致）
@@ -198,6 +200,17 @@ rag:
         # 过短段落并入相邻段，避免噪声干扰聚类
         min-segment-chars: 20
         fallback-on-error: true
+  # 工具调用（Tool Calling）限制：防止枚举/大纲类工具在大数据量下撑爆上下文。
+  # 配置中心（Nacos）修改后热生效，无需重启（@ConfigurationProperties 自动重新绑定）
+  tools:
+    # 单份文档大纲标题数量上限：超过即停止扫描并提示截断
+    outline-limit: 200
+    # 一次大纲查询最多处理的文档数：文档过多时引导指定具体文档，避免枚举全部文档
+    max-outline-docs: 20
+    # 大纲结果文本总长度上限（字符）
+    max-outline-chars: 12000
+    # 文档清单最多展示条数：超限截断并引导关键词定位
+    max-inventory-docs: 200
 
 # ==================== 网关信任配置 ====================
 # 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，

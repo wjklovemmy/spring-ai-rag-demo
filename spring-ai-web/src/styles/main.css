@@ -218,7 +218,7 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 .stat-label { margin-top: 6px; color: #94a3b8; font-size: 13px; }
 
 /* ---------------- 聊天 ---------------- */
-.chat-layout { display: flex; gap: 18px; align-items: stretch; }
+.chat-layout { display: flex; flex-direction: column; gap: 16px; align-items: stretch; }
 .chat-panel { flex: 1; display: flex; flex-direction: column; min-height: 62vh; }
 .chat-messages {
   flex: 1; overflow-y: auto; padding: 14px 6px; display: flex; flex-direction: column; gap: 14px;
@@ -269,7 +269,6 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 
 .chat-input-row { display: flex; gap: 10px; align-items: center; }
 .chat-input-row .input { flex: 1; }
-.chat-aside { width: 300px; flex-shrink: 0; }
 
 /* ---------------- 上传 ---------------- */
 .drop-zone {
@@ -337,5 +336,4 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 @media (max-width: 900px) {
   .sidebar { display: none; }
   .chat-layout { flex-direction: column; }
-  .chat-aside { width: 100%; }
 }

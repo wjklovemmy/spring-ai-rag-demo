@@ -31,4 +31,14 @@ public interface ChatSessionService extends IService<ChatSessionEntity> {
      * 按用户+会话查询（归属校验）
      */
     ChatSessionEntity getOwned(Long userId, String sessionId);
+
+    /**
+     * 逻辑删除会话并级联逻辑删除其下全部 Agent 任务与步骤轨迹（记录删除人/时间，数据保留供审计追溯）。
+     * Redis 聊天记忆清理由调用方负责（记忆 key 与库表独立）。
+     *
+     * @param userId     会话归属用户（数据权限）
+     * @param sessionId  会话 ID
+     * @param operatorId 删除人用户 ID（审计）
+     */
+    void logicalDelete(Long userId, String sessionId, Long operatorId);
 }

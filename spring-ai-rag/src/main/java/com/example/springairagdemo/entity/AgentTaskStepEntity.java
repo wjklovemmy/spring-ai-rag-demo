@@ -3,6 +3,7 @@ package com.example.springairagdemo.entity;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
+import com.baomidou.mybatisplus.annotation.TableLogic;
 import com.baomidou.mybatisplus.annotation.TableName;
 import lombok.Data;
 
@@ -51,4 +52,17 @@ public class AgentTaskStepEntity {
     /** 发生时间 */
     @TableField("create_time")
     private Date createTime;
+
+    /** 逻辑删除标记：0 正常 / 1 已删除（随所属任务逻辑删除，MyBatis-Plus 自动过滤） */
+    @TableLogic(value = "0", delval = "1")
+    @TableField("deleted")
+    private Integer deleted;
+
+    /** 删除人用户 ID（删除会话级联删除步骤时记录，与所属任务一致） */
+    @TableField("deleted_by")
+    private Long deletedBy;
+
+    /** 删除时间 */
+    @TableField("delete_time")
+    private Date deleteTime;
 }

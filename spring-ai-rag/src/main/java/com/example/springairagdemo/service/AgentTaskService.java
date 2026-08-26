@@ -177,4 +177,35 @@ public class AgentTaskService {
                 .eq(status != null, AgentTaskEntity::getStatus, status)
                 .like(keyword != null && !keyword.isBlank(), AgentTaskEntity::getQuestion, keyword);
     }
+
+    // ==================== 逻辑删除（删除会话级联） ====================
+
+    /**
+     * 逻辑删除某用户某会话下的全部任务及其步骤轨迹（删除会话时级联调用）。
+     * 只将 deleted 置 1 并记录删除人/时间，数据保留供审计追溯；MyBatis-Plus 查询自动过滤已删数据。
+     *
+     * @return 受影响的任务数
+     */
+    public int logicalDeleteBySession(Long userId, String sessionId, Long operatorId) {
+        List<AgentTaskEntity> tasks = agentTaskMapper.selectList(Wrappers.<AgentTaskEntity>lambdaQuery()
+                .eq(AgentTaskEntity::getUserId, userId)
+                .eq(AgentTaskEntity::getSessionId, sessionId));
+        if (tasks.isEmpty()) {
+            return 0;
+        }
+        List<Long> taskIds = tasks.stream().map(AgentTaskEntity::getId).toList();
+        Date now = new Date();
+        // 步骤轨迹：按 task_id 批量逻辑删除（与所属任务一致的删除人/时间）
+        agentTaskStepMapper.update(null, Wrappers.<AgentTaskStepEntity>lambdaUpdate()
+                .set(AgentTaskStepEntity::getDeleted, 1)
+                .set(AgentTaskStepEntity::getDeletedBy, operatorId)
+                .set(AgentTaskStepEntity::getDeleteTime, now)
+                .in(AgentTaskStepEntity::getTaskId, taskIds));
+        return agentTaskMapper.update(null, Wrappers.<AgentTaskEntity>lambdaUpdate()
+                .set(AgentTaskEntity::getDeleted, 1)
+                .set(AgentTaskEntity::getDeletedBy, operatorId)
+                .set(AgentTaskEntity::getDeleteTime, now)
+                .eq(AgentTaskEntity::getUserId, userId)
+                .eq(AgentTaskEntity::getSessionId, sessionId));
+    }
 }

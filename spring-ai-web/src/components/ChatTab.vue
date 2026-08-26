@@ -1,11 +1,28 @@
 <template>
   <div class="chat-layout">
+    <!-- 顶部工具条：知识库选择（上方）+ 会话列表入口（右侧滑出）；吸顶时收起圆角 -->
+    <div class="card chat-toolbar" ref="chatToolbarEl" :class="{ 'is-floating': toolbarFloating }">
+      <label class="kb-label" for="kb-select">知识库</label>
+      <select id="kb-select" class="select kb-select" v-model="kbId" :disabled="kbList.length === 0" @change="handleKbChange">
+        <option value="">-- 请选择知识库 --</option>
+        <option v-for="kb in kbList" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
+      </select>
+      <span v-if="kbList.length === 0" class="msg-info info kb-empty-tip">暂无可用知识库，请先联系管理员创建。</span>
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-primary sessions-btn" @click="createNewSession" :disabled="asking" title="新建对话（当前知识库）">
+        ＋ 新建对话
+      </button>
+      <button class="btn btn-outline sessions-btn" @click="sessionsOpen = true" :disabled="asking" title="打开会话列表（仅显示当前知识库的会话）">
+        ☰ 会话列表
+        <span v-if="currentKbSessions.length" class="session-count-badge">{{ currentKbSessions.length }}</span>
+      </button>
+    </div>
+
     <!-- 对话面板 -->
     <div class="card chat-panel">
       <div class="chat-messages" ref="chatBox">
         <div v-if="messages.length === 0" class="empty">
-          选择一个知识库，输入问题开始对话。
-          <br>回答将基于知识库文档内容生成，并附引用来源。
+          {{ kbId ? '输入问题开始对话，回答将基于知识库文档内容生成，并附引用来源。' : '先在上方选择知识库，再输入问题开始对话。' }}
         </div>
 
         <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
@@ -61,14 +78,20 @@
       </div>
     </div>
 
-    <!-- 会话列表 + 知识库选择侧栏 -->
-    <div class="chat-aside">
-      <div class="card sessions-card">
-        <div class="card-title">会话列表</div>
-        <button class="btn btn-primary btn-sm new-session-btn" @click="createNewSession" :disabled="asking">
-          ＋ 新建对话
-        </button>
-        <div class="session-toolbar" v-if="sessions.length">
+    <!-- 会话列表抽屉：需要时右侧滑出，仅显示当前知识库的会话 -->
+    <transition name="drawer-mask">
+      <div v-if="sessionsOpen" class="drawer-mask" @click="sessionsOpen = false"></div>
+    </transition>
+    <transition name="drawer-panel">
+      <aside v-if="sessionsOpen" class="session-drawer">
+        <div class="drawer-header">
+          <div class="drawer-title">
+            会话列表
+            <span v-if="currentKbName" class="drawer-sub">{{ currentKbName }}</span>
+          </div>
+          <button class="drawer-close" title="关闭" @click="sessionsOpen = false">✕</button>
+        </div>
+        <div class="session-toolbar" v-if="currentKbSessions.length">
           <label class="session-check-all" title="全选/取消全选">
             <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" :disabled="asking">
             全选
@@ -78,9 +101,9 @@
             批量删除
           </button>
         </div>
-        <div class="session-list" v-if="sessions.length">
+        <div class="session-list" v-if="currentKbSessions.length">
           <div
-            v-for="s in sessions"
+            v-for="s in currentKbSessions"
             :key="s.sessionId"
             class="session-item"
             :class="{ active: s.sessionId === sessionId, selected: selectedSessionIds.includes(s.sessionId) }"
@@ -98,29 +121,16 @@
             <span class="session-del" title="删除会话" @click.stop="deleteSession(s)">✕</span>
           </div>
         </div>
-        <div v-else class="msg-info info" style="margin-top: 10px;">
-          暂无会话，点击「新建对话」开始。
+        <div v-else class="msg-info info drawer-empty">
+          该知识库下暂无会话，点击顶部「＋ 新建对话」开始。
         </div>
-      </div>
-      <div class="card kb-card">
-        <div class="card-title">选择知识库</div>
-        <select class="select" v-model="kbId" :disabled="kbList.length === 0">
-          <option value="">-- 请选择 --</option>
-          <option v-for="kb in kbList" :key="kb.id" :value="kb.id">{{ kb.name }}</option>
-        </select>
-        <div v-if="kbList.length === 0" class="msg-info info" style="margin-top: 10px;">
-          暂无可用知识库，请先联系管理员创建。
-        </div>
-        <div class="msg-info info" style="margin-top: 14px; line-height: 1.8;">
-          💡 提示：回答仅基于所选知识库中的文档内容。可通过「文档列表」查看已入库文档。
-        </div>
-      </div>
-    </div>
+      </aside>
+    </transition>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onActivated, nextTick } from 'vue'
+import { ref, computed, onMounted, onActivated, onBeforeUnmount, nextTick } from 'vue'
 import { fetchApi, downloadFile } from '../api/request'
 import { showToast } from '../utils/toast'
 
@@ -137,13 +147,33 @@ const streamMode = ref(localStorage.getItem('chatStreamMode') !== '0')
 const sessionId = ref(localStorage.getItem('chatSessionId') || '')
 // 当前用户会话列表（后端 chat_session 元数据，消息历史存 Redis）
 const sessions = ref([])
+// 会话列表抽屉：需要时右侧滑出
+const sessionsOpen = ref(false)
+// 并列列表仅显示当前知识库的会话（未选知识库时显示全部，便于无选择状态下管理）
+const currentKbSessions = computed(() => {
+  if (!kbId.value) return sessions.value
+  return sessions.value.filter(s => s.knowledgeBaseId != null && String(s.knowledgeBaseId) === String(kbId.value))
+})
+// 当前知识库名称（抽屉标题展示）
+const currentKbName = computed(() => {
+  const kb = kbList.value.find(k => String(k.id) === String(kbId.value))
+  return kb ? kb.name : ''
+})
 // 批量删除：勾选的 sessionId 集合
 const selectedSessionIds = ref([])
-// 全选状态：所有会话均被勾选时为 true
-const allSelected = computed(() => sessions.value.length > 0 && selectedSessionIds.value.length === sessions.value.length)
+// 全选状态：当前知识库下所有会话均被勾选时为 true
+const allSelected = computed(() => currentKbSessions.value.length > 0 && selectedSessionIds.value.length === currentKbSessions.value.length)
 // 来源高亮定位：点击回答中 [来源N] 后，对应来源条目临时高亮并滚动到可视区
 const hlMsgIdx = ref(-1)
 const hlSourceIdx = ref(-1)
+
+// 顶部工具条吸顶状态：页面滚动后工具条悬浮在 .topbar（58px）下方，收起顶部圆角避免露出缝隙
+const chatToolbarEl = ref(null)
+const toolbarFloating = ref(false)
+function updateToolbarFloat() {
+  if (!chatToolbarEl.value) return
+  toolbarFloating.value = chatToolbarEl.value.getBoundingClientRect().top <= 58
+}
 
 function toggleStreamMode(v) {
   streamMode.value = v
@@ -154,9 +184,11 @@ function toggleStreamMode(v) {
 let sessionCreateInFlight = false
 
 /**
- * 加载当前用户会话列表；校验当前会话 ID 是否仍有效（不在列表中则重置为空，
- * 会话改为「新建对话」或首次提问时惰性创建，避免进页面就写库、并发重复建）。
- * 未登录（接口 401）时静默跳过，保持旧的无会话模式可用。
+ * 加载当前用户会话列表。
+ * 注意：不再按"sessionId 是否在列表中"重置当前会话——
+ * 后端已过滤空会话（从未问答），当前空会话作为「新建对话」占位合法地不在列表，
+ * 若按旧逻辑重置会清空消息面板，造成问答期间答案丢失（需手动重新选中才回显）；
+ * 已被删除的会话由 loadMessages 404 兜底重置。未登录（401）时静默跳过。
  */
 async function loadSessions() {
   try {
@@ -165,11 +197,6 @@ async function loadSessions() {
     const data = await res.json()
     if (!Array.isArray(data)) return
     sessions.value = data
-    if (sessionId.value && !data.some(s => s.sessionId === sessionId.value)) {
-      sessionId.value = ''
-      localStorage.removeItem('chatSessionId')
-      messages.value = []
-    }
   } catch (e) {
     console.warn('加载会话列表失败，保持当前会话', e)
   }
@@ -194,6 +221,7 @@ async function createNewSession() {
     localStorage.setItem('chatSessionId', data.sessionId)
     messages.value = []
     loadSessions()
+    sessionsOpen.value = false
     nextTick(scroll)
   } catch (e) {
     console.warn('创建会话失败', e)
@@ -242,7 +270,20 @@ async function selectSession(s) {
   if (s.knowledgeBaseId) kbId.value = String(s.knowledgeBaseId)
   messages.value = []
   await loadMessages()
+  sessionsOpen.value = false
   nextTick(scroll)
+}
+
+/** 切换知识库：若当前会话不属于新知识库，重置为无会话状态（提问时惰性创建新会话） */
+function handleKbChange() {
+  const cur = sessions.value.find(s => s.sessionId === sessionId.value)
+  if (cur && cur.knowledgeBaseId != null && String(cur.knowledgeBaseId) === String(kbId.value)) {
+    return // 当前会话仍属于新知识库，保留
+  }
+  sessionId.value = ''
+  localStorage.removeItem('chatSessionId')
+  messages.value = []
+  selectedSessionIds.value = []
 }
 
 /** 删除会话（后端删 MySQL 元数据 + Redis 记忆）；删除的是当前会话则新建一个 */
@@ -273,9 +314,9 @@ function toggleSelect(sid, checked) {
   }
 }
 
-/** 全选/取消全选 */
+/** 全选/取消全选（仅作用于当前知识库的会话） */
 function toggleSelectAll(e) {
-  selectedSessionIds.value = e.target.checked ? sessions.value.map(s => s.sessionId) : []
+  selectedSessionIds.value = e.target.checked ? currentKbSessions.value.map(s => s.sessionId) : []
 }
 
 /** 批量删除会话（POST 批量接口，逐条归属校验）；删除包含当前会话则新建一个 */
@@ -515,8 +556,18 @@ async function initChatTab() {
   // 刷新页面后自动回显当前会话历史（sessionId 已存 localStorage）
   loadMessages()
 }
-onMounted(initChatTab)
-onActivated(initChatTab)
+onMounted(() => {
+  updateToolbarFloat()
+  window.addEventListener('scroll', updateToolbarFloat, { passive: true })
+  initChatTab()
+})
+onActivated(() => {
+  updateToolbarFloat()
+  initChatTab()
+})
+onBeforeUnmount(() => {
+  window.removeEventListener('scroll', updateToolbarFloat)
+})
 </script>
 
 <style scoped>
@@ -578,21 +629,138 @@ onActivated(initChatTab)
   border-radius: 6px;
 }
 
-/* ===== 会话列表 + 知识库侧栏 ===== */
-.chat-aside {
+/* ===== 顶部工具条：知识库选择（上方） + 会话列表入口 ===== */
+.chat-toolbar {
   display: flex;
-  flex-direction: column;
-  gap: 14px;
-  width: 260px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  /* 问答增多、消息区变长导致页面滚动时，工具条悬浮在顶部不被遮住：
+     吸在主布局 .topbar（height:58px, sticky top:0, z-index:100）下方 */
+  position: sticky;
+  top: 58px;
+  z-index: 50;
+}
+/* 悬浮时加深阴影、收掉顶部圆角，避免露出背景缝隙 */
+.chat-toolbar {
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+  border-radius: 10px;
+}
+.chat-toolbar.is-floating {
+  border-radius: 0 0 10px 10px;
+}
+.kb-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: #475569;
+  white-space: nowrap;
+}
+.kb-select {
+  width: 300px;
+  max-width: 45%;
   flex-shrink: 0;
 }
-.sessions-card,
-.kb-card {
+.kb-empty-tip {
+  margin: 0;
+  padding: 6px 12px;
+}
+.toolbar-spacer {
+  flex: 1;
+}
+.sessions-btn {
+  position: relative;
+  flex-shrink: 0;
+}
+.session-count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* ===== 会话列表抽屉（右侧滑出） ===== */
+.drawer-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.35);
+  z-index: 1050;
+}
+.drawer-mask-enter-active,
+.drawer-mask-leave-active {
+  transition: opacity 0.25s ease;
+}
+.drawer-mask-enter-from,
+.drawer-mask-leave-to {
+  opacity: 0;
+}
+.session-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 320px;
+  max-width: 88vw;
+  z-index: 1100;
+  background: #fff;
+  box-shadow: -8px 0 24px rgba(15, 23, 42, 0.14);
+  display: flex;
+  flex-direction: column;
   padding: 16px;
+}
+.drawer-panel-enter-active,
+.drawer-panel-leave-active {
+  transition: transform 0.25s ease;
+}
+.drawer-panel-enter-from,
+.drawer-panel-leave-to {
+  transform: translateX(100%);
+}
+.drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+.drawer-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: #1e293b;
+}
+.drawer-sub {
+  margin-left: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #64748b;
+}
+.drawer-close {
+  border: none;
+  background: transparent;
+  font-size: 18px;
+  line-height: 1;
+  color: #94a3b8;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.drawer-close:hover {
+  color: #334155;
+  background: #f1f5f9;
+}
+.drawer-empty {
+  margin: 12px 0 0;
 }
 .session-list {
   margin-top: 10px;
-  max-height: 300px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;

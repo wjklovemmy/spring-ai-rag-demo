@@ -38,7 +38,7 @@ On Windows, replace `./mvnw` with `mvnw.cmd`. Spring Cloud (`2025.1.0`) and Spri
 
 Before running, ensure the following services are available:
 
-- **Nacos** on `localhost:8848` (registry + config center, via `docker-compose up -d nacos`, console `http://localhost:8848/nacos`, default `nacos/nacos`). All three services register here; gateway `lb://` routes and OpenFeign service-to-service calls (`UserFeignClient` / `RagSyncFeignClient`) resolve instances via Nacos. Shared secrets may be published to config center data-id `common.yaml` (see `nacos/common.yaml`), otherwise local fallbacks apply.
+- **Nacos** on `localhost:8848` (registry + config center, via `docker-compose up -d nacos`, console `http://localhost:8090/nacos`, default `nacos/nacos`). All three services register here; gateway `lb://` routes and OpenFeign service-to-service calls (`UserFeignClient` / `RagSyncFeignClient`) resolve instances via Nacos. Shared secrets may be published to config center data-id `common.yaml` (see `nacos/common.yaml`), otherwise local fallbacks apply.
 - **Milvus** vector database on `localhost:19530` (default database, per-knowledge-base dynamic collections `kb_{id}`)
 - **DeepSeek API** key via environment variable `DEEPSEEK_API_KEY`
 - **DashScope (Alibaba Cloud) API** key via environment variable `DASHSCOPE_API_KEY`

@@ -1001,7 +1001,9 @@ public abstract class KnowledgeDocumentService {
         // 仅当唯一命中且与原编号不符时纠正；无法判定则保持原编号（保守，不误伤）
         answer = alignCitations(answer, rc);
 
-        List<SourceInfo> sources = rc.sources();
+        // 引用来源仅随实际引用展示：回答中无 [来源N]（澄清性提问/告知无信息/AI 降级）时不返回来源，
+        // 避免把与回答无关的检索候选展示给用户（agent_task 快照仍保留完整候选供审计查看）
+        List<SourceInfo> sources = hasSourceRefs(answer) ? rc.sources() : List.of();
 
         // Agent 可观测性：同步问答同样落库执行轨迹（无工具步骤），记录 prompt/model/引用来源；
         // 同步链路不采集 token 用量（流式链路已记录），token 列为 null
@@ -1166,6 +1168,14 @@ public abstract class KnowledgeDocumentService {
             "上面的问题|上面的回答|上面那|刚才|之前|先前|上一个问题|前一个问题|上一问|前一问|"
                     + "再查|重新|重试|重复|再问|再说|再讲|再回答|继续|"
                     + "这个文档|这份文档|这个文件|这份文件|该文档|该文件|同样的问题");
+
+    /** [来源N] 引用标记：回答中不存在该标记（如澄清性提问、告知无信息、AI 降级）时不展示引用来源 */
+    private static final Pattern SOURCE_REF_PATTERN = Pattern.compile("\\[来源\\s*\\d+\\]");
+
+    /** 判断回答是否实际引用了 [来源N]：无引用的回答（澄清/拒绝/降级）不随回答展示引用来源 */
+    public static boolean hasSourceRefs(String answer) {
+        return answer != null && SOURCE_REF_PATTERN.matcher(answer).find();
+    }
 
     /**
      * 多轮指代感知的显式文档解析：
