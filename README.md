@@ -17,6 +17,7 @@
   - [3. 文档删除](#3-文档删除)
   - [4. 用户认证与授权（JWT + RBAC）](#4-用户认证与授权jwt--rbac)
   - [5. 聊天会话管理](#5-聊天会话管理)
+  - [6. Agent 升级问题与解决方案](#6-agent-升级问题与解决方案)
 - [数据库设计](#数据库设计)
 - [配置说明](#配置说明)
 - [快速开始](#快速开始)
@@ -495,6 +496,23 @@ spring-ai-rag-demo/
 - **标题自动生成**：会话标题取首个问题的前 30 字（去空白、截断加省略号）；
 - **归属隔离**：列表/消息/删除均按 `UserContext` 的 userId 过滤，只能操作自己的会话；
 - **清空对话**：`POST /api/knowledge-document/chat/clear-memory` 删除 Redis 记忆（会话记录保留，前端更换新 ID 继续提问）。
+
+---
+
+### 6. Agent 升级问题与解决方案
+
+Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `agent_task_step`）与会话管理在升级过程中遇到的问题及对应解法：
+
+| # | 遇到的问题 | 原因分析 | 解决方案 |
+|---|-----------|---------|---------|
+| 1 | 问「文档结构」会**枚举全部文档**，上万文档时拼接出超大工具结果/响应，撑爆上下文 | `documentOutline` 未指定文档时遍历知识库全部文档生成大纲，文档规模无上限 | **三重上限防护**：`rag.tools.max-outline-docs`（默认 20，超限拒绝枚举并引导指定文档名）、`max-outline-chars`（默认 12000，结果字符硬上限）、`max-inventory-docs`（默认 200，文档清单截断并引导关键词定位） |
+| 2 | 防护阈值写死在代码常量（`static final`），调参必须改代码重启 | 限制值未配置化 | 提取到 `RagConfigProperties.Tools`（前缀 `rag.tools.*`）；`@ConfigurationProperties` 在 **Nacos 配置变更时自动重新绑定**（无需 `@RefreshScope`），修改配置即热生效、免重启 |
+| 3 | 模型**未实际引用知识库**（如「文档结构指代不明确，请问您想查询哪份文档的结构？」）时，前端仍展示检索候选来源，误导用户 | sources 无条件随回答返回（检索有候选就下发） | 以回答是否含 `[来源N]` 标记为信号（`hasSourceRefs`）：无引用则不下发来源。SSE 按 final 回答动态决定（final 先于 sources，时序天然正确），历史消息回补同步过滤；`agent_task` 落库快照仍保留完整候选供审计 |
+| 4 | 删除会话后 **Agent 审计数据残留**，且无法追溯删除人/时间 | 删除会话仅物理删除 `chat_session`，`agent_task` / `agent_task_step` 成为孤儿数据 | 三表新增逻辑删除三件套（`deleted` / `deleted_by` / `delete_time`），删除会话由应用**级联置 1** 并记录删除人（当前登录用户）；`@TableLogic` 自动过滤已删数据；`sql/migration_agent_logic_delete.sql` 支持已部署库升级 |
+| 5 | 提问后**答案不显示**，需手动选中会话才出现 | 前端 `loadSessions` 的「sessionId 不在列表 → 重置并清空 messages」校验在问答流式期间触发（后端已过滤空会话），竞态清空了正在生成的消息 | 移除该校验，改由 `loadMessages` 404 兜底；流式期间的列表刷新不再触碰正在生成的消息 |
+| 6 | 每次「新建对话」都生成新空会话，无问答时**空会话堆积** | 创建会话无「是否已有空会话」判断 | `create` 复用现有空会话（Redis 消息历史为空即视为空），`list` 过滤空会话；空会话仅在使用提问时才变为正式会话 |
+
+> 对应代码：`KbQueryTools`（工具三重上限）、`RagConfigProperties`（`rag.tools.*`）、`KnowledgeDocumentService`（`hasSourceRefs`）、`KnowledgeDocumentController` / `ChatSessionController`（来源过滤）、`ChatSessionService` / `AgentTaskService`（级联逻辑删除）、`ChatTab.vue`（前端竞态/空会话）。
 
 ---
 
