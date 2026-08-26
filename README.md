@@ -87,7 +87,7 @@ graph TB
     end
 
     subgraph Storage["存储层"]
-        MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member/chat_session<br/>用户域: RBAC 五表")]
+        MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member/chat_session/agent_task<br/>用户域: RBAC 五表")]
         MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
         MINIO[("MinIO<br/>原始 PDF 文件")]
         REDIS[("Redis<br/>对话记忆 rag:chat:memory:{userId}:{sessionId}<br/>TTL 7 天")]
@@ -379,7 +379,7 @@ spring-ai-rag-demo/
 **检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
 
 **返回结构**：
-- 流式（默认）：SSE 事件序列——`{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"sources","sources":[...]}`（生成完毕下发候选，前端按回答实际引用的 [来源N] 过滤展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
+- 流式（默认）：SSE 事件序列——`{"type":"tool","name":...,"status":"running|done|error","args":...,"result":...}`（模型自主调用工具的过程，先于内容下发）→ `{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"final","content":...}`（引用对齐校验后的最终全文，前端覆盖显示）→ `{"type":"sources","sources":[...]}`（生成完毕下发候选，前端按回答实际引用的 [来源N] 过滤展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
 - 同步（`stream=false`）：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`
 - 前端将 `sources` 渲染为可点击高亮/可下载的引用来源（`.source-ref` 标签与来源列表编号对应）；AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）
 
@@ -492,7 +492,7 @@ spring-ai-rag-demo/
 另外 **Nacos 配置中心**也使用同一 MySQL 实例中的 `nacos_config` 库存储配置（见 [快速开始](#快速开始) 第 1 步）。
 
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
-- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session`。
+- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session` / `agent_task` / `agent_task_step`。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
 - `sql/mysql-nacos.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
@@ -510,6 +510,8 @@ spring-ai-rag-demo/
 | `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
 | `chat_session` | 聊天会话元数据 | user_id、session_id(后端 UUID 唯一，`uk_user_session`)、title(首个问题截断 30 字)、knowledge_base_id、create_time/update_time |
+| `agent_task` | Agent 任务（一次提问的执行审计单元，可观测性） | user_id、session_id、kb_id、question、answer(LONGTEXT)、sources(引用来源 JSON)、prompt(LLM 实际输入)、model、prompt_tokens/completion_tokens/total_tokens、status(0执行中/1成功/2失败)、tool_count、cost_ms、error_msg、start_ms、create_time/finish_time |
+| `agent_task_step` | Agent 任务步骤轨迹（工具调用过程） | task_id、type(TOOL_CALL)、tool_name、status(running/done/error)、args、result、latency_ms(该步耗时)、create_time |
 
 **用户域独立库（spring_ai_user）—— RBAC 经典五表**：
 
@@ -749,7 +751,7 @@ npm run build        # 生产构建，产物在 dist/
 | POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
-| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`delta`/`final`/`sources`/`done`/`error` 事件，其中 `final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆；检索为空时引导模型调用工具回答文档清单类问题） |
+| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`tool`/`delta`/`final`/`sources`/`done`/`error` 事件，`tool` 展示模型调用工具过程、`final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆；检索为空时引导模型调用工具回答文档清单类问题） |
 | POST | `/api/knowledge-document/chat/clear-memory` | 是 | 清空指定会话的 Redis 记忆（body `{sessionId}` 可选，缺省清当前会话；会话记录保留） |
 | POST | `/api/chat-session/create` | 是 | 创建聊天会话（可选 body `{knowledgeBaseId}`），返回后端生成的 `sessionId`/`title` |
 | GET | `/api/chat-session/list` | 是 | 当前用户会话列表（按最近更新倒序） |
@@ -758,6 +760,8 @@ npm run build        # 生产构建，产物在 dist/
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
 | GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤，含 statusText/version/进度等） |
+| GET | `/api/agent-task/list` | 是 | Agent 任务列表（非 ADMIN 仅本人，ADMIN 全部；可选 `kbId`/`status`/`keyword`/`page`/`size`，创建时间倒序，含 `kbName`/`statusText`/`toolCount`/`costMs`） |
+| GET | `/api/agent-task/{id}` | 是 | Agent 任务详情（含步骤轨迹 `steps`：type/tool_name/status/args/result，按执行顺序；非 ADMIN 仅本人，越权 403） |
 | GET | `/api/admin/users?keyword=` | 是 | 用户列表（需 ADMIN，含功能角色） |
 | POST | `/api/admin/users` | 是 | 创建用户（需 ADMIN，body `{username,password,nickname,email}`） |
 | PUT | `/api/admin/users/{id}/status` | 是 | 启用/禁用用户（需 ADMIN，body `{status:0\|1}`） |

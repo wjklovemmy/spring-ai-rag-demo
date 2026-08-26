@@ -65,6 +65,7 @@ import ChatTab from '../components/ChatTab.vue'
 import UploadTab from '../components/UploadTab.vue'
 import DocsTab from '../components/DocsTab.vue'
 import TasksTab from '../components/TasksTab.vue'
+import AgentTasksTab from '../components/AgentTasksTab.vue'
 import KbTab from '../components/KbTab.vue'
 import UsersTab from '../components/UsersTab.vue'
 import RolesTab from '../components/RolesTab.vue'
@@ -83,7 +84,8 @@ const navItems = computed(() => {
     { key: 'chat', icon: '💬', title: '知识问答' },
     { key: 'upload', icon: '📤', title: '上传文档' },
     { key: 'docs', icon: '📄', title: '文档列表' },
-    { key: 'tasks', icon: '⏳', title: '任务列表' }
+    { key: 'tasks', icon: '⏳', title: '任务列表' },
+    { key: 'agentTasks', icon: '🤖', title: 'Agent 任务' }
   ]
   if (isAdmin.value) {
     items.push(
@@ -101,6 +103,7 @@ const tabComponents = {
   upload: UploadTab,
   docs: DocsTab,
   tasks: TasksTab,
+  agentTasks: AgentTasksTab,
   kb: KbTab,
   users: UsersTab,
   roles: RolesTab
@@ -110,7 +113,7 @@ const currentComponent = shallowRef(tabComponents[activeTab.value])
 
 const tabTitles = {
   home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表',
-  tasks: '任务列表', kb: '知识库管理', users: '用户管理', roles: '角色管理'
+  tasks: '任务列表', agentTasks: 'Agent 任务', kb: '知识库管理', users: '用户管理', roles: '角色管理'
 }
 const currentTitle = computed(() => tabTitles[activeTab.value])
 

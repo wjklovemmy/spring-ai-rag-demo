@@ -279,6 +279,7 @@ public class KnowledgeDocumentController {
      * 基于指定知识库进行问答（需要 VIEWER 及以上），SSE 流式输出
      * <p>事件流格式（data 为 JSON 对象）：
      * <ul>
+     *   <li>{@code {"type":"tool","name":"...","status":"running|done|error","args":"...","result":"..."}} — 工具调用过程（先于内容下发）</li>
      *   <li>{@code {"type":"delta","content":"..."}} — 增量文本（逐 token）</li>
      *   <li>{@code {"type":"final","content":"..."}} — 引用对齐校验后的最终全文（覆盖显示，强制纠正编号）</li>
      *   <li>{@code {"type":"sources","sources":[...]}} — 完整引用来源（结束前发送）</li>
@@ -391,10 +392,22 @@ public class KnowledgeDocumentController {
             return src;
         }).toList();
 
-        // SSE 事件流：先逐 token 输出增量文本，再下发引用对齐校验后的最终全文
-        // （final：强制纠正 [来源N] 编号张冠李戴，前端覆盖显示），最后携带引用来源与结束标记
-        Flux<ServerSentEvent<Map<String, Object>>> flux = chatResult.stream()
+        // SSE 事件流：先并行下发工具调用事件（模型自主调用 KbQueryTools 的过程，先于内容产生）
+        // 与逐 token 增量文本；内容流结束后合并下发引用对齐校验后的最终全文（final：强制纠正
+        // [来源N] 编号张冠李戴，前端覆盖显示），最后携带引用来源与结束标记。
+        // 时序保证：工具调用全部发生在内容生成之前，merge 顺序天然正确；内容流完成时
+        // complete 工具 Sink，使 merge 完成、后续 concatWith 链继续。
+        Flux<ServerSentEvent<Map<String, Object>>> toolStream = chatResult.toolEvents()
+                .asFlux()
+                .map(evt -> sseEvent(Map.<String, Object>of(
+                        "type", "tool", "name", evt.name(), "status", evt.status(),
+                        "args", evt.args() == null ? "" : evt.args(),
+                        "result", evt.result() == null ? "" : evt.result())));
+        Flux<ServerSentEvent<Map<String, Object>>> deltaStream = chatResult.stream()
                 .map(delta -> sseEvent(Map.<String, Object>of("type", "delta", "content", delta)))
+                .doFinally(sig -> chatResult.toolEvents().tryEmitComplete());
+
+        Flux<ServerSentEvent<Map<String, Object>>> flux = Flux.merge(toolStream, deltaStream)
                 .concatWith(chatResult.correctedAnswer()
                         .map(a -> sseEvent(Map.<String, Object>of("type", "final", "content", a))))
                 .concatWith(Flux.just(

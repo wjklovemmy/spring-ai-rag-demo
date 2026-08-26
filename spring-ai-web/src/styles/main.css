@@ -239,6 +239,19 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 .msg.user .msg-body { background: #eff6ff; border-color: #bfdbfe; }
 .msg-body .msg-text { white-space: pre-wrap; word-break: break-word; line-height: 1.7; color: #1e293b; }
 .msg-body .msg-text.error { color: #b91c1c; }
+/* 工具调用过程条（SSE tool 事件） */
+.tool-calls { margin-bottom: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+.tool-call {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; color: #475569; background: #f1f5f9;
+  border: 1px solid #e2e8f0; border-radius: 999px; padding: 2px 10px;
+}
+.tool-name { font-weight: 600; }
+.tool-status { font-size: 11px; border-radius: 999px; padding: 0 6px; }
+.tool-status.st-running { color: #1d4ed8; background: #dbeafe; }
+.tool-status.st-done { color: #15803d; background: #dcfce7; }
+.tool-status.st-error { color: #b91c1c; background: #fee2e2; }
+.tool-args { color: #94a3b8; max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg-loading { display: flex; align-items: center; gap: 8px; color: #94a3b8; font-size: 13px; }
 .msg-loading .dot { width: 6px; height: 6px; border-radius: 50%; background: #94a3b8; animation: blink 1.2s infinite; }
 .msg-loading .dot:nth-child(2) { animation-delay: .2s; }
@@ -279,6 +292,11 @@ input, select, textarea { font-family: inherit; font-size: 14px; }
 .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
 .toolbar .input, .toolbar .select { width: auto; min-width: 140px; }
 .toolbar .grow { flex: 1; }
+
+.pager {
+  display: flex; align-items: center; justify-content: flex-end;
+  gap: 12px; margin-top: 14px;
+}
 
 /* ---------------- 任务 ---------------- */
 .task-progress { display: flex; gap: 4px; align-items: center; }

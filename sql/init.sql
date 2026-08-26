@@ -197,6 +197,54 @@ CREATE TABLE IF NOT EXISTS `chat_session` (
     KEY `idx_user_update` (`user_id`, `update_time`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='聊天会话';
 
+-- ============================================================
+-- Agent 任务（一次提问的执行审计单元）
+-- 说明：
+--   1. 一次提问 = 一条 agent_task，记录问题/最终回答/状态/耗时/工具调用次数，
+--      支撑 Agent 执行审计、失败排查、耗时统计
+--   2. 工具调用过程（模型自主调用 KbQueryTools 的每一步）落在 agent_task_step，
+--      按 task_id + id 顺序还原推理轨迹
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `agent_task` (
+    `id`               BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `user_id`          BIGINT       NOT NULL COMMENT '发起用户 ID',
+    `session_id`       VARCHAR(64)  DEFAULT NULL COMMENT '会话 ID（chat_session.session_id）',
+    `kb_id`            BIGINT       DEFAULT NULL COMMENT '知识库 ID',
+    `question`         VARCHAR(2000) NOT NULL COMMENT '用户问题',
+    `answer`           LONGTEXT     DEFAULT NULL COMMENT '最终回答（引用对齐后全文）',
+    `sources`          LONGTEXT     DEFAULT NULL COMMENT '引用来源快照（JSON 数组）',
+    `prompt`           LONGTEXT     DEFAULT NULL COMMENT 'LLM 实际输入（系统提示+问题，可观测性审计）',
+    `model`            VARCHAR(100) DEFAULT NULL COMMENT 'LLM 模型名',
+    `prompt_tokens`    INT          DEFAULT NULL COMMENT '输入 token 数',
+    `completion_tokens` INT         DEFAULT NULL COMMENT '输出 token 数',
+    `total_tokens`     INT          DEFAULT NULL COMMENT '总 token 数',
+    `status`           TINYINT      NOT NULL DEFAULT 0 COMMENT '状态：0 执行中 / 1 成功 / 2 失败',
+    `tool_count`       INT          NOT NULL DEFAULT 0 COMMENT '工具调用步骤数',
+    `cost_ms`          BIGINT       DEFAULT NULL COMMENT '总耗时（毫秒）',
+    `error_msg`        VARCHAR(2000) DEFAULT NULL COMMENT '失败原因',
+    `start_ms`         BIGINT       NOT NULL COMMENT '开始时间戳（毫秒）',
+    `create_time`      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '开始时间',
+    `finish_time`      DATETIME     DEFAULT NULL COMMENT '结束时间',
+    KEY `idx_user_time` (`user_id`, `create_time`),
+    KEY `idx_session` (`session_id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 任务';
+
+-- ============================================================
+-- Agent 任务步骤轨迹（工具调用过程）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `agent_task_step` (
+    `id`          BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `task_id`     BIGINT       NOT NULL COMMENT '任务 ID（agent_task.id）',
+    `type`        VARCHAR(20)  NOT NULL DEFAULT 'TOOL_CALL' COMMENT '步骤类型：TOOL_CALL',
+    `tool_name`   VARCHAR(100) DEFAULT NULL COMMENT '工具名',
+    `status`      VARCHAR(20)  NOT NULL COMMENT '状态：running / done / error',
+    `args`        TEXT         DEFAULT NULL COMMENT '工具入参摘要',
+    `result`      TEXT         DEFAULT NULL COMMENT '工具返回结果',
+    `latency_ms`  BIGINT       DEFAULT NULL COMMENT '该步耗时（毫秒，done 时回填）',
+    `create_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '发生时间',
+    KEY `idx_task` (`task_id`, `id`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 任务步骤轨迹';
+
 -- 内置 ADMIN 角色 / 权限种子 / admin 管理员账号及其绑定关系，
 -- 已全部迁移至用户域独立库脚本 sql/user.sql（应用启动时 UserDataInitializer 也会自动补齐）。
 

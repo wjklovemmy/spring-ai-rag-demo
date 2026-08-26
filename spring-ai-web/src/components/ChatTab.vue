@@ -11,6 +11,13 @@
         <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
           <div class="msg-avatar">{{ m.role === 'user' ? '我' : 'AI' }}</div>
           <div class="msg-body">
+            <div class="tool-calls" v-if="m.tools && m.tools.length">
+              <div class="tool-call" v-for="(t, ti) in m.tools" :key="ti">
+                <span class="tool-name">{{ t.name }}</span>
+                <span class="tool-status" :class="'st-' + t.status">{{ toolStatusText(t.status) }}</span>
+                <span class="tool-args" v-if="t.args">{{ t.args }}</span>
+              </div>
+            </div>
             <div class="msg-text" :class="{ error: m.error }">
               <template v-for="(p, pi) in parseText(m.text)" :key="pi">
                 <span v-if="p.type === 'ref'" class="source-ref" @click="scrollToSource(p.num, i)">[来源{{ p.num }}]</span>
@@ -61,14 +68,32 @@
         <button class="btn btn-primary btn-sm new-session-btn" @click="createNewSession" :disabled="asking">
           ＋ 新建对话
         </button>
+        <div class="session-toolbar" v-if="sessions.length">
+          <label class="session-check-all" title="全选/取消全选">
+            <input type="checkbox" :checked="allSelected" @change="toggleSelectAll" :disabled="asking">
+            全选
+          </label>
+          <span v-if="selectedSessionIds.length" class="session-count">已选 {{ selectedSessionIds.length }} 项</span>
+          <button class="btn btn-outline btn-sm" :disabled="selectedSessionIds.length === 0 || asking" @click="batchDeleteSessions">
+            批量删除
+          </button>
+        </div>
         <div class="session-list" v-if="sessions.length">
           <div
             v-for="s in sessions"
             :key="s.sessionId"
             class="session-item"
-            :class="{ active: s.sessionId === sessionId }"
+            :class="{ active: s.sessionId === sessionId, selected: selectedSessionIds.includes(s.sessionId) }"
             @click="selectSession(s)"
           >
+            <input
+              type="checkbox"
+              class="session-check"
+              :checked="selectedSessionIds.includes(s.sessionId)"
+              @click.stop
+              @change="e => toggleSelect(s.sessionId, e.target.checked)"
+              :disabled="asking"
+            >
             <span class="session-title" :title="s.title">{{ s.title }}</span>
             <span class="session-del" title="删除会话" @click.stop="deleteSession(s)">✕</span>
           </div>
@@ -95,7 +120,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onActivated, nextTick } from 'vue'
+import { ref, computed, onMounted, onActivated, nextTick } from 'vue'
 import { fetchApi, downloadFile } from '../api/request'
 import { showToast } from '../utils/toast'
 
@@ -112,6 +137,10 @@ const streamMode = ref(localStorage.getItem('chatStreamMode') !== '0')
 const sessionId = ref(localStorage.getItem('chatSessionId') || '')
 // 当前用户会话列表（后端 chat_session 元数据，消息历史存 Redis）
 const sessions = ref([])
+// 批量删除：勾选的 sessionId 集合
+const selectedSessionIds = ref([])
+// 全选状态：所有会话均被勾选时为 true
+const allSelected = computed(() => sessions.value.length > 0 && selectedSessionIds.value.length === sessions.value.length)
 // 来源高亮定位：点击回答中 [来源N] 后，对应来源条目临时高亮并滚动到可视区
 const hlMsgIdx = ref(-1)
 const hlSourceIdx = ref(-1)
@@ -190,8 +219,10 @@ async function loadMessages() {
         messages.value = data.map(m => ({
           role: m.role,
           text: m.content || '',
-          sources: [],
-          error: false
+          // 历史消息引用来源由后端从 agent_task 快照回补（刷新/切换会话后仍可查看）
+          sources: Array.isArray(m.sources) ? m.sources : [],
+          error: false,
+          tools: []
         }))
       }
     } else if (res.status === 404) {
@@ -224,11 +255,56 @@ async function deleteSession(s) {
     return
   }
   sessions.value = sessions.value.filter(x => x.sessionId !== s.sessionId)
+  selectedSessionIds.value = selectedSessionIds.value.filter(x => x !== s.sessionId)
   if (s.sessionId === sessionId.value) {
     sessionId.value = ''
     localStorage.removeItem('chatSessionId')
     messages.value = []
     createNewSession()
+  }
+}
+
+/** 勾选/取消单个会话（checkbox 已 stop 冒泡，不触发切换会话） */
+function toggleSelect(sid, checked) {
+  if (checked) {
+    if (!selectedSessionIds.value.includes(sid)) selectedSessionIds.value.push(sid)
+  } else {
+    selectedSessionIds.value = selectedSessionIds.value.filter(x => x !== sid)
+  }
+}
+
+/** 全选/取消全选 */
+function toggleSelectAll(e) {
+  selectedSessionIds.value = e.target.checked ? sessions.value.map(s => s.sessionId) : []
+}
+
+/** 批量删除会话（POST 批量接口，逐条归属校验）；删除包含当前会话则新建一个 */
+async function batchDeleteSessions() {
+  const ids = selectedSessionIds.value.slice()
+  if (!ids.length) return
+  if (!window.confirm(`确定删除选中的 ${ids.length} 个会话？删除后历史不可恢复。`)) return
+  try {
+    const res = await fetchApi('/api/chat-session/batch-delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sessionIds: ids })
+    })
+    const data = await res.json()
+    if (!res.ok || !data.success) {
+      showToast((data && data.message) || '批量删除失败', 'error')
+      return
+    }
+    sessions.value = sessions.value.filter(s => !ids.includes(s.sessionId))
+    selectedSessionIds.value = []
+    if (ids.includes(sessionId.value)) {
+      sessionId.value = ''
+      localStorage.removeItem('chatSessionId')
+      messages.value = []
+      createNewSession()
+    }
+    showToast(`已删除 ${data.deleted || ids.length} 个会话`, 'success')
+  } catch (e) {
+    showToast('批量删除失败，请稍后重试', 'error')
   }
 }
 
@@ -257,6 +333,13 @@ function parseText(text) {
   }
   if (last < text.length) parts.push({ type: 'text', value: text.slice(last) })
   return parts
+}
+
+/** 工具调用状态文案（SSE tool 事件 status → 展示文本） */
+function toolStatusText(status) {
+  if (status === 'done') return '完成'
+  if (status === 'error') return '失败'
+  return '进行中…'
 }
 
 /** 点击回答中的 [来源N]：定位到该消息对应来源条目并短暂高亮 */
@@ -310,7 +393,7 @@ async function ask() {
     }
   }
   messages.value.push({ role: 'user', text: q })
-  const idx = messages.value.push({ role: 'assistant', text: '', sources: [], error: false }) - 1
+  const idx = messages.value.push({ role: 'assistant', text: '', sources: [], error: false, tools: [] }) - 1
   question.value = ''
   asking.value = true
   scroll()
@@ -388,7 +471,17 @@ function handleSseEvent(raw, idx) {
   }
   const m = messages.value[idx]
   if (!m) return
-  if (evt.type === 'delta') {
+  if (evt.type === 'tool') {
+    // 工具调用过程：同一工具 running→done 原地更新状态，避免重复条目
+    const tool = { name: evt.name || '', status: evt.status || 'running', args: evt.args || '' }
+    const prev = m.tools.findIndex(t => t.name === tool.name && t.status === 'running')
+    if (prev >= 0) {
+      m.tools[prev] = tool
+    } else {
+      m.tools.push(tool)
+    }
+    scroll()
+  } else if (evt.type === 'delta') {
     m.text += evt.content || ''
     scroll()
   } else if (evt.type === 'final') {
@@ -398,14 +491,10 @@ function handleSseEvent(raw, idx) {
       scroll()
     }
   } else if (evt.type === 'sources') {
-    const all = Array.isArray(evt.sources) ? evt.sources : []
-    // 只保留回答中实际引用的来源：流式模式下后端返回全部候选（生成前无法预知引用），
-    // 此处从完整回答文本提取 [来源N] 过滤；同步模式后端已精准返回，过滤后结果不变
-    const cited = new Set()
-    const re = /\[来源(\d+)\]/g
-    let mm
-    while ((mm = re.exec(m.text))) cited.add(Number(mm[1]))
-    m.sources = cited.size ? all.filter(s => cited.has(s.refIndex)) : []
+    // 展示全部检索候选来源（编号不重排，与回答中 [来源N] 一一对应）。
+    // 不做"仅保留被引用来源"过滤：LLM 可能只标注了部分编号（如仅 [来源1]），
+    // 但检索精排后的候选都是相关片段，应完整展示供用户查看
+    m.sources = Array.isArray(evt.sources) ? evt.sources : []
     scroll()
   } else if (evt.type === 'error') {
     m.error = true
@@ -530,6 +619,45 @@ onActivated(initChatTab)
   background: #dbeafe;
   border-color: #93c5fd;
   color: #1d4ed8;
+  font-weight: 600;
+}
+.session-item.selected {
+  border-color: #93c5fd;
+}
+.session-check {
+  flex-shrink: 0;
+  margin: 0;
+  cursor: pointer;
+  accent-color: #2563eb;
+}
+.session-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+}
+.session-check-all {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #64748b;
+  cursor: pointer;
+  user-select: none;
+}
+.session-check-all input {
+  margin: 0;
+  cursor: pointer;
+  accent-color: #2563eb;
+}
+.session-count {
+  font-size: 12px;
+  color: #2563eb;
   font-weight: 600;
 }
 .session-title {

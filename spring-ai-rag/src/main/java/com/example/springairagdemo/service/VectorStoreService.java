@@ -426,20 +426,38 @@ public class VectorStoreService {
      * @return 检索结果列表（含 chunkId，调用方通过 chunkId 从 MySQL 获取文本内容）
      */
     public List<SearchResult> search(Long knowledgeBaseId, String query, int topK, double threshold) {
+        return search(knowledgeBaseId, query, topK, threshold, null);
+    }
+
+    /**
+     * 纯向量检索（dense）：在指定知识库中检索与查询最相关的 chunk，可按文档 ID 限定召回范围
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param query           查询文本
+     * @param topK            返回 Top-K 条
+     * @param threshold       余弦相似度阈值
+     * @param documentIds     限定召回范围的文档 ID 列表（null/空 = 全库检索）
+     * @return 检索结果列表（含 chunkId，调用方通过 chunkId 从 MySQL 获取文本内容）
+     */
+    public List<SearchResult> search(Long knowledgeBaseId, String query, int topK, double threshold,
+                                     List<Long> documentIds) {
         String collectionName = getCollectionName(knowledgeBaseId);
         ensureReady(knowledgeBaseId);
 
         List<Float> queryVec = embedQuery(query);
 
-        SearchReq searchReq = SearchReq.builder()
+        var builder = SearchReq.builder()
                 .collectionName(collectionName)
                 .data(List.of(new FloatVec(queryVec)))
                 .annsField(FIELD_EMBEDDING)
                 .metricType(IndexParam.MetricType.COSINE)
                 .topK(topK)
-                .outputFields(OUT_FIELDS)
-                .build();
-        SearchResp resp = milvusClient.search(searchReq);
+                .outputFields(OUT_FIELDS);
+        String docFilter = buildDocumentFilter(documentIds);
+        if (docFilter != null) {
+            builder.filter(docFilter);
+        }
+        SearchResp resp = milvusClient.search(builder.build());
 
         List<SearchResult> results = parseSearchResp(resp, threshold);
         log.info("在 collection [{}] 中检索到 {} 个相关 chunk (query={})", collectionName, results.size(), query);
@@ -508,22 +526,53 @@ public class VectorStoreService {
      * @return 检索结果列表（score 为 BM25 相关性分）
      */
     public List<SearchResult> bm25Search(Long knowledgeBaseId, String query, int topK) {
+        return bm25Search(knowledgeBaseId, query, topK, null);
+    }
+
+    /**
+     * 纯 BM25 全文检索：仅用关键词路召回，不依赖 embedding，可按文档 ID 限定召回范围
+     * <p>
+     * 用于 embedding 服务异常时的兜底检索（HybridSearchService 降级链的一环），
+     * 需要 collection 含 BM25 字段（由 {@link #createCollection} 创建）。
+     *
+     * @param knowledgeBaseId 知识库 ID
+     * @param query           查询文本（由 Milvus 内置 analyzer 分词）
+     * @param topK            返回 Top-K 条
+     * @param documentIds     限定召回范围的文档 ID 列表（null/空 = 全库检索）
+     * @return 检索结果列表（score 为 BM25 相关性分）
+     */
+    public List<SearchResult> bm25Search(Long knowledgeBaseId, String query, int topK, List<Long> documentIds) {
         String collectionName = getCollectionName(knowledgeBaseId);
         ensureReady(knowledgeBaseId);
 
-        SearchReq searchReq = SearchReq.builder()
+        var builder = SearchReq.builder()
                 .collectionName(collectionName)
                 .data(List.of(new EmbeddedText(query)))
                 .annsField(FIELD_SPARSE)
                 .metricType(IndexParam.MetricType.BM25)
                 .topK(topK)
-                .outputFields(OUT_FIELDS)
-                .build();
-        SearchResp resp = milvusClient.search(searchReq);
+                .outputFields(OUT_FIELDS);
+        String docFilter = buildDocumentFilter(documentIds);
+        if (docFilter != null) {
+            builder.filter(docFilter);
+        }
+        SearchResp resp = milvusClient.search(builder.build());
 
         List<SearchResult> results = parseSearchResp(resp, 0.0);
         log.info("BM25 全文检索 collection [{}] 召回 {} 个 chunk (query={})", collectionName, results.size(), query);
         return results;
+    }
+
+    /** 构建按文档 ID 限定召回范围的 Milvus 过滤表达式（null/空列表返回 null，即不限定） */
+    private String buildDocumentFilter(List<Long> documentIds) {
+        if (documentIds == null || documentIds.isEmpty()) {
+            return null;
+        }
+        if (documentIds.size() == 1) {
+            return FIELD_DOCUMENT_ID + " == " + documentIds.get(0);
+        }
+        // Milvus 支持 in 表达式；List.toString() 形如 [1, 2, 3] 与 Milvus 语法一致
+        return FIELD_DOCUMENT_ID + " in " + documentIds;
     }
 
     // ===================== 辅助方法 =====================
