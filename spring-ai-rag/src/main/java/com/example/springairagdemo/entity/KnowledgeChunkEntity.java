@@ -44,6 +44,10 @@ public class KnowledgeChunkEntity {
     @TableField("milvus_id")
     private Long milvusId;
 
+    /** 父块ID（Parent-Child 检索）：NULL = 父块（语义切分结果，仅存 MySQL 不向量化）；非空 = 子块（父块细分的检索单元，命中后反查父块全文） */
+    @TableField("parent_id")
+    private Long parentId;
+
     /** 创建时间 */
     @TableField("create_time")
     private Date createTime;

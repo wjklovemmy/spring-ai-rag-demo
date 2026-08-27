@@ -165,6 +165,48 @@ public class KnowledgeDocumentController {
     }
 
     /**
+     * 重试失败的 Embedding 任务（文档级权限：EDITOR 及以上）。
+     * <p>
+     * 原始文件在提交阶段已最先持久化到存储后端（MinIO/本地），因此重试无需重新上传，
+     * 复用 {@link KnowledgeDocumentService#retryTask(Long)} 的增量逻辑：
+     * 任务置回待处理重新入队，已完整处理（MySQL + 向量均完成）的 chunk 自动跳过，只补齐缺失或内容变化的片段。
+     *
+     * @param taskNo 任务编号
+     */
+    @PostMapping("/task/{taskNo}/retry")
+    public ResponseEntity<Map<String, Object>> retryTask(@PathVariable String taskNo) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.lambdaQuery()
+                .eq(KnowledgeEmbeddingTaskEntity::getTaskNo, taskNo)
+                .one();
+        if (task == null) {
+            return ResponseEntity.status(404).body(Map.of("success", false, "message", "任务不存在"));
+        }
+        KnowledgeDocumentEntity doc = knowledgeDocumentEntityService.getById(task.getDocumentId());
+        if (doc == null) {
+            return ResponseEntity.status(404).body(Map.of("success", false, "message", "任务关联的文档不存在"));
+        }
+        // 对象级防越权：按文档所属知识库校验
+        try {
+            kbAuthorizationService.assertRole(doc.getKnowledgeId(), KbRole.EDITOR);
+        } catch (ForbiddenException e) {
+            return ResponseEntity.status(403).body(Map.of("success", false, "message", e.getMessage()));
+        }
+        try {
+            knowledgeDocumentService.retryTask(task.getId());
+            return ResponseEntity.ok(Map.of(
+                    "success", true,
+                    "message", "任务已重新提交，正在基于原始文件增量重试（任务号 " + taskNo + "）"));
+        } catch (IllegalStateException e) {
+            // 业务冲突：非失败状态 / 原始文件已丢失（409 而非 500）
+            return ResponseEntity.status(409).body(Map.of("success", false, "message", e.getMessage()));
+        } catch (Exception e) {
+            log.error("重试任务失败: taskNo={}", taskNo, e);
+            return ResponseEntity.internalServerError().body(Map.of(
+                    "success", false, "message", "重试失败: " + e.getMessage()));
+        }
+    }
+
+    /**
      * 查询 Embedding 任务列表（强制按当前用户可见知识库过滤）
      *
      * @param knowledgeBaseId 知识库 ID（可选，指定时必须是当前用户可见）

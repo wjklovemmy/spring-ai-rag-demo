@@ -15,6 +15,8 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -124,6 +126,10 @@ public class KnowledgeSearchService {
         Map<Long, KnowledgeChunkEntity> chunkMap = chunks.stream()
                 .collect(Collectors.toMap(KnowledgeChunkEntity::getId, c -> c, (a, b) -> a));
 
+        // Parent-Child 反查：命中子块（parent_id 非空）时，一次批量反查父块行，
+        // 用父块全文作为 LLM 上下文/片段——小块召回精准、父块上下文完整
+        Map<Long, KnowledgeChunkEntity> parentMap = resolveParents(chunkMap);
+
         // 获取文档信息，过滤已过期版本，且同名文档多版本只保留最高版本（新版优先，避免混入旧内容）
         Date now = new Date();
         List<Long> docIds = searchResults.stream()
@@ -170,7 +176,7 @@ public class KnowledgeSearchService {
             List<String> texts = searchResults.stream()
                     .map(r -> {
                         KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
-                        return chunk == null ? "" : chunk.getContent();
+                        return chunk == null ? "" : resolveContent(chunk, parentMap);
                     })
                     .toList();
             try {
@@ -206,21 +212,54 @@ public class KnowledgeSearchService {
             KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
             if (chunk == null) continue;
 
+            // 子块命中 → 用父块全文作为上下文与片段（parentMap 已批量反查，无 N+1）
+            String content = resolveContent(chunk, parentMap);
             String docName = docNameMap.getOrDefault(r.getDocumentId(), "未知文档");
-            String snippet = chunk.getContent();
+            String snippet = content;
             if (snippet.length() > 120) {
                 snippet = snippet.substring(0, 120) + "...";
             }
 
             int ref = refIndex++;
             sources.add(new SourceInfo(r.getDocumentId(), docName, r.getPageNo(), snippet, ref));
-            fullContents.add(chunk.getContent());
+            fullContents.add(content);
 
             // 在上下文中标记来源
             contextBuilder.append(String.format("[来源%d] 文档：%s，第%d页%n%s%n%n",
-                    ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
+                    ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, content));
         }
 
         return new SearchResult(contextBuilder.toString(), sources, fullContents);
+    }
+
+    /**
+     * 反查父块（Parent-Child 检索）：收集命中子块的 parent_id，一次性批量查询父块行。
+     * 父块仅存 MySQL 不向量化，检索命中子块后用父块全文保证上下文完整。
+     */
+    private Map<Long, KnowledgeChunkEntity> resolveParents(Map<Long, KnowledgeChunkEntity> chunkMap) {
+        Set<Long> parentIds = chunkMap.values().stream()
+                .map(KnowledgeChunkEntity::getParentId)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        if (parentIds.isEmpty()) {
+            return Map.of();
+        }
+        return knowledgeChunkEntityService.listByIds(parentIds).stream()
+                .collect(Collectors.toMap(KnowledgeChunkEntity::getId, p -> p, (a, b) -> a));
+    }
+
+    /**
+     * 解析用于 LLM 上下文的片段内容：
+     * 子块（parent_id 非空）→ 反查父块全文（上下文完整）；父块/单级块 → 自身内容。
+     */
+    private String resolveContent(KnowledgeChunkEntity chunk, Map<Long, KnowledgeChunkEntity> parentMap) {
+        if (chunk.getParentId() != null) {
+            KnowledgeChunkEntity parent = parentMap.get(chunk.getParentId());
+            if (parent != null && parent.getContent() != null && !parent.getContent().isBlank()) {
+                return parent.getContent();
+            }
+        }
+        String content = chunk.getContent();
+        return content != null ? content : "";
     }
 }

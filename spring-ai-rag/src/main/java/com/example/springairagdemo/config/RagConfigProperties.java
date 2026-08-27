@@ -130,6 +130,25 @@ public class RagConfigProperties {
         private Heading heading = new Heading();
         /** 语义切片配置 */
         private Semantic semantic = new Semantic();
+        /** Parent-Child 检索配置：语义切分结果作为父块（存 MySQL），再细分为子块（向量化存 Milvus） */
+        private ParentChild parentChild = new ParentChild();
+    }
+
+    @Data
+    public static class ParentChild {
+        /** 是否启用 Parent-Child 检索：切分结果为父块，再按子块大小细分为子块。
+         *  子块向量化存 Milvus（小块召回精度高），检索命中子块后反查父块全文作为 LLM 上下文（上下文完整）。 */
+        private boolean enabled = true;
+        /** 子块大小（tokens）：父块细分为子块的粒度，子块更小 → 召回更精准，但向量数变多 */
+        private int childChunkSize = 200;
+        /** 子块最小字符数 */
+        private int childMinChunkSizeChars = 80;
+        /** 子块最小可向量化长度（低于该长度不单独向量化，并入相邻子块） */
+        private int childMinChunkLengthToEmbed = 40;
+        /** 子块最大数量上限（防御超大文档） */
+        private int childMaxNumChunks = 50000;
+        /** 子块切分保留分隔符 */
+        private boolean childKeepSeparator = true;
     }
 
     @Data

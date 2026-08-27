@@ -7,6 +7,7 @@ import com.example.springairagdemo.entity.KnowledgeChunkEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
+import com.example.springairagdemo.parser.PdfDocumentParser;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.UserContext;
 import lombok.extern.slf4j.Slf4j;
@@ -253,23 +254,59 @@ public abstract class KnowledgeDocumentService {
         }
 
         // 1. 重置任务字段并置回 PENDING（processTaskAsync 通过 CAS 抢占 PENDING 才能执行，
-        //    避免与其它入口并发重复处理同一任务）
-        task.setStatus(KnowledgeEmbeddingTaskStatus.PENDING);
-        task.setTotalChunk(0);
-        task.setSuccessChunk(0);
-        task.setFailChunk(0);
-        task.setRetryCount(task.getRetryCount() == null ? 1 : task.getRetryCount() + 1);
-        task.setErrorMessage(null);
-        task.setFinishTime(null);
-        task.setCostTime(null);
-        task.setUpdateTime(new Date());
-        knowledgeEmbeddingTaskService.updateById(task);
+        //    避免与其它入口并发重复处理同一任务）。
+        //    注意：必须用 lambdaUpdate 显式 .set(..., null) 清空字段——
+        //    updateById 默认 NOT_NULL 策略会跳过 null 字段，导致旧的错误信息/完成时间残留。
+        int retryCount = task.getRetryCount() == null ? 1 : task.getRetryCount() + 1;
+        knowledgeEmbeddingTaskService.lambdaUpdate()
+                .eq(KnowledgeEmbeddingTaskEntity::getId, taskId)
+                .set(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PENDING)
+                .set(KnowledgeEmbeddingTaskEntity::getTotalChunk, 0)
+                .set(KnowledgeEmbeddingTaskEntity::getSuccessChunk, 0)
+                .set(KnowledgeEmbeddingTaskEntity::getFailChunk, 0)
+                .set(KnowledgeEmbeddingTaskEntity::getRetryCount, retryCount)
+                .set(KnowledgeEmbeddingTaskEntity::getErrorMessage, null)
+                .set(KnowledgeEmbeddingTaskEntity::getFinishTime, null)
+                .set(KnowledgeEmbeddingTaskEntity::getCostTime, null)
+                .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
+                .update();
 
         // 2. 重新入队执行（增量补齐：已处理过的 chunk 直接跳过）
         final Long finalTaskId = task.getId();
         CompletableFuture.runAsync(() -> processTaskAsync(finalTaskId), taskExecutor);
         log.info("重启恢复：任务 {} 已重新入队执行（增量补齐） documentId={}",
                 task.getTaskNo(), docEntity.getId());
+    }
+
+    /**
+     * 手动重试失败的 Embedding 任务（前端任务列表「重试」按钮）。
+     * <p>
+     * 原始文件在上传提交阶段（{@code submitIngest}）已最先持久化到存储后端，
+     * 因此重试无需重新上传，直接复用 {@link #resumeInterruptedTask} 的增量重置逻辑：
+     * 任务置回 PENDING 重新入队，已完整处理（MySQL + 向量均完成）的 chunk 增量跳过，
+     * 只补齐缺失或内容变化的片段。
+     *
+     * @param taskId 任务 ID
+     * @throws IllegalStateException 任务不存在 / 非失败状态 / 原始文件已丢失
+     */
+    public void retryTask(Long taskId) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            throw new IllegalStateException("任务不存在");
+        }
+        if (task.getStatus() != KnowledgeEmbeddingTaskStatus.FAILED) {
+            throw new IllegalStateException("只有失败的任务可以重试（当前状态：" + task.getStatus().getText() + "）");
+        }
+        KnowledgeDocumentEntity docEntity = knowledgeDocumentEntityService.getById(task.getDocumentId());
+        if (docEntity == null || docEntity.getFilePath() == null) {
+            throw new IllegalStateException("原始文档不存在，无法重试，请重新上传");
+        }
+        if (!fileStorageService.exists(docEntity.getFilePath())) {
+            throw new IllegalStateException("原始文件已丢失，无法重试，请重新上传");
+        }
+        // 复用增量恢复逻辑：重置任务并重新入队，已处理的 chunk 自动跳过
+        resumeInterruptedTask(taskId);
+        log.info("用户手动重试任务：taskNo={} documentId={}", task.getTaskNo(), docEntity.getId());
     }
 
     /**
@@ -310,14 +347,16 @@ public abstract class KnowledgeDocumentService {
             // 4. 删除作废/多余的旧 chunk（MySQL 行 + Milvus 向量）
             cleanStaleChunks(docEntity, chunks, diff.stale());
 
-            // 5. 新增/变化 chunk 批量写入 MySQL
-            persistChunksToMysql(task, docEntity, diff.toSave());
+            // 5. 新增/变化 chunk 批量写入 MySQL（Parent-Child：先写父块行、再写子块行并回填 parent_id），
+            //    返回新写入的子块实体（id 已回填，供向量化阶段引用）
+            List<KnowledgeChunkEntity> savedChildren = persistChunksToMysql(task, docEntity, diff, chunks);
 
-            // 6. Embedding + Milvus upsert（分批推进，实时更新进度），返回实际写入向量数
-            int vectorCount = embedAndUpsertVectors(task, docEntity, chunks, diff);
+            // 6. Embedding + Milvus upsert（分批推进，实时更新进度），返回实际写入向量数。
+            //    仅子块向量化（父块只存 MySQL，不写 Milvus）
+            int vectorCount = embedAndUpsertVectors(task, docEntity, chunks, diff, savedChildren);
 
             // 7. 收尾：文档置成功、废弃旧版本、任务置成功
-            finishTask(task, docEntity, chunks, diff, vectorCount, start);
+            finishTask(task, docEntity, chunks, diff, savedChildren, vectorCount, start);
         } catch (Exception e) {
             log.error("Embedding 任务执行失败: taskNo={}, documentId={}",
                     task.getTaskNo(), task.getDocumentId(), e);
@@ -384,46 +423,167 @@ public abstract class KnowledgeDocumentService {
 
     /**
      * 增量查缺：按 (chunk_index, content_hash, milvus_id) 将已有 chunk 分类为
-     * 新增/变化（toSave）、仅缺向量（toVectorOnly）、作废/多余（stale）、完整跳过（skipCount）。
+     * 新增/变化、仅缺向量、作废/多余、完整跳过。
+     * <p>
+     * Parent-Child 模式（切分结果携带 {@link PdfDocumentParser#META_PARENT_TEXT} 元数据）：
+     * <ul>
+     *     <li>父块（parent_id IS NULL）：语义/token 切分结果 + 标题注入，仅存 MySQL 不向量化，chunk_index = 父块序号</li>
+     *     <li>子块（parent_id = 父块ID）：父块细分后的检索单元，向量化存 Milvus，chunk_index = 子块序号</li>
+     * </ul>
+     * 父块内容变化会级联作废其全部子块（子块由父块切出，内容必然变化）后重新写入。
+     * 单级模式（未启用 / 存量单级数据）保持原有行为：全部按父块处理，历史子块行整体作废。
      */
     private ChunkDiff diffChunks(KnowledgeDocumentEntity docEntity, List<Document> chunks) {
+        boolean pcEnabled = isParentChildChunks(chunks);
         List<KnowledgeChunkEntity> existing = knowledgeChunkEntityService.lambdaQuery()
                 .eq(KnowledgeChunkEntity::getDocumentId, docEntity.getId())
                 .list();
-        Map<Integer, KnowledgeChunkEntity> existingByIndex = existing.stream()
-                .collect(Collectors.toMap(KnowledgeChunkEntity::getChunkIndex, e -> e, (a, b) -> a));
-
-        List<KnowledgeChunkEntity> toSave = new ArrayList<>();       // 新 / 内容变化：写 MySQL + 向量
-        List<KnowledgeChunkEntity> toVectorOnly = new ArrayList<>(); // 已写 MySQL、仅缺向量
-        List<KnowledgeChunkEntity> stale = new ArrayList<>();        // 作废/多余旧 chunk（删 MySQL + 向量）
-        int skipCount = 0;                                          // 已完整处理，直接跳过
-
-        for (int i = 0; i < chunks.size(); i++) {
-            Document chunk = chunks.get(i);
-            String content = chunk.getText() != null ? chunk.getText() : "";
-            String hash = sha256(content);
-            KnowledgeChunkEntity old = existingByIndex.get(i);
-            if (old == null || !hash.equals(old.getContentHash())) {
-                // 新增或内容变化（如切分逻辑升级）：旧行（若有）作废删除；Milvus 主键按 index 相同，upsert 自动覆盖
-                if (old != null) {
-                    stale.add(old);
-                }
-                toSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(chunk, i)));
-            } else if (old.getMilvusId() == null) {
-                // MySQL 已写但向量缺失（上次失败在写向量阶段）：只补向量
-                toVectorOnly.add(old);
+        Map<Integer, KnowledgeChunkEntity> existingParentByIndex = new HashMap<>();
+        Map<Integer, KnowledgeChunkEntity> existingChildByIndex = new HashMap<>();
+        for (KnowledgeChunkEntity e : existing) {
+            if (e.getParentId() == null) {
+                existingParentByIndex.put(e.getChunkIndex(), e);
             } else {
-                // MySQL + 向量均已写入：跳过（省写库 / embedding / 向量写入）
-                skipCount++;
+                existingChildByIndex.put(e.getChunkIndex(), e);
             }
         }
-        // 新切分数量变少时，尾部残留旧 chunk（index >= 新数量）需清理
-        for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingByIndex.entrySet()) {
-            if (entry.getKey() >= chunks.size()) {
-                stale.add(entry.getValue());
+
+        List<KnowledgeChunkEntity> parentsToSave = new ArrayList<>();     // 新增/变化的父块（写 MySQL，不向量化）
+        Map<Integer, KnowledgeChunkEntity> parentsKept = new HashMap<>(); // 未变化的父块（保留，供子块引用 parentId）
+        List<ChildToSave> childrenToSave = new ArrayList<>();             // 新增/变化的子块（parentId 写入阶段回填）
+        List<KnowledgeChunkEntity> toVectorOnly = new ArrayList<>();      // 已写 MySQL、仅缺向量
+        List<KnowledgeChunkEntity> stale = new ArrayList<>();             // 作废/多余旧 chunk（删 MySQL + 向量）
+        int skipCount = 0;                                                // 已完整处理，直接跳过
+
+        if (pcEnabled) {
+            // ---------- 1. 父块级 diff ----------
+            List<Document> parents = buildParents(chunks); // parentIndex -> 父块 Document（含 pageNo）
+            for (int i = 0; i < parents.size(); i++) {
+                Document parent = parents.get(i);
+                String content = parent.getText() != null ? parent.getText() : "";
+                String hash = sha256(content);
+                KnowledgeChunkEntity old = existingParentByIndex.get(i);
+                if (old == null || !hash.equals(old.getContentHash())) {
+                    // 新增或父块内容变化（如切分/标题注入升级）：旧父块作废，其子块在子块级一并作废
+                    if (old != null) {
+                        stale.add(old);
+                    }
+                    parentsToSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(parent, i)));
+                } else {
+                    parentsKept.put(i, old);
+                }
+            }
+            // 新父块数量变少时，尾部残留旧父块需清理
+            for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingParentByIndex.entrySet()) {
+                if (entry.getKey() >= parents.size()) {
+                    stale.add(entry.getValue());
+                }
+            }
+
+            // ---------- 2. 子块级 diff ----------
+            Map<String, Integer> parentIndexByText = new HashMap<>();
+            for (int i = 0; i < parents.size(); i++) {
+                parentIndexByText.putIfAbsent(parents.get(i).getText(), i);
+            }
+            for (int i = 0; i < chunks.size(); i++) {
+                Document child = chunks.get(i);
+                String content = child.getText() != null ? child.getText() : "";
+                String hash = sha256(content);
+                KnowledgeChunkEntity old = existingChildByIndex.get(i);
+                Integer parentIdx = parentIndexOf(child, parentIndexByText);
+                // 父块变化（未保留）→ 子块必然变化，级联重写；Milvus 主键按 index 相同，upsert 自动覆盖
+                boolean parentChanged = parentIdx == null || !parentsKept.containsKey(parentIdx);
+                if (old == null || !hash.equals(old.getContentHash()) || parentChanged) {
+                    if (old != null) {
+                        stale.add(old);
+                    }
+                    childrenToSave.add(new ChildToSave(i, parentIdx == null ? -1 : parentIdx));
+                } else if (old.getMilvusId() == null) {
+                    // MySQL 已写但向量缺失（上次失败在写向量阶段）：只补向量
+                    toVectorOnly.add(old);
+                } else {
+                    // MySQL + 向量均已写入：跳过（省写库 / embedding / 向量写入）
+                    skipCount++;
+                }
+            }
+            // 新子块数量变少时，尾部残留旧子块需清理
+            for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingChildByIndex.entrySet()) {
+                if (entry.getKey() >= chunks.size()) {
+                    stale.add(entry.getValue());
+                }
+            }
+        } else {
+            // ---------- 单级模式（原有行为）：全部按父块处理 ----------
+            // 历史 Parent-Child 子块行（parent_id 非空）无法复用，整体作废（其向量由 index 相同的 upsert 覆盖/尾部清理）
+            stale.addAll(existingChildByIndex.values());
+            for (int i = 0; i < chunks.size(); i++) {
+                Document chunk = chunks.get(i);
+                String content = chunk.getText() != null ? chunk.getText() : "";
+                String hash = sha256(content);
+                KnowledgeChunkEntity old = existingParentByIndex.get(i);
+                if (old == null || !hash.equals(old.getContentHash())) {
+                    // 新增或内容变化（如切分逻辑升级）：旧行（若有）作废删除；Milvus 主键按 index 相同，upsert 自动覆盖
+                    if (old != null) {
+                        stale.add(old);
+                    }
+                    parentsToSave.add(buildChunkEntity(docEntity.getId(), i, content, hash, parsePageNo(chunk, i)));
+                } else if (old.getMilvusId() == null) {
+                    toVectorOnly.add(old);
+                } else {
+                    skipCount++;
+                }
+            }
+            // 新切分数量变少时，尾部残留旧 chunk（index >= 新数量）需清理
+            for (Map.Entry<Integer, KnowledgeChunkEntity> entry : existingParentByIndex.entrySet()) {
+                if (entry.getKey() >= chunks.size()) {
+                    stale.add(entry.getValue());
+                }
             }
         }
-        return new ChunkDiff(toSave, toVectorOnly, stale, skipCount);
+        return new ChunkDiff(parentsToSave, parentsKept, childrenToSave, toVectorOnly, stale, skipCount);
+    }
+
+    /**
+     * 判断本次切分结果是否为 Parent-Child 结构（子块携带 parent_text 元数据）。
+     */
+    private boolean isParentChildChunks(List<Document> chunks) {
+        if (chunks.isEmpty()) {
+            return false;
+        }
+        Map<String, Object> meta = chunks.get(0).getMetadata();
+        return meta != null && meta.containsKey(PdfDocumentParser.META_PARENT_TEXT);
+    }
+
+    /**
+     * 从子块列表重建父块列表（Parent-Child 检索）。
+     * <p>子块按首次出现的 parent_text 去重，父块序号的分配即去重顺序；
+     * 父块 Document 复用首个子块的 metadata（含 page_number），文本为父块全文（含标题链前缀）。</p>
+     */
+    private List<Document> buildParents(List<Document> chunks) {
+        List<Document> parents = new ArrayList<>();
+        Map<String, Integer> indexByText = new HashMap<>();
+        for (Document child : chunks) {
+            Map<String, Object> meta = child.getMetadata();
+            Object pt = meta == null ? null : meta.get(PdfDocumentParser.META_PARENT_TEXT);
+            String parentText = pt instanceof String s ? s : (child.getText() != null ? child.getText() : "");
+            if (!indexByText.containsKey(parentText)) {
+                indexByText.put(parentText, parents.size());
+                parents.add(Document.builder().text(parentText).metadata(meta).build());
+            }
+        }
+        return parents;
+    }
+
+    /**
+     * 子块所属父块的序号（Parent-Child 检索）；未携带 parent_text 元数据时返回 null。
+     */
+    private Integer parentIndexOf(Document child, Map<String, Integer> parentIndexByText) {
+        Map<String, Object> meta = child.getMetadata();
+        Object pt = meta == null ? null : meta.get(PdfDocumentParser.META_PARENT_TEXT);
+        if (pt instanceof String s) {
+            return parentIndexByText.get(s);
+        }
+        return null;
     }
 
     /**
@@ -443,18 +603,46 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 新增/变化 chunk 批量写入 MySQL（插入后 id 回填，供 Milvus chunkId 字段引用）。
+     * 新增/变化 chunk 批量写入 MySQL（Parent-Child：先写父块行、再写子块行并回填 parent_id）。
+     * <p>插入后 id 由 MyBatis-Plus saveBatch 回填：父块 id 供子块 parent_id 引用，
+     * 子块 id 供 Milvus chunkId 字段引用。</p>
+     *
+     * @return 新写入的子块实体列表（id 已回填，供向量化阶段使用）；无子块写入时返回空列表
      */
-    private void persistChunksToMysql(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
-                                      List<KnowledgeChunkEntity> toSave) {
-        if (toSave.isEmpty()) {
-            return;
+    private List<KnowledgeChunkEntity> persistChunksToMysql(KnowledgeEmbeddingTaskEntity task,
+                                                            KnowledgeDocumentEntity docEntity,
+                                                            ChunkDiff diff, List<Document> chunks) {
+        List<KnowledgeChunkEntity> parentsToSave = diff.parentsToSave();
+        List<ChildToSave> childrenToSave = diff.childrenToSave();
+        if (parentsToSave.isEmpty() && childrenToSave.isEmpty()) {
+            return List.of();
         }
-        knowledgeChunkEntityService.saveBatch(toSave);
+        // 1. 先写父块行（父块不向量化，仅作为子块的完整上下文与 parentId 锚点）
+        knowledgeChunkEntityService.saveBatch(parentsToSave);
+        // 2. 构建 parentIndex -> parentId 映射：新父块用 saveBatch 回填的 id，未变父块用已有行 id
+        Map<Integer, Long> parentIdByIndex = new HashMap<>();
+        for (KnowledgeChunkEntity p : parentsToSave) {
+            parentIdByIndex.put(p.getChunkIndex(), p.getId());
+        }
+        for (KnowledgeChunkEntity p : diff.parentsKept().values()) {
+            parentIdByIndex.put(p.getChunkIndex(), p.getId());
+        }
+        // 3. 构造子块实体（补 parentId）并写入
+        List<KnowledgeChunkEntity> childEntities = new ArrayList<>(childrenToSave.size());
+        for (ChildToSave c : childrenToSave) {
+            Document childDoc = chunks.get(c.childIndex());
+            String content = childDoc.getText() != null ? childDoc.getText() : "";
+            childEntities.add(buildChildEntity(docEntity.getId(), c.childIndex(), content,
+                    sha256(content), parsePageNo(childDoc, c.childIndex()),
+                    parentIdByIndex.get(c.parentIndex())));
+        }
+        knowledgeChunkEntityService.saveBatch(childEntities);
         task.setChunkProgress(100);
         task.setUpdateTime(new Date());
         knowledgeEmbeddingTaskService.updateById(task);
-        log.info("新增 {} 个 chunk 已写入 MySQL knowledge_chunk (documentId={})", toSave.size(), docEntity.getId());
+        log.info("新增 {} 个父块 / {} 个子块已写入 MySQL knowledge_chunk (documentId={})",
+                parentsToSave.size(), childEntities.size(), docEntity.getId());
+        return childEntities;
     }
 
     /**
@@ -469,8 +657,10 @@ public abstract class KnowledgeDocumentService {
      * @return 实际写入 Milvus 的向量数
      */
     private int embedAndUpsertVectors(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
-                                      List<Document> chunks, ChunkDiff diff) {
-        List<KnowledgeChunkEntity> toSave = diff.toSave();
+                                      List<Document> chunks, ChunkDiff diff,
+                                      List<KnowledgeChunkEntity> savedChildren) {
+        // 仅子块向量化：父块（parent_id NULL）只存 MySQL，不参与 embedding / Milvus 写入
+        List<KnowledgeChunkEntity> toSave = savedChildren;
         List<KnowledgeChunkEntity> toVectorOnly = diff.toVectorOnly();
         if (toSave.isEmpty() && toVectorOnly.isEmpty()) {
             return 0;
@@ -527,7 +717,8 @@ public abstract class KnowledgeDocumentService {
      * 各阶段实际已完成，避免"任务成功但进度条全 0"的困惑展示。</p>
      */
     private void finishTask(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity,
-                            List<Document> chunks, ChunkDiff diff, int vectorCount, long start) {
+                            List<Document> chunks, ChunkDiff diff, List<KnowledgeChunkEntity> savedChildren,
+                            int vectorCount, long start) {
         docEntity.setChunkCount(chunks.size());
         updateDocumentStatus(docEntity, DocumentStatus.SUCCESS);
         deprecateOldVersions(docEntity.getKnowledgeId(), docEntity);
@@ -542,9 +733,9 @@ public abstract class KnowledgeDocumentService {
         task.setCostTime(System.currentTimeMillis() - start);
         task.setUpdateTime(new Date());
         knowledgeEmbeddingTaskService.updateById(task);
-        log.info("任务 {} 处理完成: 总chunk={}, 新增/补齐={}, 跳过={}, 向量={}, 耗时 {}ms",
-                task.getTaskNo(), chunks.size(), diff.toSave().size() + diff.toVectorOnly().size(),
-                diff.skipCount(), vectorCount, task.getCostTime());
+        log.info("任务 {} 处理完成: 总chunk={}, 新增父块={}, 新增子块={}, 补齐向量={}, 跳过={}, 向量={}, 耗时 {}ms",
+                task.getTaskNo(), chunks.size(), diff.parentsToSave().size(), savedChildren.size(),
+                diff.toVectorOnly().size(), diff.skipCount(), vectorCount, task.getCostTime());
     }
 
     /**
@@ -567,12 +758,26 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 增量分类结果：新增/变化、仅缺向量、作废/多余、完整跳过。
+     * 增量分类结果（Parent-Child 两级）：
+     * <ul>
+     *     <li>{@code parentsToSave}：新增/变化的父块（写 MySQL，不向量化）</li>
+     *     <li>{@code parentsKept}：未变化的父块（parentIndex → 行，供子块引用 parentId）</li>
+     *     <li>{@code childrenToSave}：新增/变化的子块（parentId 在写入阶段按 parentIndex 回填）</li>
+     *     <li>{@code toVectorOnly}：已写 MySQL、仅缺向量</li>
+     *     <li>{@code stale}：作废/多余（删 MySQL + 向量）</li>
+     *     <li>{@code skipCount}：已完整处理，直接跳过</li>
+     * </ul>
      */
-    private record ChunkDiff(List<KnowledgeChunkEntity> toSave,
+    private record ChunkDiff(List<KnowledgeChunkEntity> parentsToSave,
+                             Map<Integer, KnowledgeChunkEntity> parentsKept,
+                             List<ChildToSave> childrenToSave,
                              List<KnowledgeChunkEntity> toVectorOnly,
                              List<KnowledgeChunkEntity> stale,
                              int skipCount) {
+    }
+
+    /** 待写入的子块：childIndex 为全局子块序号（= chunk_index，Milvus 主键编码依据），parentIndex 为父块序号（写入时回填 parentId） */
+    private record ChildToSave(int childIndex, int parentIndex) {
     }
 
     /**
@@ -894,6 +1099,17 @@ public abstract class KnowledgeDocumentService {
         entity.setTokenCount(0);
         entity.setPageNo(pageNo);
         entity.setCreateTime(new Date());
+        return entity;
+    }
+
+    /**
+     * 构建子块实体（Parent-Child 检索）：在父块基础上补充 parent_id 关联父块行。
+     */
+    protected KnowledgeChunkEntity buildChildEntity(Long documentId, int chunkIndex,
+                                                    String content, String contentHash, Integer pageNo,
+                                                    Long parentId) {
+        KnowledgeChunkEntity entity = buildChunkEntity(documentId, chunkIndex, content, contentHash, pageNo);
+        entity.setParentId(parentId);
         return entity;
     }
 

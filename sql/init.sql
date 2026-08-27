@@ -42,11 +42,7 @@ CREATE TABLE IF NOT EXISTS knowledge_document (
     INDEX idx_knowledge_id (knowledge_id),
 
     -- 同名文档并发上传防重号：同一知识库下 (库, 文件名, 版本) 唯一
-    UNIQUE KEY uk_kb_file_version (knowledge_id, file_name, version),
-
-    CONSTRAINT fk_document_base
-    FOREIGN KEY (knowledge_id)
-    REFERENCES knowledge_base(id)
+    UNIQUE KEY uk_kb_file_version (knowledge_id, file_name, version)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识文档';
 
 CREATE TABLE IF NOT EXISTS knowledge_chunk (
@@ -67,20 +63,24 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
 
     milvus_id BIGINT DEFAULT NULL COMMENT 'Milvus主键',
 
+    -- Parent-Child 检索：NULL = 父块（语义切分结果，content 为父块全文，仅存 MySQL 不向量化）
+    --                     非空 = 子块（父块细分的检索单元，content 为子块文本，向量化存 Milvus，命中后反查父块全文）
+    parent_id BIGINT DEFAULT NULL COMMENT '父块ID（Parent-Child 检索）：NULL 表示父块，非空表示子块',
+
     create_time DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
 
     INDEX idx_document_id (document_id),
 
     INDEX idx_hash (content_hash),
 
-    -- 同一文档内 chunk 序号唯一：防止任务被并发/重复处理时产生重复 chunk
-    UNIQUE KEY uk_document_index (document_id, chunk_index),
+    INDEX idx_parent_id (parent_id),
 
-    CONSTRAINT fk_chunk_document
-    FOREIGN KEY (document_id)
-    REFERENCES knowledge_document(id)
-
+    -- 同一文档内 (chunk_index, parent_id) 组合唯一：
+    -- 父块行 parent_id=NULL、子块行 parent_id=父块ID，两套编号空间互不冲突，
+    -- 防止任务被并发/重复处理时产生重复 chunk
+    UNIQUE KEY uk_document_index (document_id, chunk_index, parent_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识Chunk';
+
 
 CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
 
@@ -127,12 +127,7 @@ CREATE TABLE IF NOT EXISTS knowledge_embedding_task (
 
     INDEX idx_document_id (document_id),
 
-    INDEX idx_status (status),
-
-    CONSTRAINT fk_task_document
-    FOREIGN KEY (document_id)
-    REFERENCES knowledge_document(id)
-
+    INDEX idx_status (status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Embedding任务';
 
 

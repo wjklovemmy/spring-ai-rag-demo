@@ -324,15 +324,23 @@ spring-ai-rag-demo/
         │             · 超长段 token 二次切分；失败自动降级 TokenTextSplitter
         │             · 默认 chunk-size 800、min 350 字符、最大 10000 chunk
         │             → split_progress = 100%
-        ├─ 增量分类    与已有 chunk 对比（chunk_index + content_hash）
-        │             toSave(新增/变化) / toVectorOnly(缺向量) / skip(已完整) / stale(删除)
-        ├─ Chunk 入库  saveBatch 批量写 MySQL knowledge_chunk（主键回填）
+        ├─ Parent-Child 切分结果（含标题链前缀）作为"父块"，再按 child-chunk-size
+        │             （默认 200 token）用 TokenTextSplitter 细分为"子块"，
+        │             子块 metadata 记录 parent_text（父块全文）
+        │             · 父块：仅存 MySQL（parent_id=NULL），不向量化，作为完整上下文单元
+        │             · 子块：向量化存 Milvus（parent_id=父块ID），小块召回更精准，
+        │               命中后反查父块全文给 LLM——"小块检索、大块上下文"
+        ├─ 增量分类    与已有 chunk 对比（chunk_index + content_hash），两级处理
+        │             · 父块级：内容变化 → 旧父块作废，并级联作废其全部子块重写
+        │             · 子块级：toSave(新增/变化) / toVectorOnly(缺向量) / skip(已完整) / stale(删除)
+        │             · 单级旧数据兼容：parent_id IS NULL 的行本身就是父块，检索直接用
+        ├─ Chunk 入库  先写父块行（saveBatch 回填 id），再写子块行并回填 parent_id
         │             → chunk_progress = 100%
-        ├─ Embedding  按 batch-size 分批向量化（embed_progress 0→100%，逐批回写）
+        ├─ Embedding  仅子块向量化（父块不向量化），按 batch-size 分批（embed_progress 0→100%，逐批回写）
         │             · DashScope 网络异常/5xx 自动重试（最多 2 次，4xx 业务错误不重试）
         │             · Sentinel 熔断保护（资源 dashscope-embedding），异常比例高时快速失败
         │             · 失败错误信息归一为「向量化服务暂时不可用，请稍后重试」
-        ├─ Milvus     按 batch-size 分批 upsert 到 kb_{id}（milvus_progress 0→100%）
+        ├─ Milvus     仅子块按 batch-size 分批 upsert 到 kb_{id}（milvus_progress 0→100%）
         │             · 回填 milvus_id：作为"向量已写入"的增量判定标记
         │             · 每批更新任务 success_chunk，前端 5 行进度条实时展示
         ├─ 置成功      文档状态 3（SUCCESS），回填 chunk_count
@@ -609,6 +617,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
 - `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session` / `agent_task` / `agent_task_step`。
 - `sql/migration_agent_logic_delete.sql` — 已按旧版 init.sql 初始化的库升级用：为 `chat_session` / `agent_task` / `agent_task_step` 补充逻辑删除字段（新装库执行 init.sql 即可，无需本脚本）。
+- `sql/migration_parent_child.sql` — **Parent-Child 检索升级用**：为已存在的 `knowledge_chunk` 补充 `parent_id` 列、`idx_parent_id` 索引，并将唯一索引扩展为 `(document_id, chunk_index, parent_id)`（新装库执行 init.sql 即可，无需本脚本）。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
 - `sql/mysql-nacos.sql` — Nacos 3.1.1 官方 schema，用于初始化 `nacos_config` 库（仅 Nacos 用，业务服务不连接）。
 
@@ -621,7 +630,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 |----|------|----------|
 | `knowledge_base` | 知识库 | name(唯一)、description、status、create_user |
 | `knowledge_document` | 文档元数据 | knowledge_id(FK)、file_name、file_path、file_size、file_type、chunk_count、embedding_model、status(**0上传中/1解析中/2向量化中/3成功/4失败/5已废弃/6已过期**)、**version**、**expire_time**（旧版本下线时间）、**is_active** |
-| `knowledge_chunk` | 文本分块 | document_id(FK)、chunk_index、content(LONGTEXT)、content_hash(SHA-256)、token_count、page_no、milvus_id |
+| `knowledge_chunk` | 文本分块（Parent-Child 两级） | document_id(FK)、chunk_index、content(LONGTEXT)、content_hash(SHA-256)、token_count、page_no、milvus_id、**parent_id**（NULL=父块/非空=子块，父块仅存 MySQL 不向量化，子块向量化存 Milvus 且 `chunk_index` 与 Milvus 主键编码一致） |
 | `knowledge_embedding_task` | 向量化任务 | task_no(唯一)、document_id(FK)、status(0待处理/1处理中/2成功/3失败)、total/success/fail_chunk、**parse/split/chunk/embed/milvus_progress（阶段进度 0-100）**、retry_count、error_message、cost_time |
 | `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
@@ -671,6 +680,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
 | `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
 | `rag.document.chunk.semantic.*` | 语义切片：enabled / threshold(0.55) / batch-size(10) / fallback-on-error |
+| `rag.document.chunk.parent-child.*` | **Parent-Child 检索**：enabled(true) / child-chunk-size(200) / child-min-chunk-size-chars(80) / child-min-chunk-length-to-embed(40) / child-max-num-chunks(50000) / child-keep-separator(true)。切分结果为父块（存 MySQL 不向量化），再细分 200 token 子块向量化存 Milvus；检索命中子块 → 反查父块全文作为 LLM 上下文。`enabled: false` 即回退单级模式（旧数据兼容） |
 | `gateway.internal-token` | 网关内部信任令牌（`X-Gateway-Token`），RAG 与用户服务的 `GatewayIdentityFilter` 校验，防绕过网关直连伪造身份 |
 | `feign.circuitbreaker.enabled` | OpenFeign 熔断降级开关（true；配合 Sentinel + fallbackFactory，Hystrix 的官方替代） |
 | `feign.sentinel.rules` | Sentinel 熔断规则（key：`default`=所有 Feign 客户端默认规则，或精确资源名如 `spring-ai-user#isAdmin(Long)`；value：DegradeRule 列表） |

@@ -24,6 +24,7 @@
 
     <div class="loading-line" v-if="loading">加载中…</div>
     <div class="msg-info error" v-if="message">{{ message }}</div>
+    <div class="msg-info success" v-if="successMsg">{{ successMsg }}</div>
 
     <div class="table-wrap" v-if="tasks.length">
       <table class="table">
@@ -57,6 +58,7 @@
             <td>{{ formatDateTime(t.createTime) }}</td>
             <td>
               <button class="btn btn-outline btn-sm" @click="openDetail(t.taskNo)">详情</button>
+              <button v-if="t.status === 3" class="btn btn-outline btn-sm" style="margin-left: 6px; color: #1d4ed8;" @click="retryTask(t)">重试</button>
             </td>
           </tr>
         </tbody>
@@ -84,6 +86,7 @@ const autoRefresh = ref(true)
 const tasks = ref([])
 const loading = ref(false)
 const message = ref('')
+const successMsg = ref('')
 let pollTimer = null
 const detailTaskNo = ref('')
 const showDetail = ref(false)
@@ -117,6 +120,7 @@ async function loadTaskList() {
   if (pollTimer) { clearTimeout(pollTimer); pollTimer = null }
   loading.value = true
   message.value = ''
+  successMsg.value = ''
   const params = new URLSearchParams()
   if (kbId.value) params.append('knowledgeBaseId', kbId.value)
   if (status.value) params.append('status', status.value)
@@ -150,6 +154,22 @@ function resetFilter() {
 function openDetail(taskNo) {
   detailTaskNo.value = taskNo
   showDetail.value = true
+}
+
+async function retryTask(t) {
+  if (!window.confirm(`确定重试任务 ${t.taskNo}（${t.fileName}）吗？将基于已上传的原始文件增量重建索引，已处理的内容会自动跳过。`)) return
+  try {
+    const res = await fetchApi('/api/knowledge-document/task/' + encodeURIComponent(t.taskNo) + '/retry', { method: 'POST' })
+    const data = await res.json()
+    if (!data.success) {
+      message.value = data.message || '重试失败'
+      return
+    }
+    successMsg.value = data.message || '任务已重新提交'
+    loadTaskList()
+  } catch (e) {
+    message.value = '重试失败，请稍后重试'
+  }
 }
 
 onActivated(() => {

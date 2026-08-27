@@ -8,6 +8,7 @@
       <div class="modal-body">
         <div class="loading-line" v-if="loading">加载中…</div>
         <div class="msg-info error" v-if="error">{{ error }}</div>
+        <div class="msg-info success" v-if="successMsg">{{ successMsg }}</div>
 
         <template v-if="detail">
           <table class="table" style="margin-bottom: 16px;">
@@ -41,6 +42,7 @@
       </div>
       <div class="modal-footer">
         <button class="btn btn-outline" @click="close">关闭</button>
+        <button v-if="detail && detail.status === 3" class="btn btn-outline" style="color: #1d4ed8;" @click="retry" :disabled="retrying">重试</button>
         <button class="btn btn-primary" @click="load" :disabled="loading">刷新</button>
       </div>
     </div>
@@ -60,6 +62,8 @@ const emit = defineEmits(['close'])
 const detail = ref(null)
 const loading = ref(false)
 const error = ref('')
+const successMsg = ref('')
+const retrying = ref(false)
 
 const statusMap = {
   0: ['待处理', '#93c5fd'],
@@ -97,6 +101,27 @@ async function load() {
     error.value = '加载失败，请稍后重试'
   } finally {
     loading.value = false
+  }
+}
+
+async function retry() {
+  if (!window.confirm('确定重试该任务吗？将基于已上传的原始文件增量重建索引，已处理的内容会自动跳过。')) return
+  retrying.value = true
+  error.value = ''
+  successMsg.value = ''
+  try {
+    const res = await fetchApi('/api/knowledge-document/task/' + encodeURIComponent(props.taskNo) + '/retry', { method: 'POST' })
+    const data = await res.json()
+    if (!data.success) {
+      error.value = data.message || '重试失败'
+      return
+    }
+    successMsg.value = data.message || '任务已重新提交'
+    await load() // 刷新详情：状态回到待处理，进度清零
+  } catch (e) {
+    error.value = '重试失败，请稍后重试'
+  } finally {
+    retrying.value = false
   }
 }
 
