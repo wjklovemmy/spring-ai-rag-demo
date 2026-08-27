@@ -6,7 +6,6 @@ import com.example.springairagdemo.entity.AgentTaskEntity;
 import com.example.springairagdemo.entity.AgentTaskStepEntity;
 import com.example.springairagdemo.mapper.AgentTaskMapper;
 import com.example.springairagdemo.mapper.AgentTaskStepMapper;
-import com.example.springairagdemo.tools.KbQueryTools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -71,7 +70,7 @@ public class AgentTaskService {
      * 记录一步工具调用轨迹（工具回调线程写入；每条 SSE tool 事件落一行，running/done 成对）。
      * running 事件缓存时间戳，done/error 事件到达时回填该步耗时 latency_ms。
      */
-    public void recordStep(Long taskId, KbQueryTools.ToolEvent evt) {
+    public void recordStep(Long taskId, RagRetrievalService.ToolEvent evt) {
         if (taskId == null || evt == null) return;
         long now = System.currentTimeMillis();
         AgentTaskStepEntity step = new AgentTaskStepEntity();
@@ -82,7 +81,7 @@ public class AgentTaskService {
         step.setArgs(evt.args());
         step.setResult(evt.result());
         step.setCreateTime(new Date());
-        if (KbQueryTools.ToolEvent.STATUS_RUNNING.equals(evt.status())) {
+        if (RagRetrievalService.ToolEvent.STATUS_RUNNING.equals(evt.status())) {
             // 记录起点；同一工具多轮调用时覆盖为最近一次（耗时精度可接受）
             stepStartTimes.computeIfAbsent(taskId, k -> new ConcurrentHashMap<>()).put(evt.name(), now);
         } else {
@@ -122,7 +121,7 @@ public class AgentTaskService {
         long stepCount = agentTaskStepMapper.selectCount(Wrappers.<AgentTaskStepEntity>lambdaQuery()
                 .eq(AgentTaskStepEntity::getTaskId, taskId)
                 .in(AgentTaskStepEntity::getStatus,
-                        KbQueryTools.ToolEvent.STATUS_DONE, KbQueryTools.ToolEvent.STATUS_ERROR));
+                        RagRetrievalService.ToolEvent.STATUS_DONE, RagRetrievalService.ToolEvent.STATUS_ERROR));
         update.setToolCount(Math.toIntExact(stepCount));
         agentTaskMapper.updateById(update);
         // 任务结束，释放步骤耗时统计缓存

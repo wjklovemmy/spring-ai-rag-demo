@@ -14,6 +14,7 @@
 - [核心业务流程](#核心业务流程)
   - [1. 文档上传与摄取（Ingestion）](#1-文档上传与摄取ingestion)
   - [2. 知识问答（Q&A）](#2-知识问答qa)
+  - [2.1 Agent 问答完整调用链](#21-agent-问答完整调用链)
   - [3. 文档删除](#3-文档删除)
   - [4. 用户认证与授权（JWT + RBAC）](#4-用户认证与授权jwt--rbac)
   - [5. 聊天会话管理](#5-聊天会话管理)
@@ -211,7 +212,7 @@ spring-ai-rag-demo/
 │       ├── memory/
 │       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库）
 │       ├── tools/
-│       │   ├── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments / searchKnowledge）+ 显式文档解析（问题点名文档时限定召回）
+│       │   ├── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments / documentOutline / searchKnowledge 壳）
 │       │   └── CalculatorTool.java            # 通用计算工具（@Tool：calculate，受限表达式安全求值：+ - * / ( ) ^ %）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
@@ -223,6 +224,7 @@ spring-ai-rag-demo/
 │           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
 │           ├── HybridSearchService.java           # 混合检索编排（RRF 融合 + 异常降级）
 │           ├── KnowledgeSearchService.java        # 知识库检索唯一入口（召回→过滤→Rerank→[来源N]上下文组装），searchKnowledge 工具复用
+│           ├── RagRetrievalService.java           # Agent 检索链路组件：显式文档解析（问题点名文档限定召回）+ searchKnowledge 方法体 + 编号累积合并 + 工具事件基础设施
 │           ├── RerankService.java / DashScopeRerankService.java  # 重排序接口与实现
 │           ├── OcrService.java / AliyunOcrService.java           # OCR 接口与实现
 │           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
@@ -400,6 +402,80 @@ spring-ai-rag-demo/
 - 同步（`stream=false`）：`{ answer, sources: [{documentId, documentName, pageNo, snippet}] }`（sources 同样为过滤重排后的引用来源）
 - 前端将 `sources` 渲染为可点击高亮/可下载的引用来源（`.source-ref` 标签与来源列表编号对应）；AI 服务不可用时返回 `answer="AI服务暂时不可用，请稍后再试"`、`sources=[]`（接口正常 200，前端可直接展示降级提示）
 
+### 2.1 Agent 问答完整调用链
+
+以流式问答 `POST /api/knowledge-document/chat`（`stream=true`）为例，从请求进入到最终引用下发的完整链路（按下列顺序阅读对应文件/方法即是全链路）：
+
+```
+前端 Vue（spring-ai-web）
+  → 网关 7070（JwtAuthGlobalFilter：JWT 校验 + 注入用户头）
+  → RAG :8080  KnowledgeDocumentController.chat()
+     │  ① HTTP 入口：@RequireKbRole(VIEWER) AOP 鉴权，解析 question / knowledgeBaseId / sessionId / stream
+     ▼
+  KnowledgeDocumentService.chatStream(question, kbId, sessionId)
+     │  ② Agent 编排：
+     │     · touchOnChat              会话元数据落库（未知 sessionId 自动补建）
+     │     · expireOverdueDocuments   懒标记 TTL 到期文档为 EXPIRED
+     │     · startAgentTask           写 agent_task（question / prompt / model）
+     │     · 创建 toolSink            工具事件通道（replay 缓存：落库 + SSE 双订阅）
+     │     · streamLlm()              流式调用 LLM（内部 callLlm → chatClient.prompt()）
+     ▼
+  chatClient.prompt().user(question)
+     │  ③ 工具注册：AiConfig.kbQueryToolCallbacks()（KbQueryTools + CalculatorTool
+     │     → MethodToolCallbackProvider → ChatClient.defaultToolCallbacks）
+     │     toolContext() 注入：kbId / userId / conversationId / taskId / toolSink / searchResultRef
+     ▼
+  DeepSeek（deepseek-chat）按系统提示词 buildAgentSystemPrompt() 自主决策
+     │  ④ 模型决定是否调用 searchKnowledge（知识类问题先检索再引用）
+     ▼
+  KbQueryTools.searchKnowledge（@Tool 声明 + @ToolParam 描述，方法体为壳）
+     ▼
+  RagRetrievalService（检索管线）
+     │  ⑤ · KbAuthorizationService 权限校验（显式 userId 版，回调线程不失效）
+     │     · resolveExplicitDocuments / matchDocuments / activeDocuments   显式文档限定
+     │     · KnowledgeSearchService.search   混合检索 + 过滤 + Rerank 精排
+     │     · SearchResult.shift / append     [来源N] 多轮累积合并、编号全局唯一
+     │     · emitToolEvent → toolSink        SSE「tool」事件 + agent_task_step 落库
+     │     · 结果写回 ToolContext 的 AtomicReference（searchResultRef）
+     ▼
+  KnowledgeSearchService.search（检索内核）
+     │  ⑥ Milvus Hybrid（Dense + BM25 + RRF 召回 top20）
+     │     → 状态/版本过滤（SUCCESS/DEPRECATED，同名多版本取最高）
+     │     → gte-rerank-v2 精排 top5 → 组装 [来源N] 上下文返回
+     ▼
+  LLM 基于 [来源N] 片段逐字引用生成回答（SSE「delta」逐 token 输出）
+     ▼
+  回答生成完毕后的后处理（chatStream 中 collectList 之后）
+     │  ⑦ alignCitations         引用编号对齐校验（纠正张冠李戴）
+     │     renumberCitedSources   按回答实际引用的 [来源N] 过滤候选并重排为连续升序编号，
+     │                            回答文本与来源列表同步重写
+     ▼
+  输出：SSE「final」最终全文（对齐后）→「sources」实际引用的来源 →「done」
+     │  ⑧ agentTaskService.finishTask   回答 + sources JSON 快照落 agent_task
+     └─ 历史消息回显：ChatSessionService 从 agent_task.sources 快照回补引用来源
+```
+
+**各环节代码定位：**
+
+| 环节 | 文件 / 关键方法 | 说明 |
+|------|----------------|------|
+| HTTP 入口 | `controller/KnowledgeDocumentController.chat()` | 参数解析 + `@RequireKbRole(VIEWER)` |
+| Agent 编排 | `service/KnowledgeDocumentService.chatStream()` / `chat()` | 建任务、订阅工具事件、调用 LLM、回答后处理 |
+| 工具上下文 | `service/KnowledgeDocumentService.toolContext()` | kbId / userId / conversationId / taskId / toolSink / searchResultRef 注入 ToolContext |
+| 工具注册 | `config/AiConfig.kbQueryToolCallbacks()` | `MethodToolCallbackProvider` 注册全部 `@Tool` |
+| 工具声明 | `tools/KbQueryTools.searchKnowledge()` | `@Tool` + `@ToolParam` 描述（方法体为壳，委托检索组件） |
+| 检索管线 | `service/RagRetrievalService` | 权限校验 → 显式文档解析 → 检索 → 编号累积合并 → 工具事件 |
+| 检索内核 | `service/KnowledgeSearchService.search()` | Milvus Hybrid 召回 → 过滤 → Rerank → [来源N] 上下文 |
+| 计算工具 | `tools/CalculatorTool.calculate()` | 受限表达式求值（如年假余额） |
+| 事件消费/轨迹 | `service/AgentTaskService.startTask` / `recordStep` / `finishTask` | `agent_task` + `agent_task_step` 执行轨迹落库 |
+| 引用后处理 | `service/KnowledgeDocumentService.alignCitations()` / `renumberCitedSources()` | 对齐校验 + 按引用过滤重排连续编号 |
+
+**查看方式：**
+
+1. **读代码**：按上表顺序（①→⑧）逐文件阅读即为完整调用链；同步链路（`stream=false`）差异仅在输出形式（一次性 JSON、工具调用过程不展示），检索与引用逻辑完全一致。
+2. **IDE 追踪**（IntelliJ IDEA）：在 `chatStream` 上 `Ctrl+Alt+H`（Call Hierarchy）看调用方，在 `searchKnowledge` 上 `Alt+F7`（Find Usages）看引用方，`Ctrl+Alt+B` 跳转实现类，可逐层跟踪。
+3. **运行时观测**：每轮提问都会在 `agent_task`（question / prompt / answer / token 用量）+ `agent_task_step`（每步工具调用入参 / 结果 / 耗时）落执行轨迹，`GET /api/agent-task/{id}` 可直接查看实际发生的调用过程；前端「Agent 轨迹」页（`AgentTasksTab.vue`）可视化展示。
+
 ### 3. 文档删除
 
 `KnowledgeDocumentService.deleteDocument(documentId)` 三存储独立容错（对象级权限：先按文档 ID 查所属知识库，再 `assertRole(kbId, EDITOR)` 校验）：
@@ -515,7 +591,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | 10 | 中文提问偶发**英文回答** | 系统提示词无语言约束 | 提示词增加「与用户提问同语言作答」规则（中文提问必须全程中文，仅文档名/术语等专有名词可保留原文） |
 | 11 | 并列子问题（如"年休假提前几天申请？连续请假超5天谁审批？"）被**原样重复检索**两次且结果相同 | 提示词要求"将用户问题原样传入"，模型首次检索不充分时重试仍传完整问题，确定性检索返回相同结果 | 提示词引导：多子问题拆分为针对性查询、一次查一个方面；首次检索已覆盖则直接回答；确需重试必须换更精确查询词，严禁原样重复 |
 
-> 对应代码：`KbQueryTools`（工具三重上限 + searchKnowledge 累积合并）、`KnowledgeSearchService`（`SearchResult.shift/append`）、`RagConfigProperties`（`rag.tools.*`）、`KnowledgeDocumentService`（`hasSourceRefs` / `alignCitations` / `renumberCitedSources`、`buildAgentSystemPrompt` 语言与检索规则）、`KnowledgeDocumentController` / `ChatSessionController`（来源过滤）、`ChatSessionService` / `AgentTaskService`（级联逻辑删除）、`ChatTab.vue`（前端竞态/空会话）。
+> 对应代码：`KbQueryTools`（工具声明 + 清单/大纲）、`RagRetrievalService`（searchKnowledge 方法体 + 累积合并 + 显式文档解析 + 工具事件）、`KnowledgeSearchService`（`SearchResult.shift/append`）、`RagConfigProperties`（`rag.tools.*`）、`KnowledgeDocumentService`（`hasSourceRefs` / `alignCitations` / `renumberCitedSources`、`buildAgentSystemPrompt` 语言与检索规则）、`KnowledgeDocumentController` / `ChatSessionController`（来源过滤）、`ChatSessionService` / `AgentTaskService`（级联逻辑删除）、`ChatTab.vue`（前端竞态/空会话）。
 
 ---
 
@@ -838,6 +914,6 @@ npm run build        # 生产构建，产物在 dist/
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
 19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。
 20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步/流式链路均为 Agentic RAG：模型自主调用工具，无服务层兜底检索）。来源列表在生成完毕后随 `sources` 事件下发（**仅回答实际引用的来源**，按 [来源N] 过滤并重排为连续编号），流式/同步/历史回显（agent_task 快照回补）三种场景下引用来源一致、不漏显。
-21. **工具调用（Function Calling）实现 Agentic RAG**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments` / `searchKnowledge`），问答不再预检索注入上下文，由模型自主决定何时检索——知识类问题先调用 `searchKnowledge`（检索逻辑收敛于 `KnowledgeSearchService`：Hybrid 召回→过滤→Rerank→[来源N]上下文组装），再严格基于工具返回片段逐字引用回答；澄清/寒暄/告知无信息类问题不检索、不下发来源。服务层**不兜底检索**（检索决策完全交给模型）。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
+21. **工具调用（Function Calling）实现 Agentic RAG**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments` / `documentOutline` + `searchKnowledge` 委托壳），问答不再预检索注入上下文，由模型自主决定何时检索——知识类问题先调用 `searchKnowledge`（检索链路收敛于 `RagRetrievalService` 组件 + `KnowledgeSearchService`：显式文档解析→Hybrid 召回→过滤→Rerank→[来源N]上下文组装→编号累积合并），再严格基于工具返回片段逐字引用回答；澄清/寒暄/告知无信息类问题不检索、不下发来源。服务层**不兜底检索**（检索决策完全交给模型）。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
 22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。
 23. **Agent 可观测性（执行轨迹 + 引用来源快照）**：一次提问 = 一条 `agent_task`（question/answer/prompt/model/token 用量/耗时/状态），工具调用每步落一条 `agent_task_step`（工具名/状态/入参/结果/耗时）；同步、流式与熔断降级链路均落库，落库失败不阻塞问答仅告警。引用来源 JSON 快照进 `agent_task.sources`——Redis 记忆只存纯文本，`GET /api/chat-session/{sessionId}/messages` 据此按序回补历史消息的 sources，刷新页面引用来源不丢失。前端「Agent 轨迹」页（`AgentTasksTab.vue` / `AgentTaskDetailModal.vue`）按任务维度查看执行过程与引用来源。

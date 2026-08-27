@@ -382,7 +382,7 @@ public class KnowledgeDocumentController {
         KnowledgeDocumentService.ChatStreamResult chatResult =
                 knowledgeDocumentService.chatStream(question, knowledgeBaseId, sessionId);
 
-        // SSE 事件流：先并行下发工具调用事件（模型自主调用 KbQueryTools 的过程，先于内容产生）
+        // SSE 事件流：先并行下发工具调用事件（模型自主调用 Agent 工具的过程，先于内容产生）
         // 与逐 token 增量文本；内容流结束后合并下发引用对齐校验后的最终全文（final：强制纠正
         // [来源N] 编号张冠李戴，前端覆盖显示），最后携带引用来源与结束标记。
         // 引用来源动态确定（模型调用 searchKnowledge 工具检索后才产生）：

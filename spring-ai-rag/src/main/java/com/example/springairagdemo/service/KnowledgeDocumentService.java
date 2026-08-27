@@ -9,7 +9,6 @@ import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.UserContext;
-import com.example.springairagdemo.tools.KbQueryTools;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -935,7 +934,7 @@ public abstract class KnowledgeDocumentService {
      * @param answer 生成完毕后（引用对齐校验 {@link #alignCitations} 后）的最终回答 + 完整候选来源
      */
     public record ChatStreamResult(Flux<String> stream, Mono<AnswerContext> answer,
-                                   Sinks.Many<KbQueryTools.ToolEvent> toolEvents) {
+                                   Sinks.Many<RagRetrievalService.ToolEvent> toolEvents) {
 
         /** 最终回答上下文：answer 为引用对齐后的全文，sources 为完整候选来源（编号不重排，空表示无检索来源） */
         public record AnswerContext(String answer, List<SourceInfo> sources) {}
@@ -1223,9 +1222,9 @@ public abstract class KnowledgeDocumentService {
         final Long taskId = startAgentTask(UserContext.getUserId(), sessionId, knowledgeBaseId,
                 question, promptText, chatModelName);
 
-        // 2.2 工具调用事件 Sink：KbQueryTools 工具回调线程写入（running/done），Controller 合并进 SSE 展示。
+        // 2.2 工具调用事件 Sink：RagRetrievalService 工具回调线程写入（running/done），Controller 合并进 SSE 展示。
         //    replay 缓存支持多订阅者：本处订阅落库 + Controller 订阅 SSE，两者都能收到全部事件
-        Sinks.Many<KbQueryTools.ToolEvent> toolSink = Sinks.many().replay().limit(1024);
+        Sinks.Many<RagRetrievalService.ToolEvent> toolSink = Sinks.many().replay().limit(1024);
         if (taskId != null) {
             Long task = taskId;
             toolSink.asFlux().subscribe(evt -> {
@@ -1334,7 +1333,7 @@ public abstract class KnowledgeDocumentService {
      * 调用异常/网络中断时降级为 {@link #AI_SERVICE_UNAVAILABLE}，避免连接异常中断前端。
      */
     private Flux<String> streamLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId,
-                                   Long taskId, Sinks.Many<KbQueryTools.ToolEvent> toolSink,
+                                   Long taskId, Sinks.Many<RagRetrievalService.ToolEvent> toolSink,
                                    AtomicReference<Usage> usageRef,
                                    AtomicReference<KnowledgeSearchService.SearchResult> searchResultRef) {
         ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
@@ -1425,28 +1424,28 @@ public abstract class KnowledgeDocumentService {
     /**
      * 工具调用上下文：把当前请求的知识库 ID、用户 ID、会话记忆 ID、Agent 任务 ID 放入 ToolContext。
      * 必须在请求线程内调用（UserContext 为 ThreadLocal）；工具回调线程不在此上下文内，
-     * KbQueryTools 从 ToolContext 而非 UserContext 读取身份信息，避免线程切换导致权限校验失效。
+     * Agent 工具（RagRetrievalService）从 ToolContext 而非 UserContext 读取身份信息，避免线程切换导致权限校验失效。
      *
      * @param conversationId 会话记忆 ID（userId:sessionId，供工具感知多轮上下文）
      * @param taskId         Agent 任务 ID（供工具关联执行轨迹；同步链路 LLM 调用时任务尚未创建，传 null）
      */
     private Map<String, Object> toolContext(Long knowledgeBaseId, String conversationId, Long taskId,
-                                            Sinks.Many<KbQueryTools.ToolEvent> toolSink,
+                                            Sinks.Many<RagRetrievalService.ToolEvent> toolSink,
                                             AtomicReference<KnowledgeSearchService.SearchResult> searchResultRef) {
         Map<String, Object> ctx = new HashMap<>(6);
-        ctx.put(KbQueryTools.KB_ID_KEY, knowledgeBaseId);
-        ctx.put(KbQueryTools.USER_ID_KEY, UserContext.getUserId());
+        ctx.put(RagRetrievalService.KB_ID_KEY, knowledgeBaseId);
+        ctx.put(RagRetrievalService.USER_ID_KEY, UserContext.getUserId());
         if (conversationId != null) {
-            ctx.put(KbQueryTools.CONVERSATION_ID_KEY, conversationId);
+            ctx.put(RagRetrievalService.CONVERSATION_ID_KEY, conversationId);
         }
         if (taskId != null) {
-            ctx.put(KbQueryTools.TASK_ID_KEY, taskId);
+            ctx.put(RagRetrievalService.TASK_ID_KEY, taskId);
         }
         if (toolSink != null) {
-            ctx.put(KbQueryTools.TOOL_EVENT_SINK_KEY, toolSink);
+            ctx.put(RagRetrievalService.TOOL_EVENT_SINK_KEY, toolSink);
         }
         if (searchResultRef != null) {
-            ctx.put(KbQueryTools.SEARCH_RESULT_HOLDER_KEY, searchResultRef);
+            ctx.put(RagRetrievalService.SEARCH_RESULT_HOLDER_KEY, searchResultRef);
         }
         return ctx;
     }

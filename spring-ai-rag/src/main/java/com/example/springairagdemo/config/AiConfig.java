@@ -55,9 +55,11 @@ public class AiConfig {
     /**
      * 注册模型可自主调用的工具集为 ToolCallbackProvider：
      * <ul>
-     *   <li>{@link KbQueryTools}：知识库查询（文档清单、文件名搜索、大纲、检索正文），
-     *       解决"知识库中有哪些文档"等纯向量检索无法回答的枚举类问题；
-     *       请求级上下文（knowledgeBaseId/userId）由 Service 层经 prompt.toolContext() 注入。</li>
+     *   <li>{@link KbQueryTools}：知识库查询（文档清单、文件名搜索、大纲 + searchKnowledge 检索壳；
+     *       正文检索链路已收敛到 {@code RagRetrievalService}，含显式文档解析 + Milvus 混合检索
+     *       + Rerank 精排 + 编号累积合并 + 工具事件），解决"知识库中有哪些文档"等纯向量检索
+     *       无法回答的枚举类问题；请求级上下文（knowledgeBaseId/userId）由 Service 层
+     *       经 prompt.toolContext() 注入。</li>
      *   <li>{@link CalculatorTool}：数学表达式计算，解决"年假还剩几天"等需要数值运算的问题，
      *       模型把自然语言翻译为受限表达式，由服务端安全求值。</li>
      * </ul>

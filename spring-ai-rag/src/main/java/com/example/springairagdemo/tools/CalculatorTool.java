@@ -1,5 +1,6 @@
 package com.example.springairagdemo.tools;
 
+import com.example.springairagdemo.service.RagRetrievalService;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.tool.annotation.Tool;
@@ -51,21 +52,21 @@ public class CalculatorTool {
         } catch (IllegalArgumentException e) {
             String error = "无法计算：" + e.getMessage()
                     + "。请将问题整理为仅含数字和 + - * / ( ) ^ % 的数学表达式后重新调用本工具";
-            emitToolEvent(toolContext, KbQueryTools.ToolEvent.STATUS_ERROR, expression, error);
+            emitToolEvent(toolContext, RagRetrievalService.ToolEvent.STATUS_ERROR, expression, error);
             return error;
         }
-        emitToolEvent(toolContext, KbQueryTools.ToolEvent.STATUS_DONE, normalized, result);
+        emitToolEvent(toolContext, RagRetrievalService.ToolEvent.STATUS_DONE, normalized, result);
         return result;
     }
 
-    /** 发布工具调用事件（SSE 展示用），与 KbQueryTools 共用 Sink；未注入 Sink 时静默跳过 */
+    /** 发布工具调用事件（SSE 展示用），与 RagRetrievalService 共用 Sink；未注入 Sink 时静默跳过 */
     private void emitToolEvent(ToolContext toolContext, String status, String args, String result) {
         if (toolContext == null) return;
-        Object sinkObj = toolContext.getContext().get(KbQueryTools.TOOL_EVENT_SINK_KEY);
+        Object sinkObj = toolContext.getContext().get(RagRetrievalService.TOOL_EVENT_SINK_KEY);
         if (!(sinkObj instanceof Sinks.Many<?> sink)) return;
         @SuppressWarnings("unchecked")
-        Sinks.Many<KbQueryTools.ToolEvent> typed = (Sinks.Many<KbQueryTools.ToolEvent>) sink;
-        typed.tryEmitNext(new KbQueryTools.ToolEvent(TOOL_NAME, status, truncate(args), truncate(result)));
+        Sinks.Many<RagRetrievalService.ToolEvent> typed = (Sinks.Many<RagRetrievalService.ToolEvent>) sink;
+        typed.tryEmitNext(new RagRetrievalService.ToolEvent(TOOL_NAME, status, truncate(args), truncate(result)));
     }
 
     /** 事件摘要截断，避免超大参数/结果撑爆 SSE 帧 */
