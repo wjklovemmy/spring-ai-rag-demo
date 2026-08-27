@@ -48,10 +48,7 @@ public class AiConfig {
         this.ragConfig = ragConfig;
     }
 
-    /**
-     * 显式使用 DeepSeek 的 ChatModel 创建 ChatClient，
-     * 避免因多 ChatModel Bean 导致歧义
-     */
+
     /**
      * 注册模型可自主调用的工具集为 ToolCallbackProvider：
      * <ul>
@@ -69,6 +66,10 @@ public class AiConfig {
         return MethodToolCallbackProvider.builder().toolObjects(tools, calculatorTool).build();
     }
 
+    /**
+     * 显式使用 DeepSeek 的 ChatModel 创建 ChatClient，
+     * 避免因多 ChatModel Bean 导致歧义
+     */
     @Bean
     public ChatClient chatClient(@Qualifier("deepSeekChatModel") ChatModel chatModel, ChatMemory chatMemory,
                                  ToolCallbackProvider toolCallbackProvider) {
