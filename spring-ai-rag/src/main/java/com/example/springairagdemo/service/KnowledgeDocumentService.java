@@ -40,12 +40,15 @@ import java.time.LocalDate;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -964,7 +967,7 @@ public abstract class KnowledgeDocumentService {
         expireOverdueDocuments();
 
         // 1. Agent 化：不再预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具检索；
-        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，取最后一次有效结果）
+        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，各轮结果累积合并、编号全局唯一）
         AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
         String systemPrompt = buildAgentSystemPrompt();
 
@@ -1011,8 +1014,14 @@ public abstract class KnowledgeDocumentService {
         }
 
         // 引用来源仅随实际引用展示：回答中无 [来源N]（澄清性提问/告知无信息/AI 降级）时不返回来源，
-        // 避免把与回答无关的检索候选展示给用户（agent_task 快照仍保留完整候选供审计查看）
-        List<SourceInfo> sources = (rc != null && hasSourceRefs(answer)) ? rc.sources() : List.of();
+        // 避免把与回答无关的检索候选展示给用户；回答有引用时只保留被实际引用的来源并重排为连续编号
+        // （如回答引用 1、3、7 → 回答与来源列表同步重写为 1、2、3，序号不跳号、点击定位一一对应）
+        List<SourceInfo> sources = List.of();
+        if (rc != null && hasSourceRefs(answer)) {
+            CitedSources cited = renumberCitedSources(answer, rc.sources());
+            answer = cited.answer();
+            sources = cited.sources();
+        }
 
         // Agent 可观测性：同步问答同样落库执行轨迹（无工具步骤），记录 prompt/model/引用来源；
         // 同步链路不采集 token 用量（流式链路已记录），token 列为 null
@@ -1023,7 +1032,7 @@ public abstract class KnowledgeDocumentService {
             if (syncTaskId != null) {
                 String finalAnswer = answer;
                 agentTaskService.finishTask(syncTaskId, finalAnswer,
-                        sourcesJson(rc == null ? List.of() : rc.sources()), true, null,
+                        sourcesJson(sources), true, null,
                         null, null, null);
             }
         } catch (Exception e) {
@@ -1040,6 +1049,49 @@ public abstract class KnowledgeDocumentService {
     public static boolean hasSourceRefs(String answer) {
         return answer != null && SOURCE_REF_PATTERN.matcher(answer).find();
     }
+
+    /**
+     * 引用来源过滤 + 序号重排：按回答中实际引用的 [来源N]（首次出现顺序）保留候选来源，
+     * 重新编号为 1..N，回答文本中的编号同步重写为新编号。
+     * <p>例如回答引用 [来源1][来源3][来源7] → 过滤后仅保留 3 条，重写为 [来源1][来源2][来源3]，
+     * 前端"引用来源"列表与实际引用一一对应且序号连续。
+     * <p>注意：须在 {@link #alignCitations} 对齐之后调用——对齐可能纠正编号，
+     * 重排基于纠正后的编号，保证前端按 refIndex 定位到的正是回答引用的内容。
+     *
+     * @return 重写编号后的回答 + 按新编号重排的来源列表
+     */
+    private CitedSources renumberCitedSources(String answer, List<SourceInfo> candidates) {
+        if (answer == null || candidates == null || candidates.isEmpty()) {
+            return new CitedSources(answer, List.of());
+        }
+        // 回答中实际引用的编号（LinkedHashMap 保持首次出现顺序）：旧编号 -> 新连续编号
+        Map<Integer, Integer> renumber = new LinkedHashMap<>();
+        Matcher m = Pattern.compile("\\[来源\\s*(\\d+)\\]").matcher(answer);
+        while (m.find()) {
+            int oldRef = Integer.parseInt(m.group(1));
+            renumber.computeIfAbsent(oldRef, k -> renumber.size() + 1);
+        }
+        if (renumber.isEmpty()) {
+            return new CitedSources(answer, List.of());
+        }
+        // 回答文本中的 [来源N] 同步重写为连续新编号
+        String rewritten = Pattern.compile("\\[来源\\s*(\\d+)\\]")
+                .matcher(answer)
+                .replaceAll(mr -> "[来源" + renumber.get(Integer.parseInt(mr.group(1))) + "]");
+        // 保留被引用来源并重排 refIndex，按新编号升序排列：
+        // 排序后来源列表序号为 1、2、3…（不跳号），且与回答中 [来源N] 的引用顺序一一对应
+        // （回答先引用谁，来源列表第一条就是谁；点击 [来源N] 定位到的正是回答引用的内容）
+        List<SourceInfo> cited = candidates.stream()
+                .filter(s -> s.refIndex() != null && renumber.containsKey(s.refIndex()))
+                .map(s -> new SourceInfo(s.documentId(), s.documentName(), s.pageNo(), s.snippet(),
+                        renumber.get(s.refIndex())))
+                .sorted(Comparator.comparingInt(SourceInfo::refIndex))
+                .toList();
+        return new CitedSources(rewritten, cited);
+    }
+
+    /** 引用过滤 + 重排结果：answer 为编号重写后的回答，sources 为按新编号重排的来源列表 */
+    private record CitedSources(String answer, List<SourceInfo> sources) {}
 
     /**
      * 引用对齐校验（容错）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注了 B 片段的编号）。
@@ -1061,7 +1113,9 @@ public abstract class KnowledgeDocumentService {
         Matcher m = Pattern.compile("\\[来源(\\d+)\\]([^\\[]{0,80})").matcher(answer);
         while (m.find()) {
             int citedRef = Integer.parseInt(m.group(1));
-            if (citedRef < 1 || citedRef > sources.size()) {
+            // 越界编号（模型幻觉标注的 [来源N] 超过来源总数）不跳过：
+            // 若引用文本能唯一命中某来源，同样纠正为真实编号，保证前端可定位
+            if (citedRef < 1) {
                 continue;
             }
             String citedText = m.group(2).replaceAll("\\s+", "");
@@ -1109,9 +1163,17 @@ public abstract class KnowledgeDocumentService {
                 + "你必须先调用 searchKnowledge 工具在知识库中检索相关内容，再严格基于检索到的内容回答用户问题。\n"
                 + "工具使用规则：\n"
                 + "- 需要基于知识库正文内容回答的问题（如“某功能怎么用”“某参数含义”“文档里怎么说的”）"
-                + "→ 必须先调用 searchKnowledge 工具检索，将用户问题原样传入，若问题中点名了具体文档请保留文档名。\n"
+                + "→ 必须先调用 searchKnowledge 工具检索，将用户问题（或其拆分的子问题）传入，"
+                + "若问题中点名了具体文档请保留文档名。\n"
+                + "- 一个问题包含多个独立子问题时（如“A 怎么申请？B 需要谁审批？”），"
+                + "应拆分为针对性查询词分别调用 searchKnowledge（一次检索一个方面），"
+                + "不要把所有子问题揉进同一次检索。\n"
+                + "- 若首次检索结果已能覆盖问题所需信息，直接据此回答，不要重复调用工具；"
+                + "若确实需要再次检索，必须使用更精确、更聚焦的查询词，严禁原样重复已检索过的问题。\n"
                 + "- 用户询问知识库中有哪些文档/查找某份文档 → 调用 listDocuments 或 searchDocuments 工具。\n"
                 + "- 用户询问某文档的结构/章节大纲 → 调用 documentOutline 工具。\n"
+                + "- 用户问题涉及具体数值的算术计算（如年假余额=总天数-已休天数、金额运算、"
+                + "百分比换算、差值/合计等）→ 调用 calculate 工具，把数值和运算翻译成数学表达式（如 5-2、8000*(1-10%)）传入。\n"
                 + "- 与知识库内容无关的问题（闲聊、常识等）→ 直接正常回答，无需调用工具。\n"
                 + "回答方式：当检索到的知识库内容能直接回答用户问题时，请逐字引用原文片段作答，"
                 + "不要用自己的话总结、概括、润色或扩展原文内容；多个相关片段可按原文顺序拼接，"
@@ -1125,6 +1187,8 @@ public abstract class KnowledgeDocumentService {
                 + "每个[来源N]编号必须与实际引用的片段严格对应——你引用了哪个片段的内容，"
                 + "就必须标注哪个片段的编号，严禁引用了 A 片段却标注 B 片段（或其他未引用片段）的编号；"
                 + "若无法确定对应片段，宁可不标注编号，也不可标错。\n"
+                + "请始终使用与用户提问相同的语言作答（用户用中文提问时必须全程使用中文回答，" 
+                + "不得混入英文句子、英文措辞或中英夹杂；仅文档名、术语等原文中的专有名词可保留原文）。\n"
                 + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。\n"
                 + "如果调用工具后仍没有相关知识库内容，请如实告知用户“知识库中暂无相关信息”。\n"
                 + "如果用户的问题中存在指代不清（如“这些内容”“上面提到的”“刚才说的”等），"
@@ -1148,7 +1212,7 @@ public abstract class KnowledgeDocumentService {
         expireOverdueDocuments();
 
         // 1. Agent 化：不预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具；
-        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，取最后一次有效结果）
+        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，各轮结果累积合并、编号全局唯一）
         AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
         String systemPrompt = buildAgentSystemPrompt();
 
@@ -1191,7 +1255,11 @@ public abstract class KnowledgeDocumentService {
                     if (rc == null) {
                         return new ChatStreamResult.AnswerContext(full, List.of());
                     }
-                    return new ChatStreamResult.AnswerContext(alignCitations(full, rc), rc.sources());
+                    // 先对齐编号，再按回答实际引用的 [来源N] 过滤候选并重排为连续编号：
+                    // 只保留被引用的来源（回答引用 1、3、7 → 重写为 1、2、3，序号不跳号）
+                    String aligned = alignCitations(full, rc);
+                    CitedSources cited = renumberCitedSources(aligned, rc.sources());
+                    return new ChatStreamResult.AnswerContext(cited.answer(), cited.sources());
                 })
                 .doOnSuccess(ctx -> {
                     if (taskId != null) {

@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -34,6 +35,50 @@ public class KnowledgeSearchService {
         /** 空结果 */
         public static SearchResult empty() {
             return new SearchResult("", List.of(), List.of());
+        }
+
+        /** [来源N] 编号正则（供编号平移） */
+        private static final Pattern REF_PATTERN = Pattern.compile("\\[来源(\\d+)\\]");
+
+        /**
+         * 编号平移：将本结果中的 [来源N] 统一改为 [来源(N+offset)]，
+         * 来源列表的 refIndex 同步平移。offset &lt;= 0 时原样返回。
+         * <p>用于模型多轮调用 searchKnowledge 时保证编号全局唯一：
+         * 工具返回给模型的片段、累积的最终来源列表使用同一套编号，
+         * 避免各轮编号都从 1 开始导致回答中 [来源N] 与来源列表错位。
+         */
+        public SearchResult shift(int offset) {
+            if (offset <= 0) {
+                return this;
+            }
+            String shiftedContext = REF_PATTERN.matcher(context).replaceAll(m ->
+                    "[来源" + (offset + Integer.parseInt(m.group(1))) + "]");
+            List<SourceInfo> shiftedSources = sources.stream()
+                    .map(s -> new SourceInfo(s.documentId(), s.documentName(), s.pageNo(), s.snippet(),
+                            s.refIndex() + offset))
+                    .toList();
+            return new SearchResult(shiftedContext, shiftedSources, fullContents);
+        }
+
+        /**
+         * 累积合并：将本次检索结果（编号从 1 开始）追加到已有累积结果之后，
+         * 本次片段的编号统一顺延（offset = 已有来源数），context 拼接、来源/全文列表合并。
+         * <p>用于模型多轮调用 searchKnowledge：后一次调用不再覆盖前一次，
+         * 回答中的任何 [来源N] 都能在最终来源列表中找到唯一对应。
+         */
+        public SearchResult append(SearchResult next) {
+            if (next == null || next.context().isEmpty()) {
+                return this;
+            }
+            if (context.isEmpty()) {
+                return next; // 首次调用：编号保持 1..N
+            }
+            SearchResult shifted = next.shift(sources.size());
+            List<SourceInfo> mergedSources = new ArrayList<>(sources);
+            mergedSources.addAll(shifted.sources);
+            List<String> mergedContents = new ArrayList<>(fullContents);
+            mergedContents.addAll(shifted.fullContents);
+            return new SearchResult(context + "\n\n" + shifted.context, mergedSources, mergedContents);
         }
     }
 

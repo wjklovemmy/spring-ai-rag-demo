@@ -211,8 +211,8 @@ public class KbQueryTools {
             + "注意：文档清单/查找文档用 listDocuments/searchDocuments，文档结构/章节大纲用 documentOutline，不要用本工具。"
             + "检索不到内容时工具会明确提示“未检索到”，请如实告知用户。")
     public String searchKnowledge(
-            @ToolParam(description = "需要检索的用户问题（原样传入，若问题中提到了具体文档名请保留，"
-                    + "例如：X 功能的用法、Y 参数的含义）") String question,
+            @ToolParam(description = "需要检索的查询内容（问题含多个独立子问题时拆分为针对性查询词传入，"
+                    + "一次检索一个方面；若问题中提到了具体文档名请保留，例如：X 功能的用法、Y 参数的含义）") String question,
             ToolContext toolContext) {
         emitToolEvent(toolContext, "searchKnowledge", "running",
                 "知识库检索：" + (question == null ? "" : question.trim()), null);
@@ -233,17 +233,25 @@ public class KbQueryTools {
                         : explicitDocs.stream().map(KnowledgeDocumentEntity::getId).distinct().toList();
                 KnowledgeSearchService.SearchResult sr = knowledgeSearchService.search(q, kbId, restrictDocIds);
                 // 回调检索结果给 Service（无论是否命中均标记"已执行检索"）：
-                // 供汇总最终引用来源（SSE sources / agent_task 快照）与引用对齐
+                // 模型可能多轮调用本工具，各轮编号都从 1 开始，若后一次覆盖前一次，
+                // 回答中引用早期轮次的 [来源N] 将与最终来源列表错位。
+                // 因此累积合并所有轮次结果（编号全局递增），工具返回给模型的片段也使用
+                // 平移后的全局编号，保证回答中的 [来源N] 与最终 sources 的 refIndex 一一对应。
+                KnowledgeSearchService.SearchResult thisRound = sr;
                 Object holderObj = toolContext.getContext().get(SEARCH_RESULT_HOLDER_KEY);
                 if (holderObj instanceof AtomicReference<?> holder) {
                     @SuppressWarnings("unchecked")
                     AtomicReference<KnowledgeSearchService.SearchResult> typed =
                             (AtomicReference<KnowledgeSearchService.SearchResult>) holder;
-                    typed.set(sr);
+                    KnowledgeSearchService.SearchResult prev = typed.get();
+                    int offset = (prev == null || prev.context().isEmpty()) ? 0 : prev.sources().size();
+                    typed.set(prev == null ? sr : prev.append(sr));
+                    // 返回给模型的仅本次新增片段，但编号平移到全局编号体系
+                    thisRound = sr.shift(offset);
                 }
-                result = sr.context().isEmpty()
+                result = thisRound.context().isEmpty()
                         ? "知识库中未检索到与“" + q + "”相关的信息"
-                        : sr.context();
+                        : thisRound.context();
             }
         }
         emitToolEvent(toolContext, "searchKnowledge", "done",

@@ -4,6 +4,7 @@ import com.alibaba.csp.sentinel.slots.block.RuleConstant;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRule;
 import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRuleManager;
 import com.example.springairagdemo.embedding.DashScopeEmbeddingModel;
+import com.example.springairagdemo.tools.CalculatorTool;
 import com.example.springairagdemo.tools.KbQueryTools;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
@@ -52,14 +53,18 @@ public class AiConfig {
      * 避免因多 ChatModel Bean 导致歧义
      */
     /**
-     * 注册知识库查询工具集（KbQueryTools）为 ToolCallbackProvider：
-     * 模型可自主调用工具查询 MySQL（文档清单、文件名搜索等），
-     * 解决"知识库中有哪些文档"等纯向量检索无法回答的枚举类问题。
-     * 请求级上下文（knowledgeBaseId/userId）由 Service 层经 prompt.toolContext() 注入。
+     * 注册模型可自主调用的工具集为 ToolCallbackProvider：
+     * <ul>
+     *   <li>{@link KbQueryTools}：知识库查询（文档清单、文件名搜索、大纲、检索正文），
+     *       解决"知识库中有哪些文档"等纯向量检索无法回答的枚举类问题；
+     *       请求级上下文（knowledgeBaseId/userId）由 Service 层经 prompt.toolContext() 注入。</li>
+     *   <li>{@link CalculatorTool}：数学表达式计算，解决"年假还剩几天"等需要数值运算的问题，
+     *       模型把自然语言翻译为受限表达式，由服务端安全求值。</li>
+     * </ul>
      */
     @Bean
-    public ToolCallbackProvider kbQueryToolCallbacks(KbQueryTools tools) {
-        return MethodToolCallbackProvider.builder().toolObjects(tools).build();
+    public ToolCallbackProvider kbQueryToolCallbacks(KbQueryTools tools, CalculatorTool calculatorTool) {
+        return MethodToolCallbackProvider.builder().toolObjects(tools, calculatorTool).build();
     }
 
     @Bean
