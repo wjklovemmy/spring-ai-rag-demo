@@ -16,8 +16,11 @@ import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.ai.tool.method.MethodToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.cloud.context.environment.EnvironmentChangeEvent;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.env.Environment;
 
 import java.util.List;
 
@@ -35,6 +38,14 @@ public class AiConfig {
 
     /** 向量化调用（DashScope Embedding）的 Sentinel 熔断资源名 */
     public static final String EMBEDDING_RESOURCE = "dashscope-embedding";
+
+    private final Environment environment;
+    private final RagConfigProperties ragConfig;
+
+    public AiConfig(Environment environment, RagConfigProperties ragConfig) {
+        this.environment = environment;
+        this.ragConfig = ragConfig;
+    }
 
     /**
      * 显式使用 DeepSeek 的 ChatModel 创建 ChatClient，
@@ -74,8 +85,8 @@ public class AiConfig {
     }
 
     /**
-     * 注册 Sentinel 降级规则（AI 问答 + 向量化）：
-     * 最小请求数 &gt;= 5 且异常比例 &gt;= 50% 时熔断 10 秒。
+     * 注册 Sentinel 降级规则（AI 问答 + 向量化），参数来自配置 {@code rag.sentinel.*}：
+     * 最小请求数 &gt;= min-request-amount 且异常比例 &gt;= exception-ratio 时熔断 time-window-seconds 秒。
      * <ul>
      *   <li>{@code ai-chat}（DeepSeek）：熔断/异常期间 KnowledgeDocumentService#chat 直接返回
      *       降级提示（"AI服务暂时不可用，请稍后再试"），避免接口 500；</li>
@@ -86,18 +97,47 @@ public class AiConfig {
      */
     @PostConstruct
     public void initSentinelDegradeRules() {
-        DegradeRule chatRule = new DegradeRule(AI_CHAT_RESOURCE)
-                .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
-                .setCount(0.5)
-                .setMinRequestAmount(5)
-                .setTimeWindow(10);
-        DegradeRule embedRule = new DegradeRule(EMBEDDING_RESOURCE)
-                .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
-                .setCount(0.5)
-                .setMinRequestAmount(5)
-                .setTimeWindow(10);
+        registerDegradeRules();
+    }
+
+    /**
+     * Nacos 配置热更新：{@code rag.sentinel.*} 变更时重载熔断规则，无需重启服务。
+     * 读取走 Environment（而非依赖 ConfigurationProperties 的 rebind）：
+     * EnvironmentChangeEvent 发布时 Environment 已包含新值，而 rebind 与本监听器执行顺序不保证，
+     * 直接读 Environment 可保证拿到最新配置。
+     */
+    @EventListener(EnvironmentChangeEvent.class)
+    public void reloadSentinelDegradeRules(EnvironmentChangeEvent event) {
+        boolean relevant = event.getKeys().stream().anyMatch(k -> k.startsWith("rag.sentinel"));
+        if (!relevant) {
+            return;
+        }
+        log.info("检测到 rag.sentinel.* 配置变更，重载 Sentinel 熔断规则");
+        registerDegradeRules();
+    }
+
+    /** 按配置注册/重载两条熔断规则（ai-chat + dashscope-embedding） */
+    private void registerDegradeRules() {
+        DegradeRule chatRule = buildRule(AI_CHAT_RESOURCE, "rag.sentinel.ai-chat", ragConfig.getSentinel().getAiChat());
+        DegradeRule embedRule = buildRule(EMBEDDING_RESOURCE, "rag.sentinel.embedding", ragConfig.getSentinel().getEmbedding());
         DegradeRuleManager.loadRules(List.of(chatRule, embedRule));
-        log.info("已注册 Sentinel 熔断规则：AI 问答资源={}, Embedding 资源={}, grade=异常比例, count=0.5, minRequestAmount=5, timeWindow=10s",
-                AI_CHAT_RESOURCE, EMBEDDING_RESOURCE);
+        log.info("已注册 Sentinel 熔断规则：AI 问答资源={}, Embedding 资源={}, grade=异常比例, "
+                        + "chat(count={}, minRequestAmount={}, timeWindow={}s), "
+                        + "embedding(count={}, minRequestAmount={}, timeWindow={}s)",
+                AI_CHAT_RESOURCE, EMBEDDING_RESOURCE,
+                chatRule.getCount(), chatRule.getMinRequestAmount(), chatRule.getTimeWindow(),
+                embedRule.getCount(), embedRule.getMinRequestAmount(), embedRule.getTimeWindow());
+    }
+
+    /** 从配置（Environment 优先，ConfigurationProperties 兜底默认值）构建一条熔断规则 */
+    private DegradeRule buildRule(String resource, String prefix, RagConfigProperties.Rule defaults) {
+        double exceptionRatio = environment.getProperty(prefix + ".exception-ratio", Double.class, defaults.getExceptionRatio());
+        int minRequestAmount = environment.getProperty(prefix + ".min-request-amount", Integer.class, defaults.getMinRequestAmount());
+        int timeWindow = environment.getProperty(prefix + ".time-window-seconds", Integer.class, defaults.getTimeWindowSeconds());
+        return new DegradeRule(resource)
+                .setGrade(RuleConstant.DEGRADE_GRADE_EXCEPTION_RATIO)
+                .setCount(exceptionRatio)
+                .setMinRequestAmount(minRequestAmount)
+                .setTimeWindow(timeWindow);
     }
 }

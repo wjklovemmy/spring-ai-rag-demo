@@ -47,6 +47,18 @@ rag:
     max-outline-docs: 20      # 一次大纲查询最多处理的文档数（文档过多时引导指定具体文档）
     max-outline-chars: 12000  # 大纲结果文本总长度上限（字符）
     max-inventory-docs: 200   # 文档清单最多展示条数
+
+  # Sentinel 熔断降级规则（ai-chat 问答 / dashscope-embedding 向量化）：
+  # 最小请求数 >= min-request-amount 且异常比例 >= exception-ratio 时熔断 time-window-seconds 秒
+  sentinel:
+    ai-chat:
+      exception-ratio: 0.5        # 异常比例阈值（0~1）
+      min-request-amount: 5       # 最小请求数（不足不参与熔断统计）
+      time-window-seconds: 10     # 熔断时间窗（秒）
+    embedding:
+      exception-ratio: 0.5
+      min-request-amount: 5
+      time-window-seconds: 10
 ```
 
 ## 验证

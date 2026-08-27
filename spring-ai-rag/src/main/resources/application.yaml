@@ -211,6 +211,18 @@ rag:
     max-outline-chars: 12000
     # 文档清单最多展示条数：超限截断并引导关键词定位
     max-inventory-docs: 200
+  # Sentinel 熔断降级规则（ai-chat 问答 / dashscope-embedding 向量化）：
+  # 最小请求数 >= min-request-amount 且异常比例 >= exception-ratio 时熔断 time-window-seconds 秒。
+  # 配置中心（Nacos）修改后热生效，无需重启（EnvironmentChangeEvent 监听重载）
+  sentinel:
+    ai-chat:
+      exception-ratio: 0.5
+      min-request-amount: 5
+      time-window-seconds: 10
+    embedding:
+      exception-ratio: 0.5
+      min-request-amount: 5
+      time-window-seconds: 10
 
 # ==================== 网关信任配置 ====================
 # 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，

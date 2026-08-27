@@ -30,6 +30,9 @@ public class RagConfigProperties {
     /** 工具调用（Tool Calling）限制配置：防止枚举/大纲类工具在大数据量下撑爆上下文 */
     private Tools tools = new Tools();
 
+    /** Sentinel 熔断降级规则配置（ai-chat 问答 / dashscope-embedding 向量化） */
+    private Sentinel sentinel = new Sentinel();
+
     @Data
     public static class DocumentGlobal {
         /** 文档版本共存天数：旧版本在新版本上传后 N 天内仍可检索，超期后自动过滤（默认30天） */
@@ -165,5 +168,23 @@ public class RagConfigProperties {
         private int maxOutlineChars = 12000;
         /** 文档清单最多展示条数：上万文档场景下列全部会撑爆工具结果，超限截断并引导关键词定位 */
         private int maxInventoryDocs = 200;
+    }
+
+    @Data
+    public static class Sentinel {
+        /** ai-chat（DeepSeek 问答）熔断规则 */
+        private Rule aiChat = new Rule();
+        /** dashscope-embedding（DashScope 向量化）熔断规则 */
+        private Rule embedding = new Rule();
+    }
+
+    @Data
+    public static class Rule {
+        /** 异常比例阈值（0~1）：达到最小请求数后异常占比 >= 该值即熔断 */
+        private double exceptionRatio = 0.5;
+        /** 最小请求数：请求量不足该值不参与熔断统计 */
+        private int minRequestAmount = 5;
+        /** 熔断时间窗（秒）：熔断持续时长，期间快速失败 */
+        private int timeWindowSeconds = 10;
     }
 }
