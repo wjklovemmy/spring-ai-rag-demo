@@ -117,8 +117,12 @@ public class AgentTaskService {
         if (existing.getStartMs() != null) {
             update.setCostMs(System.currentTimeMillis() - existing.getStartMs());
         }
+        // toolCount = 实际完成的工具调用次数：running/done 成对落库，仅统计 done/error 事件，
+        // 避免一次工具调用（running + done 两行 step）被计为 2 次
         long stepCount = agentTaskStepMapper.selectCount(Wrappers.<AgentTaskStepEntity>lambdaQuery()
-                .eq(AgentTaskStepEntity::getTaskId, taskId));
+                .eq(AgentTaskStepEntity::getTaskId, taskId)
+                .in(AgentTaskStepEntity::getStatus,
+                        KbQueryTools.ToolEvent.STATUS_DONE, KbQueryTools.ToolEvent.STATUS_ERROR));
         update.setToolCount(Math.toIntExact(stepCount));
         agentTaskMapper.updateById(update);
         // 任务结束，释放步骤耗时统计缓存

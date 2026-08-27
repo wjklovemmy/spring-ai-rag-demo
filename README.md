@@ -2,7 +2,7 @@
 
 一个基于 **Spring Boot 4 + Spring AI 2.0** 的企业级 **RAG（Retrieval-Augmented Generation，检索增强生成）** 演示项目。
 
-项目将 PDF 文档解析、切分、向量化后存入 Milvus 向量数据库，问答时通过向量检索召回相关片段，作为上下文注入 DeepSeek 大模型生成回答，并附带可溯源的知识库引用。
+项目将 PDF 文档解析、切分、向量化后存入 Milvus 向量数据库；问答采用 **Agentic RAG** 模式——由模型自主决定是否调用 `searchKnowledge` 工具检索知识库，再严格基于检索到的 [来源N] 片段逐字引用回答（DeepSeek 生成），并附带可溯源的知识库引用。
 
 ---
 
@@ -211,7 +211,7 @@ spring-ai-rag-demo/
 │       ├── memory/
 │       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库）
 │       ├── tools/
-│       │   └── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments）+ 显式文档解析（问题点名文档时限定召回）
+│       │   └── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments / searchKnowledge）+ 显式文档解析（问题点名文档时限定召回）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
@@ -221,6 +221,7 @@ spring-ai-rag-demo/
 │           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
 │           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
 │           ├── HybridSearchService.java           # 混合检索编排（RRF 融合 + 异常降级）
+│           ├── KnowledgeSearchService.java        # 知识库检索唯一入口（召回→过滤→Rerank→[来源N]上下文组装），searchKnowledge 工具复用
 │           ├── RerankService.java / DashScopeRerankService.java  # 重排序接口与实现
 │           ├── OcrService.java / AliyunOcrService.java           # OCR 接口与实现
 │           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
@@ -345,6 +346,8 @@ spring-ai-rag-demo/
 
 `KnowledgeDocumentService.chat(question, knowledgeBaseId, sessionId)`（同步） / `chatStream(...)`（流式，入口先执行 `assertRole(kbId, VIEWER)`，需 VIEWER 及以上）：
 
+**Agentic RAG 模式**：不再预检索注入上下文，由模型自主决定是否调用 `searchKnowledge` 工具检索知识库（Spring AI Function Calling），检索结果经工具回调汇总后做引用对齐，LLM 严格基于工具返回的 [来源N] 片段回答；知识类问题强约束"先检索、再逐字引用"。
+
 ```
 用户问题 + 会话 ID（sessionId 由后端生成：POST /api/chat-session/create，前端存 localStorage；
             旧版本前端残留的随机 ID 首次问答时自动补建会话记录，平滑接入会话列表）
@@ -353,49 +356,43 @@ spring-ai-rag-demo/
   │       MessageChatMemoryAdvisor 按会话 ID 从 Redis（key rag:chat:memory:{userId}:{sessionId}，
   │       userId 由服务端 UserContext 注入，会话按用户隔离）读取历史（仅 user/assistant 消息，
   │       窗口保护最近 100 条，TTL 7 天）注入 prompt，实现多轮上下文连贯；
-  │       · system 检索上下文不落库（避免污染记忆）；「清空对话」= 后端删 Redis 记忆 + 前端清空消息
+  │       · system 提示与工具产生的 Tool 消息均不落库（避免污染记忆）；「清空对话」= 后端删 Redis 记忆 + 前端清空消息
   │
-  ├─ ② 检索召回   Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
-  │       Milvus 端 RRF 融合，召回 candidateTopK=20 候选
-  │       · rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
+  ├─ ② 模型推理    Agent 系统提示词（buildAgentSystemPrompt）强约束：
+  │       · 知识类问题必须先调用 searchKnowledge 工具检索，再严格基于 [来源N] 片段逐字引用回答
+  │       · 禁止 Markdown；知识库无信息时如实告知；指代不清时向用户确认
+  │       模型自主决定是否调用工具（工具调用事件经 tool Sink 合并进 SSE 实时展示）
+  │
+  ├─ ③ searchKnowledge 工具（模型调用时，检索逻辑收敛于 KnowledgeSearchService）：
+  │       · userId/kbId 经 ToolContext 注入，回调线程内显式校验 VIEWER 权限
+  │       · Hybrid Search：问题 → DashScope 向量化（Dense 路）+ 关键词全文（BM25 路），
+  │         Milvus 端 RRF 融合，召回 candidateTopK=20 候选
+  │         - rag.hybrid.enabled=false 时降级为纯向量相似度检索（阈值 0.3）
   │       · 显式文档限定：问题点名某份文档（带扩展名完整文件名 / 书名号）时，先用 Milvus filter
   │         把召回限定在目标文档内（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索），
   │         从源头杜绝名称相近文档（如"纯图片产品说明书_扫描件.pdf"）的 chunk 混入引用来源
-  │       · 多轮指代：当轮未点名但含指代/续问词（如"上面的问题再查一遍"）时，回看会话记忆
-  │         中最近一轮用户问题，沿用其显式文档限定，避免检索退化为全库召回
+  │       · 过滤：状态白名单仅 SUCCESS(3) / DEPRECATED(5)（排除处理中/失败/过期；
+  │         chat 开头懒标记 TTL 到期版本为 EXPIRED）；同名多版本只保留版本号最高的检索结果（新版优先）
+  │       · Rerank 精排：百炼 gte-rerank 对 "问题 vs 候选" 逐对打分，
+  │         按相关性降序取 topN=5（失败自动降级为向量排序）
+  │       · 组装上下文：按精排顺序拼接，标注 [来源n] 文档名 + 页码；
+  │         经 ToolContext 回调写回 Service（无论是否命中均标记"已执行检索"），
+  │         供最终引用来源汇总（SSE sources / agent_task 快照）与引用对齐
   │
-  ├─ ③ 过滤       状态白名单：仅 SUCCESS(3) / DEPRECATED(5) 参与问答（排除处理中/失败/过期）
-  │       · 懒标记过期：chat 开头将 TTL 到期的旧版本标记为 EXPIRED(6) 并过滤
-  │       · 同名多版本只保留版本号最高的检索结果（新版优先，防止新旧混召）
-  │
-  ├─ ④ 取回文本   按 chunk_id 从 MySQL 回查完整 chunk 内容
-  │
-  ├─ ⑤ Rerank 精排 百炼 gte-rerank 对 "问题 vs 候选" 逐对打分，
-  │       按相关性降序取 topN=5（失败自动降级为向量排序）
-  │
-  ├─ ⑥ 组装上下文 按精排顺序拼接，标注 [来源n] 文档名 + 页码
-  │
-  ├─ ⑦ 工具调用   （可选，信号驱动）若检索为空，改用"空上下文系统提示词"引导模型自主决定：
-  │       涉及文档清单/文件搜索等结构化信息时调用 KbQueryTools（listDocuments / searchDocuments），
-  │       userId/kbId 经 ToolContext 注入，回调线程内显式校验 VIEWER 权限；
-  │       新增查询类型只需加 @Tool 方法，无需穷举关键词；
-  │       回答核心信息来自工具结果时，提示词要求在末尾统一标注相关检索片段
-  │       （"以上内容详见[来源1][来源2][来源3]"）
-  │
-  ├─ ⑧ LLM 生成   上下文注入系统提示词（仅依据知识库回答），DeepSeek 生成答案
+  ├─ ④ LLM 生成   模型基于工具返回的 [来源N] 片段逐字引用作答（上下文不预注入、服务层不兜底检索）
   │       · 流式（默认 stream=true）：SSE（text/event-stream）逐 token 输出，降低首字延迟
   │       · 同步（stream=false）：一次性返回完整 JSON
   │       · 熔断降级：调用异常/超时或 Sentinel 熔断（资源 ai-chat）→ 返回「AI服务暂时不可用，请稍后再试」
   │       · 综合引用：多相关片段须分别标注 [来源1][来源2][来源3]，禁止只引其一
   │
-  └─ ⑨ 来源溯源   返回检索/精排后的全部候选来源列表（不再按回答中的 [来源N] 过滤，避免漏显）；
-        引用编号经 alignCitations 对齐校验（逐字引用片段与来源内容匹配，纠正张冠李戴）；
-        历史消息回显时从 agent_task 引用来源快照回补
+  └─ ⑤ 来源溯源   引用来源 = searchKnowledge 工具回调结果（模型未调用工具 / 工具空结果时无来源，
+        不下发引用，避免误导）；引用编号经 alignCitations 对齐校验（逐字引用片段与来源内容匹配，
+        纠正张冠李戴）；历史消息回显时从 agent_task 引用来源快照回补
 ```
 
-**检索增强说明**：采用"先宽后精"的两阶段检索——**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5，显著优于纯向量 top-5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
+**Agentic RAG 说明**：将"预检索注入上下文"改为"模型自主决策检索"——模型看到完整问题与对话历史，自行判断是否需要检索、检索什么，再基于工具返回的 [来源N] 片段逐字引用回答；服务层不再兜底检索。检索本身仍是"先宽后精"两阶段：**混合检索**（Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回较多候选（默认 20），再由专门的 Cross-Encoder 重排序模型精排取前 5。BM25 路能召回向量路遗漏的"关键词精确命中"片段，对专有名词、编号、缩写类问题尤其有效。
 
-**显式文档限定**：问题明确点名文档（"xx.pdf 里写了什么"）时，先经 `resolveExplicitDocuments`（带扩展名完整文件名 / 书名号归一化四级匹配）定位目标文档，用 Milvus filter 把召回限制在目标文档内——杜绝名称相近文档的 chunk 因关键词命中（如"说明书"）混入引用来源；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题，沿用其显式文档限定（`resolveExplicitDocumentsWithHistory`）。
+**显式文档限定**：问题明确点名文档（"xx.pdf 里写了什么"）时，`searchKnowledge` 工具先经 `resolveExplicitDocuments`（带扩展名完整文件名 / 书名号归一化四级匹配）定位目标文档，用 Milvus filter 把召回限制在目标文档内——杜绝名称相近文档的 chunk 因关键词命中（如"说明书"）混入引用来源。多轮指代（如"上面的问题再查一遍"）由模型结合对话记忆自行组织检索问题，不再依赖服务层正则回退。
 
 **返回结构**：
 - 流式（默认）：SSE 事件序列——`{"type":"tool","name":...,"status":"running|done|error","args":...,"result":...}`（模型自主调用工具的过程，先于内容下发）→ `{"type":"delta","content":...}`（逐 token 增量）→ `{"type":"final","content":...}`（引用对齐校验后的最终全文，前端覆盖显示）→ `{"type":"sources","sources":[...]}`（生成完毕下发**全部候选**来源，前端全量展示）→ `{"type":"done"}`；出错时下发 `{"type":"error","message":...}`
@@ -788,7 +785,7 @@ npm run build        # 生产构建，产物在 dist/
 | POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
-| POST | `/api/knowledge-document/chat` | 是 | 知识问答（需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`tool`/`delta`/`final`/`sources`/`done`/`error` 事件，`tool` 展示模型调用工具过程、`final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆；检索为空时引导模型调用工具回答文档清单类问题） |
+| POST | `/api/knowledge-document/chat` | 是 | 知识问答（Agentic RAG，需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`tool`/`delta`/`final`/`sources`/`done`/`error` 事件，`tool` 展示模型自主调用 searchKnowledge 工具的过程、`final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆） |
 | POST | `/api/knowledge-document/chat/clear-memory` | 是 | 清空指定会话的 Redis 记忆（body `{sessionId}` 可选，缺省清当前会话；会话记录保留） |
 | POST | `/api/chat-session/create` | 是 | 创建聊天会话（可选 body `{knowledgeBaseId}`），返回后端生成的 `sessionId`/`title` |
 | GET | `/api/chat-session/list` | 是 | 当前用户会话列表（按最近更新倒序） |
@@ -834,7 +831,7 @@ npm run build        # 生产构建，产物在 dist/
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
 19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。
-20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步链路复用同一 `retrieveContext` 检索逻辑）。来源列表在生成完毕后随 `sources` 事件下发（**全部候选**），前端全量展示，流式/同步/历史回显（agent_task 快照回补）三种场景下引用来源一致、不漏显。
-21. **工具调用（Function Calling）替代关键词穷举**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments`），由模型自主决定是否调用——**信号驱动而非预判**：仅当检索为空时用"空上下文系统提示词"引导模型考虑调工具，新增查询类型只需增加 `@Tool` 方法，零枚举零维护。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
+20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步/流式链路均为 Agentic RAG：模型自主调用工具，无服务层兜底检索）。来源列表在生成完毕后随 `sources` 事件下发（**全部候选**），前端全量展示，流式/同步/历史回显（agent_task 快照回补）三种场景下引用来源一致、不漏显。
+21. **工具调用（Function Calling）实现 Agentic RAG**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments` / `searchKnowledge`），问答不再预检索注入上下文，由模型自主决定何时检索——知识类问题先调用 `searchKnowledge`（检索逻辑收敛于 `KnowledgeSearchService`：Hybrid 召回→过滤→Rerank→[来源N]上下文组装），再严格基于工具返回片段逐字引用回答；澄清/寒暄/告知无信息类问题不检索、不下发来源。服务层**不兜底检索**（检索决策完全交给模型）。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
 22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。
 23. **Agent 可观测性（执行轨迹 + 引用来源快照）**：一次提问 = 一条 `agent_task`（question/answer/prompt/model/token 用量/耗时/状态），工具调用每步落一条 `agent_task_step`（工具名/状态/入参/结果/耗时）；同步、流式与熔断降级链路均落库，落库失败不阻塞问答仅告警。引用来源 JSON 快照进 `agent_task.sources`——Redis 记忆只存纯文本，`GET /api/chat-session/{sessionId}/messages` 据此按序回补历史消息的 sources，刷新页面引用来源不丢失。前端「Agent 轨迹」页（`AgentTasksTab.vue` / `AgentTaskDetailModal.vue`）按任务维度查看执行过程与引用来源。

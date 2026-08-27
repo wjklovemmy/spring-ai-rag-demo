@@ -222,7 +222,7 @@ CREATE TABLE IF NOT EXISTS `agent_task` (
     `completion_tokens` INT         DEFAULT NULL COMMENT '输出 token 数',
     `total_tokens`     INT          DEFAULT NULL COMMENT '总 token 数',
     `status`           TINYINT      NOT NULL DEFAULT 0 COMMENT '状态：0 执行中 / 1 成功 / 2 失败',
-    `tool_count`       INT          NOT NULL DEFAULT 0 COMMENT '工具调用步骤数',
+    `tool_count`       INT          NOT NULL DEFAULT 0 COMMENT '工具调用次数（running/done 成对落库，仅统计 done/error 事件，一次调用记 1）',
     `cost_ms`          BIGINT       DEFAULT NULL COMMENT '总耗时（毫秒）',
     `error_msg`        VARCHAR(2000) DEFAULT NULL COMMENT '失败原因',
     `start_ms`         BIGINT       NOT NULL COMMENT '开始时间戳（毫秒）',

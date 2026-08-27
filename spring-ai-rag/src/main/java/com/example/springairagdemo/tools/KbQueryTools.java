@@ -9,6 +9,7 @@ import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.service.KbAuthorizationService;
 import com.example.springairagdemo.service.KnowledgeChunkEntityService;
 import com.example.springairagdemo.service.KnowledgeDocumentEntityService;
+import com.example.springairagdemo.service.KnowledgeSearchService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.model.ToolContext;
@@ -26,6 +27,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -52,6 +54,13 @@ public class KbQueryTools {
     public static final String USER_ID_KEY = "userId";
     /** ToolContext 中工具调用事件 Sink 的 key（由 Service 层注入，SSE 展示工具调用过程用；同步问答不注入） */
     public static final String TOOL_EVENT_SINK_KEY = "toolEventSink";
+    /** ToolContext 中 searchKnowledge 检索结果收集器的 key（由 Service 层注入：
+     *  AtomicReference<SearchResult>，工具回调线程写入，供 Service 汇总最终引用来源/落库） */
+    public static final String SEARCH_RESULT_HOLDER_KEY = "searchResultHolder";
+    /** ToolContext 中会话记忆 ID 的 key（由 Service 层注入：userId:sessionId，供工具感知多轮上下文） */
+    public static final String CONVERSATION_ID_KEY = "conversationId";
+    /** ToolContext 中 Agent 任务 ID 的 key（由 Service 层注入：流式链路传入；同步链路任务在回答后创建，注入为空） */
+    public static final String TASK_ID_KEY = "taskId";
 
     /** 工具调用事件（SSE 展示：running 开始 / done 完成 / error 失败），args/result 为摘要文本 */
     public record ToolEvent(String name, String status, String args, String result) {
@@ -71,6 +80,7 @@ public class KbQueryTools {
     private final KbAuthorizationService kbAuthorizationService;
     private final HeadingExtractor headingExtractor;
     private final RagConfigProperties config;
+    private final KnowledgeSearchService knowledgeSearchService;
 
     /** 标题链前缀模式：摄取时按 prefixTemplate 【{heading}】注入每个 chunk 文本开头 */
     private static final Pattern HEADING_PREFIX = Pattern.compile("^【([^】]+)】");
@@ -187,6 +197,61 @@ public class KbQueryTools {
     }
 
     /**
+     * 知识库正文检索：在知识库中检索与问题最相关的内容片段（Hybrid 检索 + Rerank 精排）。
+     * <p>检索逻辑复用 {@link KnowledgeSearchService#search}：问题明确点名文档时自动限定范围；
+     * 检索结果自带 [来源N] 编号，模型须按相同编号在回答中标注引用。
+     * <p>回调：检索到的候选来源通过 ToolContext 注入的
+     * {@link #SEARCH_RESULT_HOLDER_KEY}（AtomicReference&lt;SearchResult&gt;）写回 Service，
+     * 供其汇总最终引用来源（SSE sources 事件 / agent_task 快照）与引用对齐校验。
+     */
+    @Tool(description = "在知识库中检索与问题最相关的内容片段（向量+关键词混合检索+Rerank 精排）。"
+            + "当用户的问题需要基于知识库正文内容回答（如某功能/概念/参数的用法、文档里怎么写的、具体条款等）时，"
+            + "必须先调用本工具检索相关内容，再严格基于检索结果回答。"
+            + "问题中明确提到具体文档名时，原样保留文档名传入，工具会自动限定在该文档内检索。"
+            + "注意：文档清单/查找文档用 listDocuments/searchDocuments，文档结构/章节大纲用 documentOutline，不要用本工具。"
+            + "检索不到内容时工具会明确提示“未检索到”，请如实告知用户。")
+    public String searchKnowledge(
+            @ToolParam(description = "需要检索的用户问题（原样传入，若问题中提到了具体文档名请保留，"
+                    + "例如：X 功能的用法、Y 参数的含义）") String question,
+            ToolContext toolContext) {
+        emitToolEvent(toolContext, "searchKnowledge", "running",
+                "知识库检索：" + (question == null ? "" : question.trim()), null);
+        String result;
+        Long kbId = requireKbId(toolContext);
+        if (kbId == null) {
+            result = "当前未指定知识库，无法检索";
+        } else if (!canView(toolContext, kbId)) {
+            result = "无权访问该知识库";
+        } else {
+            String q = question == null ? "" : question.trim();
+            if (q.isEmpty()) {
+                result = "检索问题为空，请补充需要检索的具体内容";
+            } else {
+                // 问题明确点名文档时限定检索范围（防止名称相近文档混入引用来源）
+                List<KnowledgeDocumentEntity> explicitDocs = resolveExplicitDocuments(kbId, q);
+                List<Long> restrictDocIds = explicitDocs.isEmpty() ? null
+                        : explicitDocs.stream().map(KnowledgeDocumentEntity::getId).distinct().toList();
+                KnowledgeSearchService.SearchResult sr = knowledgeSearchService.search(q, kbId, restrictDocIds);
+                // 回调检索结果给 Service（无论是否命中均标记"已执行检索"）：
+                // 供汇总最终引用来源（SSE sources / agent_task 快照）与引用对齐
+                Object holderObj = toolContext.getContext().get(SEARCH_RESULT_HOLDER_KEY);
+                if (holderObj instanceof AtomicReference<?> holder) {
+                    @SuppressWarnings("unchecked")
+                    AtomicReference<KnowledgeSearchService.SearchResult> typed =
+                            (AtomicReference<KnowledgeSearchService.SearchResult>) holder;
+                    typed.set(sr);
+                }
+                result = sr.context().isEmpty()
+                        ? "知识库中未检索到与“" + q + "”相关的信息"
+                        : sr.context();
+            }
+        }
+        emitToolEvent(toolContext, "searchKnowledge", "done",
+                "知识库检索：" + (question == null ? "" : question.trim()), result);
+        return result;
+    }
+
+    /**
      * 构建单份文档的标题大纲文本：按页码/序号扫描全部 chunk，双通道提取标题——
      * ①【标题链】前缀（摄取时注入）；②正文逐行识别（复用 HeadingExtractor 规则，
      * 覆盖"标题链未注入前缀"的场景，如每页页眉占位导致所有 chunk 只挂根标题）。
@@ -297,7 +362,7 @@ public class KbQueryTools {
     }
 
     /**
-     * 构建当前知识库的活跃文档清单文本（无权限校验，供 Service 层检索兜底复用）。
+     * 构建当前知识库的活跃文档清单文本（无权限校验，供 listDocuments 工具构建清单）。
      * 过滤规则与检索一致：仅 SUCCESS/DEPRECATED、未过期、启用（is_active 为空视为启用），
      * 同名多版本只保留最高版本，按最近创建倒序。
      *

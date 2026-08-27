@@ -13,8 +13,6 @@ import com.example.springairagdemo.tools.KbQueryTools;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.messages.Message;
-import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.metadata.Usage;
 import org.springframework.ai.document.Document;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -118,9 +116,9 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected RagConfigProperties ragConfig;
 
-    /** 知识库查询工具（解析"问题中明确指定的文档"以限定检索召回范围） */
+    /** 检索核心（Hybrid 召回/Rerank/上下文组装），由 searchKnowledge 工具调用 */
     @Autowired
-    protected KbQueryTools kbQueryTools;
+    protected KnowledgeSearchService knowledgeSearchService;
 
     @Autowired
     protected FileStorageService fileStorageService;
@@ -926,17 +924,19 @@ public abstract class KnowledgeDocumentService {
     public record ChatResult(String answer, List<SourceInfo> sources) {}
 
     /**
-     * 流式问答结果：token 增量流 + 完整引用来源
-     * <p>流式输出无法在生成前预知回答实际引用了哪些来源，因此来源编号不重排，
-     * 直接按检索精排顺序返回全部候选，供前端渲染"引用来源"列表。
+     * 流式问答结果：token 增量流 + 最终回答上下文
+     * <p>流式输出无法在生成前预知回答实际引用了哪些来源，来源在流生成完毕后
+     * （模型调用 searchKnowledge 工具 / 服务层兜底检索后）才确定，因此随最终回答一起返回。
      *
-     * @param stream          逐 token 增量文本流（与 correctedAnswer 共享同一数据源，可先订阅 delta）
-     * @param sources         全部候选来源（编号不重排）
-     * @param correctedAnswer 生成完毕后对完整回答做引用对齐校验（{@link #alignCitations}）后的全文，
-     *                        供前端最终覆盖显示（强制纠正 [来源N] 编号张冠李戴）
+     * @param stream 逐 token 增量文本流（与 answer 共享同一数据源，可先订阅 delta）
+     * @param answer 生成完毕后（引用对齐校验 {@link #alignCitations} 后）的最终回答 + 完整候选来源
      */
-    public record ChatStreamResult(Flux<String> stream, List<SourceInfo> sources, Mono<String> correctedAnswer,
-                                   Sinks.Many<KbQueryTools.ToolEvent> toolEvents) {}
+    public record ChatStreamResult(Flux<String> stream, Mono<AnswerContext> answer,
+                                   Sinks.Many<KbQueryTools.ToolEvent> toolEvents) {
+
+        /** 最终回答上下文：answer 为引用对齐后的全文，sources 为完整候选来源（编号不重排，空表示无检索来源） */
+        public record AnswerContext(String answer, List<SourceInfo> sources) {}
+    }
 
     /** 检索上下文：上下文文本 + 完整来源列表（context 为空表示知识库中无可用内容） */
     private record RetrievalContext(String context, List<SourceInfo> sources, List<String> fullContents) {}
@@ -949,7 +949,8 @@ public abstract class KnowledgeDocumentService {
     public record SourceInfo(Long documentId, String documentName, Integer pageNo, String snippet, Integer refIndex) {}
 
     /**
-     * 在指定知识库中进行问答：向量检索 → MySQL 获取 chunk 文本 → LLM 生成回答
+     * 在指定知识库中进行 Agentic RAG 问答：模型自主决定是否调用 searchKnowledge 工具检索知识库，
+     * 检索结果经工具回调汇总，LLM 严格基于工具返回的 [来源N] 片段生成回答
      *
      * @param sessionId 会话 ID（多轮对话记忆 key，null/空则用默认会话）
      */
@@ -962,16 +963,14 @@ public abstract class KnowledgeDocumentService {
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
 
-        // 1. 检索召回 + 构建上下文（与流式问答共用）；
-        //    不做问题类型预判（关键词路由不可扩展），由模型自主决定是否调用工具；
-        //    检索为空时给出引导性系统提示（可调用工具查询清单类信息）
-        RetrievalContext rc = retrieveContext(question, knowledgeBaseId, sessionId);
-        String systemPrompt = rc.context().isEmpty()
-                ? buildEmptyContextSystemPrompt()
-                : buildSystemPrompt(rc.context());
+        // 1. Agent 化：不再预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具检索；
+        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，取最后一次有效结果）
+        AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
+        String systemPrompt = buildAgentSystemPrompt();
 
-        // 2. LLM 生成回答（同步，带 Sentinel 熔断降级 + 多轮记忆）
-        String answer = callLlm(systemPrompt, question, sessionId, knowledgeBaseId);
+        // 2. LLM 生成回答（同步，带 Sentinel 熔断降级 + 多轮记忆 + 工具调用）
+        //    同步链路执行轨迹在回答生成后才落库（此时尚无 Agent 任务 ID），taskId 传 null
+        String answer = callLlm(systemPrompt, question, sessionId, knowledgeBaseId, null, toolSearchRef);
 
         // AI 服务不可用（DeepSeek 调用异常/熔断）时降级：不展示引用来源
         if (AI_SERVICE_UNAVAILABLE.equals(answer)) {
@@ -996,14 +995,24 @@ public abstract class KnowledgeDocumentService {
             answer = answer.replace("**", "").replace("`", "");
         }
 
-        // 引用对齐校验（兜底）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注 B 的编号）。
+        // 3. 汇总工具检索结果：模型调用了 searchKnowledge 时取工具回调返回的检索上下文；
+        //    工具空结果 / 模型未调用工具时 rc 为 null（回答无 [来源N]，不展示引用来源）
+        RetrievalContext rc = null;
+        KnowledgeSearchService.SearchResult toolResult = toolSearchRef.get();
+        if (toolResult != null) {
+            rc = new RetrievalContext(toolResult.context(), toolResult.sources(), toolResult.fullContents());
+        }
+
+        // 引用对齐校验（容错）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注 B 的编号）。
         // 因提示词要求"逐字引用原文"，取每个 [来源N] 后一小段文本与各来源完整内容做包含匹配，
         // 仅当唯一命中且与原编号不符时纠正；无法判定则保持原编号（保守，不误伤）
-        answer = alignCitations(answer, rc);
+        if (rc != null) {
+            answer = alignCitations(answer, rc);
+        }
 
         // 引用来源仅随实际引用展示：回答中无 [来源N]（澄清性提问/告知无信息/AI 降级）时不返回来源，
         // 避免把与回答无关的检索候选展示给用户（agent_task 快照仍保留完整候选供审计查看）
-        List<SourceInfo> sources = hasSourceRefs(answer) ? rc.sources() : List.of();
+        List<SourceInfo> sources = (rc != null && hasSourceRefs(answer)) ? rc.sources() : List.of();
 
         // Agent 可观测性：同步问答同样落库执行轨迹（无工具步骤），记录 prompt/model/引用来源；
         // 同步链路不采集 token 用量（流式链路已记录），token 列为 null
@@ -1013,7 +1022,8 @@ public abstract class KnowledgeDocumentService {
                     question, promptText, chatModelName);
             if (syncTaskId != null) {
                 String finalAnswer = answer;
-                agentTaskService.finishTask(syncTaskId, finalAnswer, sourcesJson(rc.sources()), true, null,
+                agentTaskService.finishTask(syncTaskId, finalAnswer,
+                        sourcesJson(rc == null ? List.of() : rc.sources()), true, null,
                         null, null, null);
             }
         } catch (Exception e) {
@@ -1022,152 +1032,6 @@ public abstract class KnowledgeDocumentService {
 
         return new ChatResult(answer, sources);
     }
-
-    /**
-     * 检索召回 + 构建问答上下文（同步/流式问答共用）：
-     * 混合检索 → 过滤失效文档/同名多版本 → Rerank 精排 → 组装 [来源N] 上下文
-     *
-     * @param sessionId 会话 ID：用于多轮指代（如"上面的问题再查一遍"）回退解析上一问的显式文档限定
-     * @return context 为空字符串表示知识库中没有可用内容
-     */
-    private RetrievalContext retrieveContext(String question, Long knowledgeBaseId, String sessionId) {
-        // 0. 问题明确点名某份文档时（带扩展名完整文件名 / 书名号），限定检索范围：
-        //    只在这些文档内召回，从源头防止名称相近文档（如 纯图片产品说明书_扫描件.pdf）
-        //    的 chunk 因关键词（如"说明书"）被 BM25/向量召回而混入引用来源；
-        //    当轮未点名但含指代/续问词时，回退沿用上一问的显式文档限定（多轮指代）
-        List<KnowledgeDocumentEntity> explicitDocs =
-                resolveExplicitDocumentsWithHistory(knowledgeBaseId, question, sessionId);
-        List<Long> restrictDocIds = explicitDocs.isEmpty() ? null
-                : explicitDocs.stream().map(KnowledgeDocumentEntity::getId).distinct().toList();
-
-        // 1. 检索召回：启用 Hybrid Search 时走「Dense + BM25 + RRF 融合」，否则纯向量检索
-        //    召回 candidateTopK 个候选，供后续 Rerank 精排
-        RagConfigProperties.Rerank rerankConfig = ragConfig.getRerank();
-        List<VectorStoreService.SearchResult> searchResults;
-        if (ragConfig.getHybrid().isEnabled()) {
-            searchResults = hybridSearchService.search(knowledgeBaseId, question,
-                    rerankConfig.getCandidateTopK(), rerankConfig.getThreshold(), restrictDocIds);
-        } else {
-            searchResults = vectorStoreService.search(knowledgeBaseId, question,
-                    rerankConfig.getCandidateTopK(), rerankConfig.getThreshold(), restrictDocIds);
-        }
-
-        if (searchResults.isEmpty()) {
-            return new RetrievalContext("", List.of(), List.of());
-        }
-
-        // 2. 从 MySQL 获取 chunk 内容
-        List<Long> chunkIds = searchResults.stream()
-                .map(VectorStoreService.SearchResult::getChunkId)
-                .toList();
-        List<KnowledgeChunkEntity> chunks = knowledgeChunkEntityService.listByIds(chunkIds);
-
-        // 按检索顺序组装上下文
-        Map<Long, KnowledgeChunkEntity> chunkMap = chunks.stream()
-                .collect(Collectors.toMap(KnowledgeChunkEntity::getId, c -> c, (a, b) -> a));
-
-        // 获取文档信息，过滤已过期版本，且同名文档多版本只保留最高版本（新版优先，避免混入旧内容）
-        Date now = new Date();
-        List<Long> docIds = searchResults.stream()
-                .map(VectorStoreService.SearchResult::getDocumentId)
-                .distinct()
-                .toList();
-        Map<Long, KnowledgeDocumentEntity> docMap = knowledgeDocumentEntityService.listByIds(docIds).stream()
-                .collect(Collectors.toMap(KnowledgeDocumentEntity::getId, d -> d, (a, b) -> a));
-
-        // 过滤：只允许 SUCCESS(生效) 与 DEPRECATED(TTL 兜底) 版本参与问答，
-        // 排除处理中(0/1/2)、失败(4)、已过期(6) 的残留向量
-        Map<Long, String> docNameMap = new LinkedHashMap<>();
-        List<VectorStoreService.SearchResult> validResults = new ArrayList<>();
-        // 第一遍：按状态过滤，收集活跃文档，并统计同名文档的最高版本
-        Map<Long, KnowledgeDocumentEntity> activeDocs = new HashMap<>();
-        Map<String, Integer> maxVersionByFileName = new HashMap<>();
-        for (VectorStoreService.SearchResult r : searchResults) {
-            KnowledgeDocumentEntity doc = docMap.get(r.getDocumentId());
-            if (doc == null) continue;
-            Integer st = doc.getStatus();
-            // 仅成功/已废弃版本可参与（处理中、失败、已过期一律排除）
-            if (st == null
-                    || (st != DocumentStatus.SUCCESS.getCode() && st != DocumentStatus.DEPRECATED.getCode())) continue;
-            // 兜底：expire_time 已到但尚未懒标记的按过期处理
-            if (doc.getExpireTime() != null && doc.getExpireTime().before(now)) continue;
-            activeDocs.putIfAbsent(doc.getId(), doc);
-            String fileName = doc.getFileName();
-            int ver = doc.getVersion() != null ? doc.getVersion() : 0;
-            maxVersionByFileName.merge(fileName, ver, Math::max);
-        }
-        // 第二遍：同名文档只保留版本最高的检索结果（旧版本不再召回；最新版本被删除后旧版本自动接管）
-        for (VectorStoreService.SearchResult r : searchResults) {
-            KnowledgeDocumentEntity doc = activeDocs.get(r.getDocumentId());
-            if (doc == null) continue;
-            int ver = doc.getVersion() != null ? doc.getVersion() : 0;
-            if (ver < maxVersionByFileName.getOrDefault(doc.getFileName(), ver)) continue;
-            validResults.add(r);
-            docNameMap.putIfAbsent(doc.getId(), doc.getFileName());
-        }
-        searchResults = validResults;
-
-        // 2.5 召回重排序（Rerank）：对候选片段按 "问题相关性" 精排，取 topN
-        if (rerankService.isEnabled() && searchResults.size() > 1) {
-            List<String> texts = searchResults.stream()
-                    .map(r -> {
-                        KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
-                        return chunk == null ? "" : chunk.getContent();
-                    })
-                    .toList();
-            try {
-                List<RerankService.RerankItem> ranked =
-                        rerankService.rerank(question, texts, rerankConfig.getTopN());
-                if (ranked != null && !ranked.isEmpty()) {
-                    // 按重排分数降序重建检索结果（只保留 topN）
-                    List<VectorStoreService.SearchResult> currentResults = searchResults;
-                    List<VectorStoreService.SearchResult> reranked = ranked.stream()
-                            .map(item -> currentResults.get(item.index()))
-                            .toList();
-                    searchResults = reranked;
-                    log.debug("Rerank 精排完成，保留 {} 条候选", searchResults.size());
-                } else {
-                    log.debug("Rerank 未返回结果，降级为向量排序结果");
-                }
-            } catch (Exception e) {
-                log.warn("Rerank 精排失败，降级为向量排序结果: {}", e.getMessage());
-            }
-        }
-
-        // 构建来源信息
-        List<SourceInfo> sources = new ArrayList<>();
-        List<String> fullContents = new ArrayList<>();
-        StringBuilder contextBuilder = new StringBuilder();
-        int refIndex = 1;
-
-        for (VectorStoreService.SearchResult r : searchResults) {
-            KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
-            if (chunk == null) continue;
-
-            String docName = docNameMap.getOrDefault(r.getDocumentId(), "未知文档");
-            String snippet = chunk.getContent();
-            if (snippet.length() > 120) {
-                snippet = snippet.substring(0, 120) + "...";
-            }
-
-            int ref = refIndex++;
-            sources.add(new SourceInfo(r.getDocumentId(), docName, r.getPageNo(), snippet, ref));
-            fullContents.add(chunk.getContent());
-
-            // 在上下文中标记来源
-            contextBuilder.append(String.format("[来源%d] 文档：%s，第%d页%n%s%n%n",
-                    ref, docName, r.getPageNo() != null ? r.getPageNo() : 1, chunk.getContent()));
-        }
-
-        return new RetrievalContext(contextBuilder.toString(), sources, fullContents);
-    }
-
-    /** 多轮指代/续问标记：当前问题未点名文档但指向历史上下文时（如"上面的问题再查一遍"），
-     *  回退沿用上一问的显式文档限定，避免检索退化为全库召回 */
-    private static final Pattern ANAPHORA_PATTERN = Pattern.compile(
-            "上面的问题|上面的回答|上面那|刚才|之前|先前|上一个问题|前一个问题|上一问|前一问|"
-                    + "再查|重新|重试|重复|再问|再说|再讲|再回答|继续|"
-                    + "这个文档|这份文档|这个文件|这份文件|该文档|该文件|同样的问题");
 
     /** [来源N] 引用标记：回答中不存在该标记（如澄清性提问、告知无信息、AI 降级）时不展示引用来源 */
     private static final Pattern SOURCE_REF_PATTERN = Pattern.compile("\\[来源\\s*\\d+\\]");
@@ -1178,54 +1042,7 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 多轮指代感知的显式文档解析：
-     * 1. 优先解析当轮问题中明确点名的文档（带扩展名完整文件名 / 书名号）；
-     * 2. 当轮问题未点名任何文档、但含指代/续问词（如"上面的问题再查一遍"）时，
-     *    回看最近一轮用户问题中的显式文档并沿用其限定范围，
-     *    防止检索退化为全库召回、混入名称相近/无关文档的 chunk。
-     */
-    private List<KnowledgeDocumentEntity> resolveExplicitDocumentsWithHistory(
-            Long knowledgeBaseId, String question, String sessionId) {
-        List<KnowledgeDocumentEntity> explicitDocs =
-                kbQueryTools.resolveExplicitDocuments(knowledgeBaseId, question);
-        if (!explicitDocs.isEmpty()) {
-            return explicitDocs;
-        }
-        if (question == null || !ANAPHORA_PATTERN.matcher(question).find()) {
-            return List.of();
-        }
-        String lastUserQuestion = lastUserQuestion(sessionId);
-        if (lastUserQuestion == null || lastUserQuestion.isBlank()) {
-            return List.of();
-        }
-        List<KnowledgeDocumentEntity> historyDocs =
-                kbQueryTools.resolveExplicitDocuments(knowledgeBaseId, lastUserQuestion);
-        if (!historyDocs.isEmpty()) {
-            log.debug("多轮指代回退：当前问题[{}]未点名文档，沿用上一问[{}]的显式文档限定：{}",
-                    question, lastUserQuestion,
-                    historyDocs.stream().map(KnowledgeDocumentEntity::getFileName).toList());
-        }
-        return historyDocs;
-    }
-
-    /** 读取会话历史中最近一轮用户问题（当前问题尚未写入记忆，取到的即上一问） */
-    private String lastUserQuestion(String sessionId) {
-        try {
-            List<Message> messages = chatMemory.get(conversationId(sessionId));
-            for (int i = messages.size() - 1; i >= 0; i--) {
-                Message m = messages.get(i);
-                if (m instanceof UserMessage um && um.getText() != null && !um.getText().isBlank()) {
-                    return um.getText();
-                }
-            }
-        } catch (Exception e) {
-            log.warn("读取会话历史失败（不影响问答）：{}", e.getMessage());
-        }
-        return null;
-    }
-
-    /**
-     * 引用对齐校验（兜底）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注了 B 片段的编号）。
+     * 引用对齐校验（容错）：模型偶尔会把 [来源N] 编号标错（引用了 A 片段却标注了 B 片段的编号）。
      * 因系统提示要求"逐字引用原文"，取每个 [来源N] 之后的一小段文本（遇下一个 [ 停止，最多 80 字符），
      * 与各来源完整内容做包含匹配：仅当唯一命中且与原编号不符时纠正为命中编号；
      * 命中 0 个或多个（无法判定）则保持原编号，避免误伤正常引用。
@@ -1282,52 +1099,37 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 构建系统提示：严格基于知识库内容回答、禁止 Markdown、标注 [来源N]
+     * Agent 化系统提示：不预检索注入上下文，强约束模型——知识类问题必须先调用
+     * searchKnowledge 工具检索知识库内容，再严格基于工具返回的内容回答；
+     * 工具返回片段自带 [来源N] 编号，回答按相同编号标注（复用 {@link #alignCitations} 对齐）。
+     * 清单/大纲类问题引导使用 listDocuments/searchDocuments/documentOutline 工具。
      */
-    private String buildSystemPrompt(String context) {
-        return String.format(
-                "你是一个基于知识库的问答助手。请严格根据以下知识库内容回答用户问题。%n"
+    private String buildAgentSystemPrompt() {
+        return "你是一个基于知识库的问答助手。当用户的问题需要基于知识库正文内容回答时，"
+                + "你必须先调用 searchKnowledge 工具在知识库中检索相关内容，再严格基于检索到的内容回答用户问题。\n"
+                + "工具使用规则：\n"
+                + "- 需要基于知识库正文内容回答的问题（如“某功能怎么用”“某参数含义”“文档里怎么说的”）"
+                + "→ 必须先调用 searchKnowledge 工具检索，将用户问题原样传入，若问题中点名了具体文档请保留文档名。\n"
+                + "- 用户询问知识库中有哪些文档/查找某份文档 → 调用 listDocuments 或 searchDocuments 工具。\n"
+                + "- 用户询问某文档的结构/章节大纲 → 调用 documentOutline 工具。\n"
+                + "- 与知识库内容无关的问题（闲聊、常识等）→ 直接正常回答，无需调用工具。\n"
                 + "回答方式：当检索到的知识库内容能直接回答用户问题时，请逐字引用原文片段作答，"
                 + "不要用自己的话总结、概括、润色或扩展原文内容；多个相关片段可按原文顺序拼接，"
-                + "仅用最少的衔接词连接；仅当用户明确要求\"总结\"\"概括\"等时，才可以在引用原文之后附加简要总结。%n"
+                + "仅用最少的衔接词连接；仅当用户明确要求“总结”“概括”等时，才可以在引用原文之后附加简要总结。\n"
                 + "完整性规则：当问题需要文档级全量或结构信息（如文档一共有几部分/几章、全部章节标题、"
-                + "完整目录大纲等），仅凭检索到的少量片段不足以回答时，必须调用可用的工具"
-                + "（如查询文档大纲的工具）获取完整信息，严禁仅根据不完整的检索片段猜测或只回答片段中出现的部分。%n"
-                + "回答时，请在引用知识库内容的地方用方括号标注来源编号，例如[来源1]、[来源2]。%n"
-                + "综合引用：当检索上下文包含多个与问题相关的来源片段时，请综合多个片段的信息作答，"
-                + "并在相应位置分别标注各片段编号（如[来源1][来源2][来源3]），不要只引用其中一个片段"
-                + "而忽略其余相关片段；若回答的核心信息来自工具调用结果（如文档大纲等），"
-                + "可在回答末尾以\"以上内容详见[来源1][来源2][来源3]\"的形式统一标注相关检索片段。%n"
-                + "引用规范：每个[来源N]编号必须与实际引用的片段严格对应——你引用了哪个片段的内容，"
+                + "完整目录大纲等），仅凭 searchKnowledge 检索到的少量片段不足以回答时，"
+                + "必须调用可用的工具（如查询文档大纲的工具）获取完整信息，"
+                + "严禁仅根据不完整的检索片段猜测或只回答片段中出现的部分。\n"
+                + "引用规范：searchKnowledge 返回的每个片段自带 [来源N] 编号，"
+                + "请在引用对应内容的位置标注与工具返回一致的编号，例如[来源1]、[来源2]。"
+                + "每个[来源N]编号必须与实际引用的片段严格对应——你引用了哪个片段的内容，"
                 + "就必须标注哪个片段的编号，严禁引用了 A 片段却标注 B 片段（或其他未引用片段）的编号；"
-                + "若无法确定对应片段，宁可不标注编号，也不可标错。%n"
-                + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。%n"
-                + "如果知识库中没有相关信息，请如实告知用户\"知识库中暂无相关信息\"。%n"
-                + "如果用户的问题中存在指代不清（如\"这些内容\"\"上面提到的\"\"刚才说的\"等），"
-                + "且当前对话上下文（本问题和检索内容）无法明确其具体所指，"
-                + "请直接向用户确认所指内容，而不要从检索内容中猜测作答。%n"
-                + "%n"
-                + "知识库内容：%n"
-                + "%s", context);
-    }
-
-    /**
-     * 检索为空时的引导性系统提示：
-     * 不预设问题类型（关键词路由不可扩展），而是引导模型——若问题属于文档清单等
-     * 结构化枚举类，可调用可用工具查询；确无相关内容则如实告知。
-     */
-    private String buildEmptyContextSystemPrompt() {
-        return "你是一个基于知识库的问答助手。本次对知识库正文的检索没有找到相关片段。\n"
-                + "若用户的问题涉及文档清单、文件列表、文档结构/章节大纲等结构化信息"
-                + "（例如“知识库中有哪些文档”“有没有某份文档”“某文档一共有几部分/几章、有哪些章节标题”），"
-                + "请调用可用的工具（文档清单/搜索/大纲）查询后再回答。\n"
-                + "工具查询返回的结果（如文档清单）请直接原样呈现，不要自行总结或加工。\n"
-                +                 "若工具查询也没有结果，或用户的问题确与知识库内容无关，请如实告知用户"
-                + "“知识库中暂无相关信息”。\n"
+                + "若无法确定对应片段，宁可不标注编号，也不可标错。\n"
+                + "回答请使用纯文本，禁止使用任何 Markdown 格式（如 **加粗**、*斜体*、# 标题、- 列表、> 引用等）。\n"
+                + "如果调用工具后仍没有相关知识库内容，请如实告知用户“知识库中暂无相关信息”。\n"
                 + "如果用户的问题中存在指代不清（如“这些内容”“上面提到的”“刚才说的”等），"
                 + "且当前对话上下文无法明确其具体所指，请直接向用户确认所指内容，"
-                + "而不要猜测作答。\n"
-                + "回答请使用纯文本，禁止使用任何 Markdown 格式。";
+                + "而不要猜测作答。";
     }
 
     /**
@@ -1345,13 +1147,10 @@ public abstract class KnowledgeDocumentService {
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
 
-        // 1. 检索召回 + 构建上下文（与同步问答共用）；
-        //    不做问题类型预判（关键词路由不可扩展），由模型自主决定是否调用工具；
-        //    检索为空时给出引导性系统提示（可调用工具查询清单类信息）
-        RetrievalContext rc = retrieveContext(question, knowledgeBaseId, sessionId);
-        String systemPrompt = rc.context().isEmpty()
-                ? buildEmptyContextSystemPrompt()
-                : buildSystemPrompt(rc.context());
+        // 1. Agent 化：不预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具；
+        //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，取最后一次有效结果）
+        AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
+        String systemPrompt = buildAgentSystemPrompt();
 
         // 2.1 执行轨迹落库（agent_task / agent_task_step）：一次提问 = 一条任务，
         //     记录 LLM 实际输入 prompt（系统提示+问题）与模型名，支撑可观测性审计；
@@ -1360,11 +1159,8 @@ public abstract class KnowledgeDocumentService {
         final Long taskId = startAgentTask(UserContext.getUserId(), sessionId, knowledgeBaseId,
                 question, promptText, chatModelName);
 
-        // 2.2 LLM 流式生成回答（多轮记忆：Advisor 按 sessionId 注入历史）
-        //    cache() 共享同一数据源：Controller 先订阅 delta 逐 token 输出，
-        //    完成后 correctedAnswer 从缓存收集完整回答并做引用对齐校验（强制纠正编号）
-        // 工具调用事件 Sink：KbQueryTools 工具回调线程写入（running/done），Controller 合并进 SSE 展示。
-        // replay 缓存支持多订阅者：本处订阅落库 + Controller 订阅 SSE，两者都能收到全部事件
+        // 2.2 工具调用事件 Sink：KbQueryTools 工具回调线程写入（running/done），Controller 合并进 SSE 展示。
+        //    replay 缓存支持多订阅者：本处订阅落库 + Controller 订阅 SSE，两者都能收到全部事件
         Sinks.Many<KbQueryTools.ToolEvent> toolSink = Sinks.many().replay().limit(1024);
         if (taskId != null) {
             Long task = taskId;
@@ -1378,20 +1174,30 @@ public abstract class KnowledgeDocumentService {
         }
         // token 用量：流式响应的每个 chunk 都会携带 usage（OpenAI 兼容），取最后一个
         AtomicReference<Usage> usageRef = new AtomicReference<>();
-        Flux<String> cached = streamLlm(systemPrompt, question, sessionId, knowledgeBaseId, toolSink, usageRef).cache();
-        Mono<String> correctedAnswer = cached.collectList()
+
+        // 2.3 模型自主调用工具（无预检索上下文），cache() 共享同一数据源：
+        //    Controller 先订阅 delta 逐 token 输出，完成后从缓存收集完整回答做引用对齐
+        Flux<String> cached = streamLlm(systemPrompt, question, sessionId, knowledgeBaseId,
+                taskId, toolSink, usageRef, toolSearchRef).cache();
+
+        // 2.4 生成完毕后：引用对齐 + 最终来源（工具检索结果；模型未调用工具则无来源）
+        Mono<ChatStreamResult.AnswerContext> answerMono = cached.collectList()
                 .map(list -> {
                     String full = String.join("", list);
                     if (full.isBlank() || AI_SERVICE_UNAVAILABLE.equals(full)) {
-                        return full; // 降级/空回答无需纠正
+                        return new ChatStreamResult.AnswerContext(full, List.of()); // 降级/空回答
                     }
-                    return alignCitations(full, rc);
+                    RetrievalContext rc = finalRetrievalContext(toolSearchRef);
+                    if (rc == null) {
+                        return new ChatStreamResult.AnswerContext(full, List.of());
+                    }
+                    return new ChatStreamResult.AnswerContext(alignCitations(full, rc), rc.sources());
                 })
-                .doOnSuccess(answer -> {
+                .doOnSuccess(ctx -> {
                     if (taskId != null) {
                         try {
                             Usage usage = usageRef.get();
-                            agentTaskService.finishTask(taskId, answer, sourcesJson(rc.sources()), true, null,
+                            agentTaskService.finishTask(taskId, ctx.answer(), sourcesJson(ctx.sources()), true, null,
                                     usage == null ? null : usage.getPromptTokens(),
                                     usage == null ? null : usage.getCompletionTokens(),
                                     usage == null ? null : usage.getTotalTokens());
@@ -1410,7 +1216,20 @@ public abstract class KnowledgeDocumentService {
                         }
                     }
                 });
-        return new ChatStreamResult(cached, rc.sources(), correctedAnswer, toolSink);
+        return new ChatStreamResult(cached, answerMono, toolSink);
+    }
+
+    /**
+     * 汇总最终检索结果：取 searchKnowledge 工具回调结果（模型调用了工具）；
+     * 模型未调用工具时返回 null（回答无来源）。
+     */
+    private RetrievalContext finalRetrievalContext(
+            AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef) {
+        KnowledgeSearchService.SearchResult sr = toolSearchRef.get();
+        if (sr != null) {
+            return new RetrievalContext(sr.context(), sr.sources(), sr.fullContents());
+        }
+        return null;
     }
 
     /**
@@ -1447,10 +1266,12 @@ public abstract class KnowledgeDocumentService {
      * 调用异常/网络中断时降级为 {@link #AI_SERVICE_UNAVAILABLE}，避免连接异常中断前端。
      */
     private Flux<String> streamLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId,
-                                   Sinks.Many<KbQueryTools.ToolEvent> toolSink, AtomicReference<Usage> usageRef) {
+                                   Long taskId, Sinks.Many<KbQueryTools.ToolEvent> toolSink,
+                                   AtomicReference<Usage> usageRef,
+                                   AtomicReference<KnowledgeSearchService.SearchResult> searchResultRef) {
         ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
                 .user(question)
-                .toolContext(toolContext(knowledgeBaseId, toolSink))
+                .toolContext(toolContext(knowledgeBaseId, conversationId(sessionId), taskId, toolSink, searchResultRef))
                 .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId(sessionId)));
         if (systemPrompt != null && !systemPrompt.isBlank()) {
             spec = spec.system(systemPrompt);
@@ -1480,17 +1301,20 @@ public abstract class KnowledgeDocumentService {
      * 调用 LLM（DeepSeek）生成回答，带 Sentinel 熔断降级：
      * 调用异常/超时/熔断（资源 {@code ai-chat}）时返回降级提示，而不是向上抛错导致接口 500。
      *
-     * @param systemPrompt 系统提示（无检索上下文时传 null）
-     * @param question     用户问题
-     * @param sessionId    会话 ID（多轮记忆）
+     * @param systemPrompt    系统提示（无检索上下文时传 null）
+     * @param question        用户问题
+     * @param sessionId       会话 ID（多轮记忆）
+     * @param taskId          Agent 任务 ID（同步链路 LLM 调用时任务尚未创建，传 null）
+     * @param searchResultRef searchKnowledge 工具检索结果收集器（同步链路可传，供模型调用工具时回调）
      * @return LLM 回答；AI 服务不可用时返回 {@link #AI_SERVICE_UNAVAILABLE}
      */
-    private String callLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId) {
+    private String callLlm(String systemPrompt, String question, String sessionId, Long knowledgeBaseId,
+                           Long taskId, AtomicReference<KnowledgeSearchService.SearchResult> searchResultRef) {
         return circuitBreakerFactory.create(AiConfig.AI_CHAT_RESOURCE).run(
                 () -> {
                     ChatClient.ChatClientRequestSpec spec = chatClient.prompt()
                             .user(question)
-                            .toolContext(toolContext(knowledgeBaseId, null)) // 同步问答不展示工具调用过程
+                            .toolContext(toolContext(knowledgeBaseId, conversationId(sessionId), taskId, null, searchResultRef)) // 同步问答不展示工具调用过程
                             .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, conversationId(sessionId)));
                     if (systemPrompt != null && !systemPrompt.isBlank()) {
                         spec = spec.system(systemPrompt);
@@ -1531,16 +1355,30 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 工具调用上下文：把当前请求的知识库 ID 与用户 ID 放入 ToolContext。
+     * 工具调用上下文：把当前请求的知识库 ID、用户 ID、会话记忆 ID、Agent 任务 ID 放入 ToolContext。
      * 必须在请求线程内调用（UserContext 为 ThreadLocal）；工具回调线程不在此上下文内，
      * KbQueryTools 从 ToolContext 而非 UserContext 读取身份信息，避免线程切换导致权限校验失效。
+     *
+     * @param conversationId 会话记忆 ID（userId:sessionId，供工具感知多轮上下文）
+     * @param taskId         Agent 任务 ID（供工具关联执行轨迹；同步链路 LLM 调用时任务尚未创建，传 null）
      */
-    private Map<String, Object> toolContext(Long knowledgeBaseId, Sinks.Many<KbQueryTools.ToolEvent> toolSink) {
-        Map<String, Object> ctx = new HashMap<>(4);
+    private Map<String, Object> toolContext(Long knowledgeBaseId, String conversationId, Long taskId,
+                                            Sinks.Many<KbQueryTools.ToolEvent> toolSink,
+                                            AtomicReference<KnowledgeSearchService.SearchResult> searchResultRef) {
+        Map<String, Object> ctx = new HashMap<>(6);
         ctx.put(KbQueryTools.KB_ID_KEY, knowledgeBaseId);
         ctx.put(KbQueryTools.USER_ID_KEY, UserContext.getUserId());
+        if (conversationId != null) {
+            ctx.put(KbQueryTools.CONVERSATION_ID_KEY, conversationId);
+        }
+        if (taskId != null) {
+            ctx.put(KbQueryTools.TASK_ID_KEY, taskId);
+        }
         if (toolSink != null) {
             ctx.put(KbQueryTools.TOOL_EVENT_SINK_KEY, toolSink);
+        }
+        if (searchResultRef != null) {
+            ctx.put(KbQueryTools.SEARCH_RESULT_HOLDER_KEY, searchResultRef);
         }
         return ctx;
     }

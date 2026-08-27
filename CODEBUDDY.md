@@ -115,12 +115,12 @@ spring-ai-user  (com.example.user — 用户域独立服务 :8082)
 3. `TokenTextSplitter` (plus heading-aware prefix and semantic splitting) chunks the documents
 4. Each chunk is embedded via `DashScopeEmbeddingModel` (auto-retry on network errors / 5xx, max 2 attempts; 4xx business errors not retried) and stored in Milvus (per-knowledge-base collection `kb_{id}`, batched 100)
 
-**Phase 2 — Question Answering (`KnowledgeDocumentService.chat`):**
+**Phase 2 — Question Answering (Agentic RAG, `KnowledgeDocumentService.chat`/`chatStream`):**
 
-1. User question is embedded and used for Hybrid Search (Dense + BM25 + RRF) + rerank (gte-rerank-v2) against Milvus
-2. Retrieved document texts are joined as context
-3. Context is injected into a Chinese system prompt instructing the LLM to answer strictly from the knowledge base
-4. `ChatClient` (backed by DeepSeek `deepseek-chat`) generates the final answer with source citations
+1. No pre-retrieval / context injection: the model decides itself whether to call the `searchKnowledge` tool (Spring AI Function Calling; tool-call events stream to the client as SSE `tool` events)
+2. `searchKnowledge` (in `KbQueryTools`, backed by `KnowledgeSearchService`, the single retrieval entry) performs Hybrid Search (Dense + BM25 + RRF) + rerank (gte-rerank-v2) against Milvus, filters by status/version, and assembles a `[来源N]`-tagged context; explicit document mentions restrict the recall scope (Milvus filter); the result is written back to the service via a `ToolContext`-injected `AtomicReference` (also flagged when empty)
+3. The model answers strictly by verbatim-citing the `[来源N]` snippets returned by the tool (Agent system prompt `buildAgentSystemPrompt`); there is **no service-layer fallback retrieval** — retrieval decisions are fully delegated to the model
+4. `ChatClient` (backed by DeepSeek `deepseek-chat`) generates the final answer; source citations are aligned via `alignCitations` and the final `sources` come from the tool callback (empty when the model didn't call the tool)
 5. The DeepSeek call is wrapped by a `CircuitBreakerFactory` (Sentinel, resource `ai-chat`, degrade rule registered programmatically in `AiConfig`): on exception/timeout/circuit-open it degrades to `AI服务暂时不可用，请稍后再试` with empty `sources` (HTTP 200) instead of failing with 500
 
 ### Model Separation
