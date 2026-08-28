@@ -41,7 +41,7 @@
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（唯一后端；已移除本地磁盘模式——多实例部署下文件须共享） |
 | 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
-| 异步消息 | RabbitMQ（`spring-boot-starter-amqp`，docker `3.13-management-alpine`） | **Embedding 任务异步执行**：上传/恢复/重试统一走 MQ（持久化队列+消息、消费失败重试 3 次后进死信队列）；at-least-once 重复投递由任务状态预检 + claimTask CAS + 增量处理三重防护 |
+| 异步消息 | RabbitMQ（`spring-boot-starter-amqp`，docker `3.13-management-alpine`） | **Embedding 任务异步执行**：上传/恢复/重试统一走 MQ（**Quorum 队列**持久化+高可用；**Publisher Confirm/Return** 保证生产者送达，Broker nack / 路由失败即标记任务失败；消费失败重试 3 次后进死信队列）；at-least-once 重复投递由任务状态预检 + claimTask CAS + 增量处理三重防护；`RabbitQueueMonitor` 定时监控队列深度，积压超阈值告警（ERROR 日志 + 可选 Webhook） |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
@@ -169,16 +169,17 @@ spring-ai-rag-demo/
 │       │   ├── AiConfig.java                  # ChatClient / 模型装配 + MessageChatMemoryAdvisor（多轮记忆）+ ToolCallbacks（KbQueryTools）+ Sentinel 熔断规则（ai-chat / dashscope-embedding）
 │       │   ├── MilvusConfig.java              # Milvus 客户端
 │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（rerank/hybrid/ocr/storage/chunk 等）
-│       │   ├── RabbitConfig.java              # RabbitMQ 交换机/业务队列/死信队列声明（rag.embedding.*）
+│       │   ├── RabbitConfig.java              # RabbitMQ 交换机/业务队列/死信队列声明（rag.embedding.*，Quorum 高可用）+ RabbitTemplate（Publisher Confirm/Return 标记发送失败）
 │       │   ├── DataSourceConfig.java          # @Primary 数据源 + MyBatis-Plus 装配（HikariCP）
 │       │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
 │       │   ├── DataInitializer.java           # 启动初始化（恢复中断任务）
 │       │   ├── FeignConfig.java               # 全局 RequestInterceptor（注入 X-Internal-Token）
 │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
-│       ├── mq/                                # RabbitMQ：Embedding 任务异步消息
-│       │   ├── EmbeddingTaskProducer.java     # 发送任务消息（taskId，持久化投递）
+│       ├── mq/                                # RabbitMQ：Embedding 任务异步消息（可靠投递 + 死信 + 积压监控）
+│       │   ├── EmbeddingTaskProducer.java     # 发送任务消息（CorrelationData(taskId) + x-task-id 头，配合 Confirm/Return 定位失败任务）
 │       │   ├── EmbeddingTaskConsumer.java     # 业务队列消费（幂等预检 + 异常上抛触发重试）
-│       │   └── EmbeddingTaskDlqConsumer.java  # 死信队列消费（重试 3 次仍失败 → 标记任务失败）
+│       │   ├── EmbeddingTaskDlqConsumer.java  # 死信队列消费（重试耗尽 → 标记任务失败，幂等）
+│       │   └── RabbitQueueMonitor.java        # 队列积压监控（@Scheduled 轮询 Management API，Ready 超阈值告警 + 可选 Webhook）
 │       ├── controller/
 │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
 │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载/清空记忆
@@ -290,7 +291,7 @@ spring-ai-rag-demo/
 
 ### 1. 文档上传与摄取（异步任务流水线）
 
-摄取采用**异步任务制**：`submitIngest` 快速返回 `taskNo`，实际处理通过 **RabbitMQ**（`EmbeddingTaskProducer.sendTask` 发送 taskId 消息 → 消费者执行 `processTask`）完成。消息/队列持久化，消费失败由 RabbitMQ 重试 3 次，仍失败进入死信队列由死信消费者统一标记任务失败；重复投递（at-least-once）靠任务状态预检 + claimTask CAS + 增量处理三重防护避免重复消费。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）。
+摄取采用**异步任务制**：`submitIngest` 快速返回 `taskNo`，实际处理通过 **RabbitMQ**（`EmbeddingTaskProducer.sendTask` 发送 taskId 消息 → 消费者执行 `processTask`）完成。可靠性链：队列/消息持久化（**Quorum 队列**，Raft 多副本复制）+ 生产者 **Publisher Confirm/Return**（Broker nack 或路由失败即通过 `CorrelationData(taskId)` 标记任务失败，不静默丢失）+ 消费失败重试 3 次、耗尽进死信队列统一标记失败；重复投递（at-least-once）靠任务状态预检 + claimTask CAS + 增量处理三重防护避免重复消费。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）。
 
 文档状态机（`status`，7 态）：
 
@@ -667,7 +668,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024（collection 按知识库动态创建，`initialize-schema: false`） |
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
 | `spring.datasource.pool.*` | HikariCP 连接池（maximum-pool-size=10、minimum-idle=2、连接/空闲/存活超时等） |
-| `spring.rabbitmq.*` | RabbitMQ 连接（`localhost:5672`，guest/guest）与监听重试（`max-attempts=4` 即初始+3 次重试、耗尽不 requeue 进死信、`prefetch=1` 任务串行） |
+| `spring.rabbitmq.*` | RabbitMQ 连接（`localhost:5672`，guest/guest）；生产者可靠性 `publisher-confirm-type=correlated` + `publisher-returns=true`（Confirm nack / Return 路由失败 → 标记任务失败）；监听重试 `max-retries=3`（Spring Boot 4.x 语义=重试次数，即初始执行 1 次 + 重试 3 次 = 最多 4 次消费尝试）、耗尽不 requeue 进死信、`prefetch=1` 任务串行 |
 | `spring.data.redis.*` | Redis 多轮对话记忆（`RedisChatMemory`：host/port、db 0、Lettuce 连接池；key 前缀 `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天；与用户服务/网关共用同一实例） |
 | `spring.servlet.multipart.*` | 上传大小限制（50MB） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
@@ -678,6 +679,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `rag.document.chunk.*` | 全局文档分块参数（chunk-size、heading、semantic 等，见下） |
 | `rag.rerank.*` | 重排序：enabled / model(`gte-rerank-v2`) / candidate-top-k(20) / top-n(5) / threshold(0.3) / fallback-on-error |
 | `rag.hybrid.*` | 混合检索：enabled / route-top-k(40) / min-score(0) / rrf-k(60) / fallback-on-error |
+| `rag.mq-monitor.*` | **RabbitMQ 队列积压监控**：enabled / interval-ms(30000) / ready-threshold(50) / management-url(`http://localhost:15672`) / username / password / webhook-url（企业微信/钉钉/飞书机器人，留空仅 ERROR 日志）。`RabbitQueueMonitor` 定时轮询 Management API，Ready 数超阈值判定积压并告警（持续积压去抖只告警一次，恢复自动解除） |
 | `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
 | `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
 | `rag.document.chunk.semantic.*` | 语义切片：enabled / threshold(0.55) / batch-size(10) / fallback-on-error |
@@ -723,6 +725,391 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 
 ---
 
+## Maven 依赖清单
+
+> 版本约定：依赖版本由 **四个 BOM** 统一管理（Spring Boot `spring-boot-starter-parent`、Spring Cloud `spring-cloud-dependencies`、Spring Cloud Alibaba `spring-cloud-alibaba-dependencies`、Spring AI `spring-ai-bom`，仅 spring-ai-rag 导入），少数依赖在 POM 中显式声明版本覆盖。下表为 `mvn dependency:tree` 实际解析结果（Java 17 / Spring Boot 4.0.7 / Spring Framework 7.0.8）。
+
+### 版本总览
+
+| 项 | 版本 | 说明 |
+|---|---|---|
+| Java | 17 | `<java.version>` |
+| Spring Boot | 4.0.7 | 父工程 `spring-boot-starter-parent` |
+| Spring Framework | 7.0.8 | 由 Spring Boot BOM 管理 |
+| Spring AI | 2.0.0 | `spring-ai-bom`（仅 spring-ai-rag 导入） |
+| Milvus SDK | 2.6.23 | `milvus-sdk-java`，显式覆盖 Spring AI 传递引入的旧版 2.5.x（2.5.9+ 才有 v2 客户端支持 BM25） |
+| Spring Cloud | 2025.1.0 | `spring-cloud-dependencies` BOM |
+| Spring Cloud Alibaba | 2025.1.0.0 | `spring-cloud-alibaba-dependencies` BOM |
+| Spring Cloud Gateway | 5.0.0 | SC BOM 管理（`spring-cloud-starter-gateway-server-webflux`） |
+| Nacos Client | 3.1.1 | SCA BOM 管理 |
+| Sentinel | 1.8.9 | SCA BOM 管理（含 `sentinel-core` / `sentinel-transport`） |
+| MyBatis-Plus | 3.5.16 | 显式声明（`mybatis-plus-spring-boot4-starter` / `mybatis-plus-jsqlparser`） |
+| MySQL Connector/J | 9.7.0 | SB BOM 管理（runtime） |
+| Lombok | 1.18.46 | SB BOM 管理（optional） |
+| JJWT | 0.12.6 | 显式声明（api / impl / jackson 三件套） |
+| MinIO | 8.6.0 | 显式声明（排除 okhttp，8.6.0 修复 CVE-2025-59952） |
+| OkHttp | 4.12.0 | 显式声明（回退 4.x 经典结构，避开 5.x KMP 空元数据 jar） |
+| 阿里云 OCR | 3.1.3 | 显式声明（`com.aliyun:ocr_api20210707`） |
+
+### 父 POM 通用依赖（三个服务全部继承）
+
+| 依赖 | 实际版本 | 说明 |
+|---|---|---|
+| `spring-cloud-starter-alibaba-nacos-discovery` | 2025.1.0.0 | Nacos 注册与发现 |
+| `spring-cloud-starter-alibaba-nacos-config` | 2025.1.0.0 | Nacos 配置中心（`spring.config.import`） |
+| `spring-cloud-starter-loadbalancer` | 5.0.0 | 网关 `lb://` 路由 + Feign 负载均衡 |
+| `spring-cloud-starter-openfeign` | 5.0.0 | 服务间声明式调用（Feign Core 13.6） |
+| `spring-cloud-circuitbreaker-sentinel` | 2025.1.0.0 | Feign 熔断降级（Hystrix EOL 替代） |
+| `sentinel-transport-simple-http` | 1.8.9 | 向 Sentinel Dashboard 上报指标（端口 8719） |
+| `spring-boot-devtools` | 4.0.7 | runtime |
+| `lombok` | 1.18.46 | optional |
+| `spring-boot-starter-webmvc-test` | 4.0.7 | test |
+
+### spring-ai-rag（:8080）专属依赖
+
+| 依赖 | 实际版本 | 说明 |
+|---|---|---|
+| `spring-boot-starter-webmvc` | 4.0.7 | Web MVC（REST + 静态页） |
+| `spring-boot-starter-aspectj` | 4.0.7 | AOP（`KbAccessAspect` 权限切面） |
+| `mybatis-plus-spring-boot4-starter` / `mybatis-plus-jsqlparser` | 3.5.16 | ORM（业务库 `knowledge_base`，含 `jsqlparser 5.2`） |
+| `mysql-connector-j` | 9.7.0 | runtime |
+| `spring-boot-starter-data-redis` | 4.0.7 | Redis（多轮对话记忆；Lettuce 6.8.2） |
+| `commons-pool2` | 2.12.1 | Lettuce 连接池 |
+| `spring-boot-starter-amqp` | 4.0.7 | RabbitMQ（Embedding 任务；spring-rabbit 4.0.4 / amqp-client 5.27.1） |
+| `spring-ai-starter-model-deepseek` | 2.0.0 | DeepSeek ChatModel（spring-ai-deepseek） |
+| `spring-ai-starter-vector-store-milvus` | 2.0.0 | Milvus 向量库（spring-ai-milvus-store → milvus-sdk-java 2.6.23） |
+| `spring-ai-pdf-document-reader` | 2.0.0 | PDF 解析（pdfbox 3.0.7） |
+| `minio` | 8.6.0 | 文档附件对象存储 |
+| `okhttp` | 4.12.0 | MinIO HTTP 客户端（回退 4.x） |
+| `com.aliyun:ocr_api20210707` | 3.1.3 | 扫描版 PDF OCR |
+
+### spring-ai-user（:8082）专属依赖
+
+| 依赖 | 实际版本 | 说明 |
+|---|---|---|
+| `spring-boot-starter-webmvc` / `spring-boot-starter-aspectj` | 4.0.7 | Web + AOP（`AdminAccessAspect`） |
+| `mybatis-plus-spring-boot4-starter` / `mybatis-plus-jsqlparser` | 3.5.16 | ORM（用户库 `spring_ai_user`） |
+| `mysql-connector-j` | 9.7.0 | runtime |
+| `spring-boot-starter-data-redis` | 4.0.7 | Redis（刷新令牌会话） |
+| `commons-pool2` | 2.12.1 | Lettuce 连接池 |
+| `jjwt-api` / `jjwt-impl` / `jjwt-jackson` | 0.12.6 | JWT 签发/校验（impl+jackson 为 runtime） |
+| `spring-security-crypto` | 7.0.6 | BCrypt 密码哈希 |
+
+### gateway（:7070）专属依赖
+
+| 依赖 | 实际版本 | 说明 |
+|---|---|---|
+| `spring-cloud-starter-gateway-server-webflux` | 5.0.0 | 响应式网关（Gateway 5.0 拆分的 WebFlux starter） |
+| `spring-boot-starter-data-redis-reactive` | 4.0.7 | Redis（Token 黑名单 + 可选限流） |
+| `jjwt-api` / `jjwt-impl` / `jjwt-jackson` | 0.12.6 | JWT 校验（impl+jackson 为 runtime） |
+| `spring-boot-starter-actuator` | 4.0.7 | 健康检查 |
+| `spring-boot-starter-test` | 4.0.7 | test |
+
+### 关键传递依赖（由 BOM 解析，非显式声明）
+
+| 依赖 | 版本 | 来源 |
+|---|---|---|
+| Spring Core / Web / WebMVC / WebFlux / JDBC / TX / AOP | 7.0.8 | Spring Boot 4.0.7 BOM |
+| Tomcat Embed | 11.0.22 | SB BOM（`spring-boot-starter-webmvc`） |
+| Jackson 3（`tools.jackson`） | 3.1.4 | SB BOM（Spring Boot 4 默认序列化） |
+| Jackson 2（`com.fasterxml`） | 2.21.4 | MinIO / JJWT 传递（与 Jackson 3 共存） |
+| Netty | 4.2.15.Final | SB BOM |
+| Reactor Core / Netty | 3.8.6 / 1.3.6 | SB BOM |
+| Lettuce | 6.8.2.RELEASE | SB BOM |
+| Logback | 1.5.34 | SB BOM |
+| HikariCP | 7.0.2 | SB BOM（`spring-boot-starter-jdbc`） |
+| AspectJ Weaver | 1.9.25.1 | SB BOM |
+| PDFBox | 3.0.7 | `spring-ai-pdf-document-reader` |
+| gRPC / Protobuf | protobuf-java 3.25.5 | `milvus-sdk-java` 2.6.23 |
+| fastjson2 | 2.0.58 | `sentinel-transport-common` |
+| Spring Data Redis / Commons | 4.0.6 | SB BOM |
+| JUnit Jupiter | 6.0.3 | SB BOM（test） |
+
+> 重新生成本清单：`./mvnw dependency:tree -DoutputType=text -pl spring-ai-rag,spring-ai-user,gateway`（Windows：`mvnw.cmd`）。
+
+### 完整 POM 依赖标签
+
+以下为各模块 `pom.xml` 中与依赖相关的完整 XML 片段（版本属性 / BOM 管理 / `<dependency>` 声明），与仓库源码保持一致。
+
+#### 父 POM（`pom.xml`）— 版本属性 + BOM 管理 + 三服务通用依赖
+
+```xml
+<!-- 版本属性 -->
+<properties>
+    <java.version>17</java.version>
+    <spring-ai.version>2.0.0</spring-ai.version>
+    <!-- 覆盖 spring-ai-milvus-store 传递引入的旧版 SDK：2.5.9+ 才有 v2 客户端支持 BM25 -->
+    <milvus-sdk.version>2.6.23</milvus-sdk.version>
+    <spring-cloud.version>2025.1.0</spring-cloud.version>
+    <spring-cloud-alibaba.version>2025.1.0.0</spring-cloud-alibaba.version>
+</properties>
+
+<!-- BOM 管理 -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-dependencies</artifactId>
+            <version>${spring-cloud.version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-alibaba-dependencies</artifactId>
+            <version>${spring-cloud-alibaba.version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<!-- 三服务通用依赖 -->
+<dependencies>
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-starter-alibaba-nacos-discovery</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-loadbalancer</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-openfeign</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.alibaba.cloud</groupId>
+        <artifactId>spring-cloud-circuitbreaker-sentinel</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.alibaba.csp</groupId>
+        <artifactId>sentinel-transport-simple-http</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-devtools</artifactId>
+        <scope>runtime</scope>
+        <optional>true</optional>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webmvc-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+#### spring-ai-rag（`spring-ai-rag/pom.xml`）— Spring AI BOM + RAG 专属依赖
+
+```xml
+<!-- BOM 管理（模块内，叠加在父 BOM 之上） -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.ai</groupId>
+            <artifactId>spring-ai-bom</artifactId>
+            <version>${spring-ai.version}</version>
+            <type>pom</type>
+            <scope>import</scope>
+        </dependency>
+        <dependency>
+            <groupId>io.milvus</groupId>
+            <artifactId>milvus-sdk-java</artifactId>
+            <version>${milvus-sdk.version}</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+
+<!-- RAG 专属依赖 -->
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-aspectj</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+        <version>3.5.16</version>
+    </dependency>
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-jsqlparser</artifactId>
+        <version>3.5.16</version>
+    </dependency>
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-pool2</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-amqp</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-model-deepseek</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-starter-vector-store-milvus</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-pdf-document-reader</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.minio</groupId>
+        <artifactId>minio</artifactId>
+        <version>8.6.0</version>
+        <exclusions>
+            <exclusion>
+                <groupId>com.squareup.okhttp3</groupId>
+                <artifactId>okhttp</artifactId>
+            </exclusion>
+        </exclusions>
+    </dependency>
+    <dependency>
+        <groupId>com.squareup.okhttp3</groupId>
+        <artifactId>okhttp</artifactId>
+        <version>4.12.0</version>
+    </dependency>
+    <dependency>
+        <groupId>com.aliyun</groupId>
+        <artifactId>ocr_api20210707</artifactId>
+        <version>3.1.3</version>
+    </dependency>
+</dependencies>
+```
+
+#### spring-ai-user（`spring-ai-user/pom.xml`）— 用户域专属依赖
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-webmvc</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-aspectj</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-spring-boot4-starter</artifactId>
+        <version>3.5.16</version>
+    </dependency>
+    <dependency>
+        <groupId>com.baomidou</groupId>
+        <artifactId>mybatis-plus-jsqlparser</artifactId>
+        <version>3.5.16</version>
+    </dependency>
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-pool2</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.6</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.security</groupId>
+        <artifactId>spring-security-crypto</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <optional>true</optional>
+    </dependency>
+</dependencies>
+```
+
+#### gateway（`gateway/pom.xml`）— 网关专属依赖
+
+```xml
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-starter-gateway-server-webflux</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-api</artifactId>
+        <version>0.12.6</version>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-impl</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>io.jsonwebtoken</groupId>
+        <artifactId>jjwt-jackson</artifactId>
+        <version>0.12.6</version>
+        <scope>runtime</scope>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-test</artifactId>
+        <scope>test</scope>
+    </dependency>
+</dependencies>
+```
+
+---
+
 ## 快速开始
 
 ### 1. 启动基础服务（Docker）
@@ -732,9 +1119,11 @@ cd docker
 docker-compose up -d
 ```
 
-会启动：Milvus 2.6.0（+ etcd / MinIO / Attu）、doc-minio（9002/9003，bucket `knowledge-documents` 自动创建）、Redis（6379，网关 Token 黑名单 / 用户服务刷新令牌 / **RAG 多轮对话记忆**共用）、**Nacos（8848/9848，注册中心 + 配置中心）**、Sentinel Dashboard（8858）。
+会启动：Milvus 2.6.0（+ etcd / MinIO / Attu）、doc-minio（9002/9003，bucket `knowledge-documents` 自动创建）、Redis（6379，网关 Token 黑名单 / 用户服务刷新令牌 / **RAG 多轮对话记忆**共用）、**RabbitMQ（5672 AMQP / 15672 管理台，Embedding 任务队列）**、**Nacos（8848/9848，注册中心 + 配置中心）**、Sentinel Dashboard（8858）。
 
 > 若只想启动部分服务：`docker compose up -d nacos redis standalone` 等按需指定服务名。
+
+> **RabbitMQ 队列升级提示（Quorum）**：`RabbitConfig` 已将业务/死信队列声明为 **Quorum** 类型（需 RabbitMQ ≥ 3.10 以支持死信配置，compose 的 `rabbitmq:3.13` 满足；Quorum 为 Raft 多副本高可用队列，是官方替代镜像队列的方案）。队列类型**不可原地变更**：若 broker 上已存在旧版 classic 同名队列，服务启动会报 `PRECONDITION_FAILED - inequivalent arg`，需先在管理台（15672）或 `rabbitmqctl delete_queue` 删除 `rag.embedding.task.queue` / `rag.embedding.task.dlq`（确认无未消费任务）再重启。
 
 **Nacos 配置中心使用外部 MySQL 存储**（compose 中 `MYSQL_SERVICE_HOST=host.docker.internal`），首次启动前需在宿主机 MySQL 完成：
 
@@ -905,7 +1294,7 @@ npm run build        # 生产构建，产物在 dist/
 
 ## 关键设计决策
 
-1. **异步任务 + 增量执行（RabbitMQ）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。消息持久化、消费失败重试 3 次后进死信队列统一标记失败；重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
+1. **异步任务 + 增量执行（RabbitMQ 全链路可靠性）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。可靠性链：① **Quorum 队列**——Raft 多副本持久化队列（队列/消息/死信参数均持久化），单节点挂掉不丢消息，是官方替代镜像队列的高可用方案（classic mirroring 自 RabbitMQ 4.0 移除）；② **生产者可靠性**——`publisher-confirm-type=correlated` + `publisher-returns=true`（mandatory 模式），Confirm nack 或路由不到队列时通过 `CorrelationData(taskId)` / `x-task-id` 头定位任务并标记失败，不静默丢失；③ **消费者可靠性**——失败重试 3 次（`max-retries=3`，共 4 次消费尝试），耗尽 `RejectAndDontRequeueRecoverer` 拒绝 → 死信队列统一标记失败（幂等）；④ **积压监控**——`RabbitQueueMonitor` 定时轮询 Management API，Ready 超阈值告警（ERROR 日志 + 可选 Webhook），及早发现"消费者跟不上生产者"；⑤ **防重复**——重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。
