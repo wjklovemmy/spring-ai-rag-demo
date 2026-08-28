@@ -2,7 +2,6 @@ package com.example.springairagdemo.mq;
 
 import com.example.springairagdemo.config.RabbitConfig;
 import com.example.springairagdemo.config.RagConfigProperties;
-import com.fasterxml.jackson.databind.JsonNode;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.MediaType;
@@ -10,6 +9,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
+import java.net.URI;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Map;
@@ -41,7 +41,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @ConditionalOnProperty(prefix = "rag.mq-monitor", name = "enabled", havingValue = "true", matchIfMissing = true)
 public class RabbitQueueMonitor {
 
-    private static final String QUEUE_URL = "/api/queues/%2F/" + RabbitConfig.EMBEDDING_TASK_QUEUE;
+    /** 队列查询路径：vhost 默认 "/" 必须编码为 %2F。
+     *  注意必须用 URI.create 传入（而非字符串模板）：RestClient 默认对 URI 模板再编码，
+     *  会把 %2F 二次编码为 %252F，Management API 按字面 vhost "%2F" 查询返回 404。 */
+    private static final URI QUEUE_URI = URI.create("/api/queues/%2F/" + RabbitConfig.EMBEDDING_TASK_QUEUE);
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
 
     private final RagConfigProperties config;
@@ -68,6 +71,9 @@ public class RabbitQueueMonitor {
         try {
             QueueDepth depth = queryQueueDepth();
             long threshold = config.getMqMonitor().getReadyThreshold();
+            // 每次轮询输出结果：确认监控在工作（无积压时也打印，否则正常态完全静默难以判断存活）
+            log.info("RabbitMQ 队列监控: queue={} ready={} unacked={} threshold={}",
+                    RabbitConfig.EMBEDDING_TASK_QUEUE, depth.ready(), depth.unacked(), threshold);
             if (depth.ready() > threshold) {
                 if (alerting.compareAndSet(false, true)) {
                     String msg = buildAlertMessage(depth, threshold);
@@ -79,22 +85,45 @@ public class RabbitQueueMonitor {
                         depth.ready(), depth.unacked(), threshold);
             }
         } catch (Exception e) {
-            log.warn("查询 RabbitMQ 队列深度失败（Management API 不可用？）: {}", e.getMessage());
+            // 404 常见原因：① vhost 编码（应 /api/queues/%2F/...，勿用 /api/queues///...）
+            // ② 队列未声明（spring-ai-rag 服务尚未启动成功，RabbitConfig 声明队列需连上 broker）
+            // ③ 队列名拼写（应为 rag.embedding.task.queue）
+            log.warn("查询 RabbitMQ 队列深度失败（检查 vhost 编码 / 队列是否已声明）: {}", e.getMessage());
         }
     }
 
-    /** 查询业务队列的 Ready / Unacked 消息数 */
+    /**
+     * 查询业务队列的 Ready / Unacked 消息数。
+     * <p>
+     * 注意：响应体用 JDK 原生 {@link Map} 接收，而不是 Jackson 2 的 {@code JsonNode}——
+     * 本项目是 Spring Boot 4（Jackson 3，包名 {@code tools.jackson}），RestClient 的 JSON
+     * converter 无法反序列化到 Jackson 2 类型（会报 Type definition error）。
+     */
+    @SuppressWarnings("unchecked")
     private QueueDepth queryQueueDepth() {
-        JsonNode node = managementClient.get()
-                .uri(QUEUE_URL)
+        Map<String, Object> body = managementClient.get()
+                .uri(QUEUE_URI)
                 .retrieve()
-                .body(JsonNode.class);
-        if (node == null) {
+                .body(Map.class);
+        if (body == null) {
             throw new IllegalStateException("Management API 响应为空");
         }
-        long ready = node.path("messages_ready").asLong(0);
-        long unacked = node.path("messages_unacknowledged").asLong(0);
-        return new QueueDepth(ready, unacked);
+        return new QueueDepth(asLong(body.get("messages_ready")), asLong(body.get("messages_unacknowledged")));
+    }
+
+    /** JSON 数字（Integer/Long）安全转 long，缺失或非法返回 0 */
+    private long asLong(Object value) {
+        if (value instanceof Number n) {
+            return n.longValue();
+        }
+        if (value != null) {
+            try {
+                return Long.parseLong(value.toString());
+            } catch (NumberFormatException ignored) {
+                // 非数字字段，按 0 处理
+            }
+        }
+        return 0L;
     }
 
     private String buildAlertMessage(QueueDepth depth, long threshold) {
