@@ -1344,6 +1344,29 @@ public abstract class KnowledgeDocumentService {
                     hits.add(i + 1); // 1-based 来源编号
                 }
             }
+            if (hits.isEmpty()) {
+                // 短窗口（80 字符）0 命中：引文可能超长被截断、被模型部分改写、或 [ 截断。
+                // 扩展窗口到 300 字符再试一次；窗口内若出现下一个 [来源N] 只取之前部分，
+                // 避免跨来源拼接文本导致误匹配到多个来源
+                int windowEnd = Math.min(m.end() + 300, answer.length());
+                String longCited = answer.substring(m.end(), windowEnd).replaceAll("\\s+", "");
+                int nextRef = longCited.indexOf("[来源");
+                if (nextRef >= 0) {
+                    longCited = longCited.substring(0, nextRef);
+                }
+                if (longCited.length() >= 8) {
+                    List<Integer> longHits = new ArrayList<>();
+                    for (int i = 0; i < normContents.size(); i++) {
+                        if (!normContents.get(i).isEmpty() && normContents.get(i).contains(longCited)) {
+                            longHits.add(i + 1);
+                        }
+                    }
+                    if (longHits.size() == 1 && longHits.get(0) != citedRef) {
+                        correction.put(citedRef, longHits.get(0));
+                    }
+                }
+                continue;
+            }
             if (hits.size() == 1 && hits.get(0) != citedRef) {
                 correction.put(citedRef, hits.get(0));
             }

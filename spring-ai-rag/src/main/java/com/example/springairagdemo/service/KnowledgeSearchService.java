@@ -12,6 +12,7 @@ import org.springframework.stereotype.Service;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -207,10 +208,20 @@ public class KnowledgeSearchService {
         List<String> fullContents = new ArrayList<>();
         StringBuilder contextBuilder = new StringBuilder();
         int refIndex = 1;
+        // 同一父块（或同一块）的多个命中只保留第一个作为来源：
+        // 否则多个 [来源N] 对应同一份父块全文——模型标注编号有歧义（标哪个都"对"），
+        // 引用对齐时包含匹配会多命中而放弃纠正，前端来源列表还出现重复片段
+        Set<Long> dedupKeys = new HashSet<>();
 
         for (VectorStoreService.SearchResult r : searchResults) {
             KnowledgeChunkEntity chunk = chunkMap.get(r.getChunkId());
             if (chunk == null) continue;
+
+            // 去重键：子块按父块 ID（兄弟子块共享同一父块全文），单级块按自身 ID
+            Long dedupKey = chunk.getParentId() != null ? chunk.getParentId() : chunk.getId();
+            if (!dedupKeys.add(dedupKey)) {
+                continue; // 同一父块的兄弟子块同时命中：内容相同，只保留第一个
+            }
 
             // 子块命中 → 用父块全文作为上下文与片段（parentMap 已批量反查，无 N+1）
             String content = resolveContent(chunk, parentMap);
