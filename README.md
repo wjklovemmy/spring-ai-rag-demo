@@ -39,7 +39,7 @@
 | 重排序模型 | 百炼 `gte-rerank-v2` | 召回后精排（Cross-Encoder），提升上下文质量 |
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
-| 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（同时支持本地磁盘模式） |
+| 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（唯一后端；已移除本地磁盘模式——多实例部署下文件须共享） |
 | 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
@@ -227,7 +227,7 @@ spring-ai-rag-demo/
 │           ├── RagRetrievalService.java           # Agent 检索链路组件：显式文档解析（问题点名文档限定召回）+ searchKnowledge 方法体 + 编号累积合并 + 工具事件基础设施
 │           ├── RerankService.java / DashScopeRerankService.java  # 重排序接口与实现
 │           ├── OcrService.java / AliyunOcrService.java           # OCR 接口与实现
-│           ├── FileStorageService.java / MinioFileStorageService.java / LocalFileStorageService.java
+│           ├── FileStorageService.java / MinioFileStorageService.java
 │           ├── KnowledgeEmbeddingTaskService.java # 任务服务（提交/进度/恢复）
 │           ├── KnowledgeBaseService.java / KnowledgeDocumentEntityService.java
 │           ├── KnowledgeChunkEntityService.java / impl/
@@ -308,7 +308,7 @@ spring-ai-rag-demo/
   │           - 同知识库同名文件 → 自动推断递增版本号 v1/v2/v3...
   │             （版本号取同名文档全部状态中的最大版本 +1，防重号）
   │           - 状态置 0（UPLOADING 上传中）
-  │       · persistUploadedFile 最先持久化原始文件（MinIO/本地），失败可恢复
+  │       · persistUploadedFile 最先持久化原始文件到 MinIO，失败可恢复
   │           - 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.pdf
   │       · 创建 Embedding 任务（status=0 待处理），提交线程池执行
   │       · 提交阶段失败 → 补偿删除文件 + document/task 记录（防孤儿）
@@ -669,10 +669,8 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `spring.servlet.multipart.*` | 上传大小限制（50MB） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 | `spring.cloud.sentinel.*` | Sentinel transport（Dashboard 上报，`eager` 启动即注册，可选） |
-| `rag.storage.type` | `minio` / `local` 文件存储切换 |
-| `rag.storage.minio.*` | MinIO endpoint / 密钥 / bucket |
+| `rag.storage.minio.*` | MinIO endpoint / 密钥 / bucket（唯一文件存储后端） |
 | `rag.document.version-ttl-days` | 旧版本文档共存天数（默认 30） |
-| `rag.document.upload-dir` | 本地存储模式上传目录 |
 | `rag.document.batch-size` | 向量化批处理大小（默认 100：每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写） |
 | `rag.document.chunk.*` | 全局文档分块参数（chunk-size、heading、semantic 等，见下） |
 | `rag.rerank.*` | 重排序：enabled / model(`gte-rerank-v2`) / candidate-top-k(20) / top-n(5) / threshold(0.3) / fallback-on-error |

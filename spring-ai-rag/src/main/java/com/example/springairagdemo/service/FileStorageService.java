@@ -3,7 +3,7 @@ package com.example.springairagdemo.service;
 import java.io.InputStream;
 
 /**
- * 文件存储服务抽象，支持本地磁盘和 MinIO 两种后端。
+ * 文件存储服务抽象（MinIO 对象存储实现）。
  */
 public interface FileStorageService {
 

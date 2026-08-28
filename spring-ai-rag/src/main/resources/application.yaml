@@ -159,9 +159,9 @@ rag:
     min-text-length: 20
     # 单页 OCR 失败时是否抛异常中断（false=记日志跳过该页）
     fail-on-error: false
-  # 文件存储配置：local（本地磁盘）/ minio（MinIO 对象存储）
+  # 文件存储配置：MinIO 对象存储（唯一后端，多实例部署下文件共享；
+  # 已移除本地磁盘模式——本地盘在 K8s 多副本下实例间文件不互通）
   storage:
-    type: minio
     minio:
       endpoint: http://localhost:9002
       access-key: minioadmin
@@ -170,8 +170,6 @@ rag:
   document:
     # 文档版本共存天数：新版本上传后，旧版本仍可检索的天数，超期后自动过滤
     version-ttl-days: 30
-    # 上传文件持久化存储目录
-    upload-dir: ./uploads
     # 向量化批处理大小：每批 chunk 数（每批：embedding 批量调用一次 + Milvus upsert 一次 + 进度回写一次）
     batch-size: 100
     # 文档分块配置（全局统一）

@@ -10,17 +10,16 @@ import io.minio.RemoveObjectArgs;
 import io.minio.StatObjectArgs;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.stereotype.Service;
 
 import java.io.InputStream;
 
 /**
- * MinIO 对象存储实现
+ * MinIO 对象存储实现（唯一文件存储后端：多实例部署下文件须落在共享对象存储，
+ * 本地磁盘模式会导致实例间文件不互通，已移除）
  */
 @Slf4j
 @Service
-@ConditionalOnProperty(prefix = "rag.storage", name = "type", havingValue = "minio")
 public class MinioFileStorageService implements FileStorageService {
 
     private final MinioClient minioClient;

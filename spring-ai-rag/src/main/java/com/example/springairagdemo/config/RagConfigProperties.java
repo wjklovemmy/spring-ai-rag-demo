@@ -15,7 +15,7 @@ public class RagConfigProperties {
     /** 文档全局配置（版本管理、TTL、分块参数等） */
     private DocumentGlobal document = new DocumentGlobal();
 
-    /** 文件存储配置（本地磁盘 / MinIO） */
+    /** 文件存储配置（MinIO 对象存储，多实例部署下文件须共享，不提供本地磁盘模式） */
     private Storage storage = new Storage();
 
     /** 召回重排序（Rerank）配置 */
@@ -37,8 +37,6 @@ public class RagConfigProperties {
     public static class DocumentGlobal {
         /** 文档版本共存天数：旧版本在新版本上传后 N 天内仍可检索，超期后自动过滤（默认30天） */
         private int versionTtlDays = 30;
-        /** 上传文件持久化存储目录（相对或绝对路径） */
-        private String uploadDir = "./uploads";
         /** 向量化批处理大小：每批 chunk 数（每批执行一次 embedding 批量调用 + 一次 Milvus upsert + 一次进度回写），
          *  分批降低大文档单次 embedding/upsert 的内存与超时风险，并支持进度实时感知 */
         private int batchSize = 100;
@@ -96,9 +94,7 @@ public class RagConfigProperties {
 
     @Data
     public static class Storage {
-        /** 存储类型：local（本地磁盘，默认）、minio（MinIO 对象存储） */
-        private String type = "local";
-        /** MinIO 配置（type=minio 时生效） */
+        /** MinIO 配置 */
         private Minio minio = new Minio();
     }
 
