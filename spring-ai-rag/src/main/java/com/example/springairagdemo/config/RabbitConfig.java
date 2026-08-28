@@ -16,12 +16,15 @@ import org.springframework.context.annotation.Configuration;
 /**
  * RabbitMQ 基础设施：Embedding 任务队列 + 死信队列 + 生产者可靠性。
  * <p>
- * 队列与消息均持久化（durable）：
+ * 队列与消息均持久化（durable），队列类型为 <b>Quorum</b>（Raft 复制队列）：
  * <ul>
- *   <li>业务队列 {@code rag.embedding.task.queue}：收到任务消息即执行 PDF 解析/切分/向量化；
+ *   <li>业务队列 {@code rag.embedding.task.queue}（quorum）：收到任务消息即执行 PDF 解析/切分/向量化；
  *       声明死信交换机与死信路由键——消息重试 3 次仍失败（reject）时自动路由到死信队列</li>
- *   <li>死信队列 {@code rag.embedding.task.dlq}：由死信消费者统一标记任务失败</li>
+ *   <li>死信队列 {@code rag.embedding.task.dlq}（quorum）：由死信消费者统一标记任务失败</li>
  * </ul>
+ * Quorum 队列（需 RabbitMQ &gt;= 3.10 才能配置 DLX）：消息在多数副本（leader + followers）间复制，
+ * 任一节点宕机不影响消息可用性，是 RabbitMQ 官方推荐的替代镜像队列的高可用方案
+ * （classic mirroring 自 RabbitMQ 4.0 起已移除）。单节点下副本数=1，行为等价于普通持久化队列。
  * <p>
  * 生产者端可靠性（本类 {@link #rabbitTemplate(ConnectionFactory, ObjectProvider)}）：
  * <ul>
@@ -52,19 +55,20 @@ public class RabbitConfig {
         return new DirectExchange(EMBEDDING_EXCHANGE, true, false);
     }
 
-    /** 业务队列：持久化，绑定死信交换机/路由键，重试耗尽的消息自动进入死信队列 */
+    /** 业务队列：Quorum（持久化 + 高可用），绑定死信交换机/路由键，重试耗尽的消息自动进入死信队列 */
     @Bean
     public Queue embeddingTaskQueue() {
         return QueueBuilder.durable(EMBEDDING_TASK_QUEUE)
+                .quorum()
                 .deadLetterExchange(EMBEDDING_EXCHANGE)
                 .deadLetterRoutingKey(EMBEDDING_TASK_DLQ_ROUTING_KEY)
                 .build();
     }
 
-    /** 死信队列：持久化 */
+    /** 死信队列：Quorum（持久化 + 高可用） */
     @Bean
     public Queue embeddingTaskDlq() {
-        return QueueBuilder.durable(EMBEDDING_TASK_DLQ).build();
+        return QueueBuilder.durable(EMBEDDING_TASK_DLQ).quorum().build();
     }
 
     @Bean
