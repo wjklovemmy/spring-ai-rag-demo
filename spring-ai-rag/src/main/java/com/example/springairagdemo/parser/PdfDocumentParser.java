@@ -4,7 +4,12 @@ import com.example.springairagdemo.config.RagConfigProperties;
 import com.example.springairagdemo.service.OcrService;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.Loader;
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDResources;
+import org.apache.pdfbox.pdmodel.graphics.PDXObject;
+import org.apache.pdfbox.pdmodel.graphics.form.PDFormXObject;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -23,14 +28,17 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * PDF 文档解析器：读取 PDF 文件内容，按全局配置分块后返回文档列表。
  * <p>
  * 对扫描版 PDF（无文本层）：自动将页面渲染为图片并调用 OCR 识别，
- * 用识别出的文字替换空白页文本，保证扫描件也能进入 RAG 链路。
+ * 用识别出的文字替换空白页文本；对"文本层 + 图片"混合页额外做 OCR，
+ * 把图片内文字与文本层按行去重拼接，保证图表/扫描插图的内容不丢失。
  * <p>
  * 切分策略（自研，Spring AI 2.0 无 SemanticTextSplitter）：
  * <ol>
@@ -88,7 +96,7 @@ public class PdfDocumentParser implements DocumentParser {
         List<Document> documents = readAllPages(tempFile);
         log.info("从 PDF 中读取到 {} 个文档页面", documents.size());
 
-        // OCR 兜底：扫描版 PDF 页面无文本层时渲染图片识别文字（原地替换页内容）
+        // OCR 兜底：纯图片页（扫描件）整页识别替换；"文本层+图片"混合页识别图片内文字并与文本层拼接
         if (ocrService.isEnabled() && !documents.isEmpty()) {
             ocrFallback(tempFile, documents);
         }
@@ -122,7 +130,11 @@ public class PdfDocumentParser implements DocumentParser {
     }
 
     /**
-     * 对文本层缺失或过短的页面执行 OCR 识别，替换为识别出的文字
+     * OCR 兜底：对含图片的页面执行 OCR 识别。
+     * <p>
+     * 页面只有 XObject 图片时才触发——纯文本页（无图片）不需要，空白页跳过。
+     * 扫描页（无文本层）用 OCR 结果整体替换；"文本层 + 图片"混合页（如正文中嵌图表、
+     * 流程图、扫描表格）将图片内文字与文本层按行去重拼接，避免图片内容丢失。
      */
     private List<Document> ocrFallback(Path tempFile, List<Document> documents) {
         RagConfigProperties.Ocr ocrConfig = config.getOcr();
@@ -134,12 +146,13 @@ public class PdfDocumentParser implements DocumentParser {
             for (int i = 0; i < documents.size(); i++) {
                 Document doc = documents.get(i);
                 String text = doc.getText() == null ? "" : doc.getText();
-                // 有足够文本层的页面无需 OCR
-                if (text.trim().length() >= ocrConfig.getMinTextLength()) {
+                // PDF 文本层只覆盖文字，图片内的文字必须靠 OCR；纯文本页/空白页无需 OCR
+                if (!containsImage(pdfDocument.getPage(i).getResources())) {
                     continue;
                 }
+                boolean hasTextLayer = text.trim().length() >= ocrConfig.getMinTextLength();
 
-                log.info("第 {} 页无有效文本层，触发 OCR 识别", i + 1);
+                log.info("第 {} 页含图片，触发 OCR（文本层是否充足: {}）", i + 1, hasTextLayer);
                 BufferedImage image = renderer.renderImageWithDPI(i, ocrConfig.getDpi(), ImageType.RGB);
                 String ocrText = ocrService.recognizeImage(toPngBytes(image));
                 log.info("第 {} 页 OCR 返回: 是否为空={}, 识别字符数={}", i + 1,
@@ -148,13 +161,17 @@ public class PdfDocumentParser implements DocumentParser {
                 if (ocrText != null && !ocrText.isBlank()) {
                     // Spring AI 2.0 Document 不可变，重建替换
                     doc.getMetadata().put("ocr", true);
+                    String mergedText = hasTextLayer
+                            ? mergeTextLayerAndOcr(text, ocrText)  // 混合页：文本层 + 图片内文字
+                            : ocrText;                              // 扫描页：OCR 结果整体替换
                     Document ocrDocument = Document.builder()
-                            .text(ocrText)
+                            .text(mergedText)
                             .metadata(doc.getMetadata())
                             .build();
                     documents.set(i, ocrDocument);
                     ocrPageCount++;
-                    log.info("第 {} 页 OCR 识别完成，识别字符数: {}", i + 1, ocrText.length());
+                    log.info("第 {} 页 OCR 处理完成: 文本层 {} 字符 + OCR {} 字符 -> {} 字符",
+                            i + 1, text.length(), ocrText.length(), mergedText.length());
                 }
             }
             if (ocrPageCount > 0) {
@@ -167,6 +184,90 @@ public class PdfDocumentParser implements DocumentParser {
             log.error("PDF OCR 处理失败，保留原始文本层: {}", e.getMessage());
         }
         return documents;
+    }
+
+    /**
+     * 页面是否含图片对象（递归嵌套 form XObject）。
+     * <p>
+     * 仅检测 XObject 图片（覆盖绝大多数 PDF），内联图像（InlineImage）未覆盖；
+     * 检测失败时按"无图片"处理（最坏退化为纯文本层路径，不阻断解析）。
+     */
+    private boolean containsImage(PDResources resources) {
+        if (resources == null) {
+            return false;
+        }
+        try {
+            Iterable<COSName> names = resources.getXObjectNames();
+            if (names == null) {
+                return false;
+            }
+            for (COSName name : names) {
+                PDXObject xObject = resources.getXObject(name);
+                if (xObject instanceof PDImageXObject) {
+                    return true;
+                }
+                if (xObject instanceof PDFormXObject
+                        && containsImage(((PDFormXObject) xObject).getResources())) {
+                    return true;
+                }
+            }
+        } catch (IOException e) {
+            log.debug("检测页面图片对象失败: {}", e.getMessage());
+        }
+        return false;
+    }
+
+    /**
+     * 混合页合并：保留文本层，把 OCR 识别出的图片内文字按行去重后追加在末尾。
+     * <p>
+     * 整页渲染 OCR 会把正文也识别出来，与文本层重复；通过归一化行匹配剔除重复行，
+     * 仅保留图片新增内容。若追加内容过少（如图片只是装饰/logo），回退为纯文本层。
+     */
+    private String mergeTextLayerAndOcr(String textLayer, String ocrText) {
+        List<String> layerLines = new ArrayList<>();
+        for (String line : textLayer.split("\\R")) {
+            String norm = normalizeOcrLine(line);
+            if (!norm.isEmpty()) {
+                layerLines.add(norm);
+            }
+        }
+        Set<String> layerSet = new HashSet<>(layerLines);
+
+        StringBuilder sb = new StringBuilder(textLayer);
+        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') {
+            sb.append('\n');
+        }
+        int added = 0;
+        for (String line : ocrText.split("\\R")) {
+            String norm = normalizeOcrLine(line);
+            if (norm.isEmpty() || layerSet.contains(norm)) {
+                continue;
+            }
+            // 防 OCR 截断/合并导致的重复：双方足够长且互相包含，视为同一内容
+            boolean dup = false;
+            for (String l : layerLines) {
+                if (l.length() >= 4 && norm.length() >= 4
+                        && (l.contains(norm) || norm.contains(l))) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                sb.append(line.trim()).append('\n');
+                added++;
+            }
+        }
+        if (added == 0) {
+            // 图片内无新增文字（装饰图/logo），保持纯文本层，避免噪声污染
+            return textLayer;
+        }
+        log.info("混合页合并：追加 OCR 新增 {} 行", added);
+        return sb.toString();
+    }
+
+    /** OCR 行归一化：去首尾空白、压缩连续空白，用于文本层与 OCR 结果的重复匹配 */
+    private String normalizeOcrLine(String line) {
+        return line.trim().replaceAll("[\\s\u00A0]+", " ");
     }
 
     private byte[] toPngBytes(BufferedImage image) throws IOException {
