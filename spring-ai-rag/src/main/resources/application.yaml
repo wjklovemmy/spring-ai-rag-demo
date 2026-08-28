@@ -40,15 +40,21 @@ spring:
     port: 5672
     username: guest
     password: guest
+    # 生产者端可靠性：消息是否真正送达 Broker
+    # correlated：Broker 收到消息后异步 ack/nack（nack 回调把任务标记失败，见 RabbitConfig#rabbitTemplate）
+    publisher-confirm-type: correlated
+    # 路由失败退回：消息路由不到任何队列时触发 returnsCallback（mandatory 模式），避免静默丢弃
+    publisher-returns: true
     listener:
       simple:
         # 消费失败重试：初始执行 1 次 + 重试 3 次 = 最多 4 次消费尝试，仍失败进死信队列
         retry:
           enabled: true
-          max-attempts: 4
           initial-interval: 1000
           multiplier: 2.0
           max-interval: 10000
+          # max-retries = 重试次数（Spring Boot 4.x 语义），初始执行 1 次 + 重试 3 次 = 最多 4 次消费尝试
+          max-retries: 3
         # 重试耗尽后不重新入队（避免无限循环），按业务队列声明的死信配置自动进死信队列
         default-requeue-rejected: false
         # 每消费者一次只取 1 条：任务串行处理（多实例下每实例 1 并发），
@@ -241,6 +247,21 @@ rag:
       exception-ratio: 0.5
       min-request-amount: 5
       time-window-seconds: 10
+  # RabbitMQ 队列积压监控：定时轮询 Management API 读取业务队列 Ready（待消费）消息数，
+  # 超过阈值触发告警（ERROR 日志 + 可选 Webhook），用于发现"消费者跟不上生产者"的消息积压。
+  # 控制台：http://localhost:15672（默认账号 guest/guest，仅 localhost 可访问，本服务与 RabbitMQ 同机）
+  mq-monitor:
+    enabled: true
+    # 轮询间隔（毫秒）：上一次检查完成后延迟该时长再检查
+    interval-ms: 30000
+    # Ready 消息数告警阈值：超过即判定积压并告警（多实例 prefetch=1 下，
+    # 50 条 ≈ 50 × 单任务耗时；单任务约 2 分钟时 ≈ 100 分钟积压，可按业务容忍度调整）
+    ready-threshold: 50
+    management-url: http://localhost:15672
+    management-username: guest
+    management-password: guest
+    # 企业微信/钉钉/飞书机器人 Webhook 地址，留空则仅打 ERROR 日志
+    webhook-url: ""
 
 # ==================== 网关信任配置 ====================
 # 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，

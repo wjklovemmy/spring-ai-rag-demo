@@ -33,6 +33,9 @@ public class RagConfigProperties {
     /** Sentinel 熔断降级规则配置（ai-chat 问答 / dashscope-embedding 向量化） */
     private Sentinel sentinel = new Sentinel();
 
+    /** RabbitMQ 队列积压监控配置（Ready 消息数告警） */
+    private MqMonitor mqMonitor = new MqMonitor();
+
     @Data
     public static class DocumentGlobal {
         /** 文档版本共存天数：旧版本在新版本上传后 N 天内仍可检索，超期后自动过滤（默认30天） */
@@ -201,5 +204,23 @@ public class RagConfigProperties {
         private int minRequestAmount = 5;
         /** 熔断时间窗（秒）：熔断持续时长，期间快速失败 */
         private int timeWindowSeconds = 10;
+    }
+
+    @Data
+    public static class MqMonitor {
+        /** 是否启用队列积压监控（false 关闭定时轮询） */
+        private boolean enabled = true;
+        /** 轮询间隔（毫秒）：上一次检查完成后延迟该时长再检查 */
+        private long intervalMs = 30000;
+        /** Ready（待消费）消息数告警阈值：超过即判定积压并告警 */
+        private long readyThreshold = 50;
+        /** RabbitMQ Management API 地址（docker-compose rabbitmq:3.13-management，默认 15672） */
+        private String managementUrl = "http://localhost:15672";
+        /** Management API 账号（guest 默认仅允许 localhost 访问，本服务与 RabbitMQ 同机，满足） */
+        private String managementUsername = "guest";
+        /** Management API 密码 */
+        private String managementPassword = "guest";
+        /** 告警 Webhook（企业微信/钉钉/飞书机器人地址），留空仅打 ERROR 日志 */
+        private String webhookUrl = "";
     }
 }

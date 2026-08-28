@@ -424,6 +424,28 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
+     * 生产端发送失败（Publisher Confirm nack / Publisher Return 路由失败）时标记任务失败。
+     * <p>
+     * 仅当任务仍为 PENDING 时标记：PROCESSING 说明消息可能已送达并开始处理
+     * （ack 因连接闪断丢失），此时交给消费流程自身决断，避免误标失败；
+     * SUCCESS/FAILED 为幂等预检的自然跳过。
+     */
+    public void markTaskSendFailed(Long taskId, String reason) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            log.warn("发送失败回调对应任务不存在，跳过: taskId={}", taskId);
+            return;
+        }
+        if (task.getStatus() != KnowledgeEmbeddingTaskStatus.PENDING) {
+            log.warn("发送失败但任务状态为 {}（非 PENDING），跳过标记失败，交给消费流程决断: taskNo={}",
+                    task.getStatus().getText(), task.getTaskNo());
+            return;
+        }
+        log.error("MQ 消息发送失败，标记任务失败: taskNo={}, reason={}", task.getTaskNo(), reason);
+        markTaskAndDocumentFailed(taskId, reason);
+    }
+
+    /**
      * 任务状态回退 PENDING（仅当当前为 PROCESSING，带状态条件避免误回退
      * 另一消费者已重新抢占并处理中的任务）：处理异常后调用，
      * 使 MQ 重试能再次通过 claimTask（PENDING → PROCESSING）抢占执行。
