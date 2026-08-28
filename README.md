@@ -41,6 +41,7 @@
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（唯一后端；已移除本地磁盘模式——多实例部署下文件须共享） |
 | 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
+| 异步消息 | RabbitMQ（`spring-boot-starter-amqp`，docker `3.13-management-alpine`） | **Embedding 任务异步执行**：上传/恢复/重试统一走 MQ（持久化队列+消息、消费失败重试 3 次后进死信队列）；at-least-once 重复投递由任务状态预检 + claimTask CAS + 增量处理三重防护 |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
@@ -154,7 +155,7 @@ graph TB
 ```
 spring-ai-rag-demo/
 ├── docker/
-│   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + Nacos(外部 MySQL 存储) + Sentinel Dashboard + 前端 Nginx(frontend-nginx:9004) 编排
+│   └── docker-compose.yml          # Milvus(含 etcd/attu) + doc-minio + Redis + RabbitMQ + Nacos(外部 MySQL 存储) + Sentinel Dashboard + 前端 Nginx(frontend-nginx:9004) 编排
 ├── spring-ai-web/                  # 独立 Vue 3 前端工程（Vite + vue-router）：src/ 组件化开发，npm run build 产物 dist/；nginx.conf / README.md
 ├── nacos/
 │   ├── common.yaml                 # Nacos 配置中心共享配置（三端密钥，导入控制台）
@@ -168,14 +169,16 @@ spring-ai-rag-demo/
 │       │   ├── AiConfig.java                  # ChatClient / 模型装配 + MessageChatMemoryAdvisor（多轮记忆）+ ToolCallbacks（KbQueryTools）+ Sentinel 熔断规则（ai-chat / dashscope-embedding）
 │       │   ├── MilvusConfig.java              # Milvus 客户端
 │       │   ├── RagConfigProperties.java       # rag.* 配置绑定（rerank/hybrid/ocr/storage/chunk 等）
-│       │   ├── AsyncTaskConfig.java           # Embedding 异步任务线程池（taskExecutor）
-│       │   ├── AsyncTaskProperties.java       # 线程池参数绑定（spring.task.embedding.*）
-│       │   ├── NamedThreadFactory.java        # rag-embedding-N 线程命名
+│       │   ├── RabbitConfig.java              # RabbitMQ 交换机/业务队列/死信队列声明（rag.embedding.*）
 │       │   ├── DataSourceConfig.java          # @Primary 数据源 + MyBatis-Plus 装配（HikariCP）
 │       │   ├── DatabasePoolProperties.java    # 连接池参数绑定（spring.datasource.pool.*）
 │       │   ├── DataInitializer.java           # 启动初始化（恢复中断任务）
 │       │   ├── FeignConfig.java               # 全局 RequestInterceptor（注入 X-Internal-Token）
 │       │   └── GlobalExceptionHandler.java    # 全局异常 → 统一 JSON
+│       ├── mq/                                # RabbitMQ：Embedding 任务异步消息
+│       │   ├── EmbeddingTaskProducer.java     # 发送任务消息（taskId，持久化投递）
+│       │   ├── EmbeddingTaskConsumer.java     # 业务队列消费（幂等预检 + 异常上抛触发重试）
+│       │   └── EmbeddingTaskDlqConsumer.java  # 死信队列消费（重试 3 次仍失败 → 标记任务失败）
 │       ├── controller/
 │       │   ├── KnowledgeBaseController.java   # 知识库管理 + 成员授权
 │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载/清空记忆
@@ -287,7 +290,7 @@ spring-ai-rag-demo/
 
 ### 1. 文档上传与摄取（异步任务流水线）
 
-摄取采用**异步任务制**：`submitIngest` 快速返回 `taskNo`，实际处理在自定义线程池（`rag-embedding-N`）中执行 `processTaskAsync`。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）。
+摄取采用**异步任务制**：`submitIngest` 快速返回 `taskNo`，实际处理通过 **RabbitMQ**（`EmbeddingTaskProducer.sendTask` 发送 taskId 消息 → 消费者执行 `processTask`）完成。消息/队列持久化，消费失败由 RabbitMQ 重试 3 次，仍失败进入死信队列由死信消费者统一标记任务失败；重复投递（at-least-once）靠任务状态预检 + claimTask CAS + 增量处理三重防护避免重复消费。入口先执行 `assertRole(kbId, EDITOR)` 权限校验（需 EDITOR 及以上）。
 
 文档状态机（`status`，7 态）：
 
@@ -310,10 +313,10 @@ spring-ai-rag-demo/
   │           - 状态置 0（UPLOADING 上传中）
   │       · persistUploadedFile 最先持久化原始文件到 MinIO，失败可恢复
   │           - 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.pdf
-  │       · 创建 Embedding 任务（status=0 待处理），提交线程池执行
+  │       · 创建 Embedding 任务（status=0 待处理），发送 MQ 消息异步执行
   │       · 提交阶段失败 → 补偿删除文件 + document/task 记录（防孤儿）
   │
-  └─ ② 异步处理（processTaskAsync，任务状态 0待处理→1处理中→2成功/3失败）
+  └─ ② MQ 消费处理（processTask，任务状态 0待处理→1处理中→2成功/3失败；失败重试 3 次进死信）
         │  文档状态 0上传中 → 1解析中 → 2向量化中 → 3成功 / 4失败
         │
         ├─ 解析       PagePdfDocumentReader 按页解析（无文本层 OCR 兜底）
@@ -664,7 +667,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `spring.ai.vectorstore.milvus.*` | Milvus 连接、索引类型（IVF_FLAT/COSINE）、维度 1024（collection 按知识库动态创建，`initialize-schema: false`） |
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
 | `spring.datasource.pool.*` | HikariCP 连接池（maximum-pool-size=10、minimum-idle=2、连接/空闲/存活超时等） |
-| `spring.task.embedding.*` | 摄取异步任务线程池（core=2/max=4/queue=50/命名 rag-embedding-N/优雅停机等待） |
+| `spring.rabbitmq.*` | RabbitMQ 连接（`localhost:5672`，guest/guest）与监听重试（`max-attempts=4` 即初始+3 次重试、耗尽不 requeue 进死信、`prefetch=1` 任务串行） |
 | `spring.data.redis.*` | Redis 多轮对话记忆（`RedisChatMemory`：host/port、db 0、Lettuce 连接池；key 前缀 `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天；与用户服务/网关共用同一实例） |
 | `spring.servlet.multipart.*` | 上传大小限制（50MB） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
@@ -902,7 +905,7 @@ npm run build        # 生产构建，产物在 dist/
 
 ## 关键设计决策
 
-1. **异步任务 + 增量执行**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，`processTaskAsync` 在线程池执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。文档处理流水线经 `processTaskAsync` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
+1. **异步任务 + 增量执行（RabbitMQ）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。消息持久化、消费失败重试 3 次后进死信队列统一标记失败；重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。

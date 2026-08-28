@@ -78,6 +78,11 @@
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-pool2</artifactId>
         </dependency>
+        <!-- RabbitMQ：Embedding 任务异步消息（持久化投递 + 失败重试 + 死信队列） -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-amqp</artifactId>
+        </dependency>
 
         <!-- ==================== AI / 向量 / 解析（RAG 专用） ==================== -->
         <dependency>

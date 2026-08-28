@@ -7,6 +7,7 @@ import com.example.springairagdemo.entity.KnowledgeChunkEntity;
 import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
+import com.example.springairagdemo.mq.EmbeddingTaskProducer;
 import com.example.springairagdemo.parser.PdfDocumentParser;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.UserContext;
@@ -19,10 +20,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.client.circuitbreaker.CircuitBreakerFactory;
-import org.springframework.core.task.TaskExecutor;
 import org.springframework.dao.DuplicateKeyException;
 
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 import tools.jackson.databind.ObjectMapper;
 import org.springframework.transaction.annotation.Transactional;
@@ -57,17 +56,18 @@ import java.util.stream.Collectors;
 /**
  * 知识文档服务抽象类：定义文档摄取的模板流程和基于知识库的问答能力
  * <p>
- * 上传流程（submitIngest → 异步 processTaskAsync）：
+ * 上传流程（submitIngest → RabbitMQ 消息 → processTask）：
  * 1. 保存原始文档信息到 MySQL knowledge_document
  * 2. 原始文件最先持久化到存储后端（MinIO/本地）
  * 3. 创建 knowledge_embedding_task 任务（0待处理），立即返回任务编号
- * 4. 异步线程：解析文档（子类实现）
- * 5. 异步线程：切分文档（子类实现）
- * 6. 异步线程：chunk 文本写入 MySQL knowledge_chunk（增量：跳过已处理片段）
- * 7. 异步线程：chunk 向量写入 Milvus（仅存向量 + 引用字段，稳定主键 upsert 幂等）
+ * 4. MQ 消费：解析文档（子类实现）
+ * 5. MQ 消费：切分文档（子类实现）
+ * 6. MQ 消费：chunk 文本写入 MySQL knowledge_chunk（增量：跳过已处理片段）
+ * 7. MQ 消费：chunk 向量写入 Milvus（仅存向量 + 引用字段，稳定主键 upsert 幂等）
  * 8. 任务成功/失败状态回写 knowledge_embedding_task
+ *    （处理失败由 MQ 重试 3 次，仍失败进死信队列后统一标记失败）
  * <p>
- * 恢复/重跑（resumeInterruptedTask → processTaskAsync）支持增量执行：
+ * 恢复/重跑（resumeInterruptedTask → RabbitMQ 重新入队 → processTask）支持增量执行：
  * 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段；
  * Milvus 幂等 upsert 兜底并发/重复执行。
  */
@@ -142,8 +142,7 @@ public abstract class KnowledgeDocumentService {
     protected KnowledgeEmbeddingTaskService knowledgeEmbeddingTaskService;
 
     @Autowired
-    @Qualifier("taskExecutor")
-    protected TaskExecutor taskExecutor;
+    protected EmbeddingTaskProducer embeddingTaskProducer;
 
     // ===================== 模板方法：上传文档 =====================
 
@@ -192,9 +191,10 @@ public abstract class KnowledgeDocumentService {
             log.info("Embedding 任务已提交: taskNo={}, documentId={}, fileName={}",
                     task.getTaskNo(), docEntity.getId(), docEntity.getFileName());
 
-            // 4. 异步执行 PDF 解析/切分/向量化，立即返回任务编号
+            // 4. 发送 MQ 消息异步执行 PDF 解析/切分/向量化（消息持久化，失败重试 3 次后进死信队列），
+            //    立即返回任务编号，前端轮询任务状态；发送失败走下方补偿删除，避免孤儿数据
             final Long taskId = task.getId();
-            CompletableFuture.runAsync(() -> processTaskAsync(taskId), taskExecutor);
+            embeddingTaskProducer.sendTask(taskId);
 
             return new TaskSubmitResult(task.getId(), task.getTaskNo(), docEntity.getId(),
                     docEntity.getFileName(), docEntity.getVersion());
@@ -233,7 +233,7 @@ public abstract class KnowledgeDocumentService {
     /**
      * 服务重启后恢复中断的 Embedding 任务（增量执行）：
      * 1. 重置任务计数与错误信息，累加重试次数
-     * 2. 重新入队 {@link #processTaskAsync}，由增量逻辑查缺补漏：
+     * 2. 发送 MQ 消息重新入队（消费者执行 {@link #processTask}），由增量逻辑查缺补漏：
      *    已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段
      * <p>
      * 不再删除半成品数据 —— 已写入的 chunk/向量作为增量线索保留（milvus_id 标记"向量已写入"），
@@ -253,7 +253,7 @@ public abstract class KnowledgeDocumentService {
             return;
         }
 
-        // 1. 重置任务字段并置回 PENDING（processTaskAsync 通过 CAS 抢占 PENDING 才能执行，
+        // 1. 重置任务字段并置回 PENDING（processTask 通过 CAS 抢占 PENDING 才能执行，
         //    避免与其它入口并发重复处理同一任务）。
         //    注意：必须用 lambdaUpdate 显式 .set(..., null) 清空字段——
         //    updateById 默认 NOT_NULL 策略会跳过 null 字段，导致旧的错误信息/完成时间残留。
@@ -271,10 +271,10 @@ public abstract class KnowledgeDocumentService {
                 .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
                 .update();
 
-        // 2. 重新入队执行（增量补齐：已处理过的 chunk 直接跳过）
+        // 2. 发送 MQ 消息重新入队执行（增量补齐：已处理过的 chunk 直接跳过）
         final Long finalTaskId = task.getId();
-        CompletableFuture.runAsync(() -> processTaskAsync(finalTaskId), taskExecutor);
-        log.info("重启恢复：任务 {} 已重新入队执行（增量补齐） documentId={}",
+        embeddingTaskProducer.sendTask(finalTaskId);
+        log.info("重启恢复：任务 {} 已发送 MQ 重新入队（增量补齐） documentId={}",
                 task.getTaskNo(), docEntity.getId());
     }
 
@@ -310,16 +310,24 @@ public abstract class KnowledgeDocumentService {
     }
 
     /**
-     * 异步执行 Embedding 任务：解析 PDF → 切分 → chunk 写 MySQL → 向量写 Milvus。
+     * 执行 Embedding 任务：解析 PDF → 切分 → chunk 写 MySQL → 向量写 Milvus。
      * 支持增量执行（恢复/重跑）：已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，
      * 只补齐缺失或内容变化的片段。
      * 任务状态逐阶段推进（PENDING → PROCESSING → SUCCESS/FAILED），
      * 文档状态同步推进（0上传中 → 1解析中 → 2向量化中 → 3成功/4失败），
      * 处理进度在文档列表与任务表均可感知。
      * <p>
-     * 该线程不持有 HTTP 请求上下文（UserContext 已清理），处理流程不依赖登录用户。
+     * 本方法由 MQ 消费者（{@code EmbeddingTaskConsumer}）调用，不持有 HTTP 请求上下文，
+     * 处理流程不依赖登录用户。
+     * <p>
+     * <b>异常语义（关键）</b>：处理异常时回滚未完成向量并把任务状态回退为 PENDING 后
+     * <b>向上抛出</b>，交给 RabbitMQ 重试（最多 3 次）。此处<b>不能</b>直接
+     * markDocumentFailed / failTask——否则重试时 claimTask 会因任务已终结而直接放弃，
+     * 消息重试失去意义。重试 3 次仍失败后消息进入死信队列，由死信消费者统一标记失败。
+     *
+     * @throws Exception 处理失败向上抛出（checked），由 MQ 重试拦截器捕获触发重试
      */
-    public void processTaskAsync(Long taskId) {
+    public void processTask(Long taskId) throws Exception {
         KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
         if (task == null) {
             log.error("Embedding 任务不存在: taskId={}", taskId);
@@ -333,7 +341,7 @@ public abstract class KnowledgeDocumentService {
             return;
         }
         try {
-            // 1. CAS 抢占任务（PENDING -> PROCESSING），防止同一任务被并发/重复入队时重复处理
+            // 1. CAS 抢占任务（PENDING -> PROCESSING），防止同一任务被并发/重复投递时重复处理
             if (!claimTask(task, start)) {
                 return;
             }
@@ -360,10 +368,77 @@ public abstract class KnowledgeDocumentService {
         } catch (Exception e) {
             log.error("Embedding 任务执行失败: taskNo={}, documentId={}",
                     task.getTaskNo(), task.getDocumentId(), e);
-            // 回滚未完成向量（已回填 milvus_id 的保留，供恢复时增量跳过），标记文档与任务失败
+            // 回滚未完成向量（已回填 milvus_id 的保留，供恢复时增量跳过）
             rollbackIncompleteVectors(docEntity);
+            // 任务状态回退 PENDING（带 PROCESSING 条件），使 MQ 重试能再次通过 claimTask 抢占；
+            // 不在此标记文档/任务失败——留给死信消费者在重试耗尽后统一处理
+            resetToPendingIfProcessing(taskId);
+            throw e;
+        }
+    }
+
+    /**
+     * MQ 消费者幂等预检：任务是否存在且未终结（PENDING/PROCESSING）。
+     * <p>
+     * RabbitMQ 为 at-least-once 投递，消费者 ack 前崩溃会重复投递同一消息；
+     * 任务已 SUCCESS/FAILED 或已不存在（提交阶段补偿删除）时直接 ack 跳过，
+     * 避免重复处理——这是"消息不重复消费"的第一道防护（配合 claimTask CAS 与增量处理）。
+     */
+    public boolean shouldProcessTask(Long taskId) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            log.warn("MQ 消息对应的任务不存在，跳过: taskId={}", taskId);
+            return false;
+        }
+        if (task.getStatus() == KnowledgeEmbeddingTaskStatus.SUCCESS
+                || task.getStatus() == KnowledgeEmbeddingTaskStatus.FAILED) {
+            log.info("MQ 消息对应任务已终结（{}），跳过重复处理: taskNo={}",
+                    task.getStatus().getText(), task.getTaskNo());
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * 死信消费者入口：任务消息重试 3 次仍失败后，统一标记任务与文档失败。
+     * <p>
+     * 幂等：任务已成功/已失败/不存在时直接跳过；文档不存在时仅标记任务失败。
+     */
+    public void markTaskAndDocumentFailed(Long taskId, String error) {
+        KnowledgeEmbeddingTaskEntity task = knowledgeEmbeddingTaskService.getById(taskId);
+        if (task == null) {
+            log.warn("死信消息对应任务不存在，跳过: taskId={}", taskId);
+            return;
+        }
+        if (task.getStatus() == KnowledgeEmbeddingTaskStatus.SUCCESS) {
+            log.info("死信消息对应任务已成功，跳过标记失败: taskNo={}", task.getTaskNo());
+            return;
+        }
+        long start = task.getStartTime() != null
+                ? task.getStartTime().getTime() : System.currentTimeMillis();
+        KnowledgeDocumentEntity docEntity = knowledgeDocumentEntityService.getById(task.getDocumentId());
+        if (docEntity != null) {
             markDocumentFailed(docEntity);
-            failTask(task, friendlyErrorMessage(e), start);
+        }
+        failTask(task, error, start);
+    }
+
+    /**
+     * 任务状态回退 PENDING（仅当当前为 PROCESSING，带状态条件避免误回退
+     * 另一消费者已重新抢占并处理中的任务）：处理异常后调用，
+     * 使 MQ 重试能再次通过 claimTask（PENDING → PROCESSING）抢占执行。
+     */
+    private void resetToPendingIfProcessing(Long taskId) {
+        try {
+            knowledgeEmbeddingTaskService.lambdaUpdate()
+                    .eq(KnowledgeEmbeddingTaskEntity::getId, taskId)
+                    .eq(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PROCESSING)
+                    .set(KnowledgeEmbeddingTaskEntity::getStatus, KnowledgeEmbeddingTaskStatus.PENDING)
+                    .set(KnowledgeEmbeddingTaskEntity::getErrorMessage, null)
+                    .set(KnowledgeEmbeddingTaskEntity::getUpdateTime, new Date())
+                    .update();
+        } catch (Exception ex) {
+            log.error("回退任务状态失败: taskId={}", taskId, ex);
         }
     }
 
@@ -778,27 +853,6 @@ public abstract class KnowledgeDocumentService {
 
     /** 待写入的子块：childIndex 为全局子块序号（= chunk_index，Milvus 主键编码依据），parentIndex 为父块序号（写入时回填 parentId） */
     private record ChildToSave(int childIndex, int parentIndex) {
-    }
-
-    /**
-     * 将异常转为对用户友好的错误信息：
-     * 向量化/Embedding 类故障（含熔断抛出的 {@link EmbeddingServiceUnavailableException}）
-     * 归一为「向量化服务暂时不可用，请稍后重试」；其余异常截断原始消息，
-     * 避免向用户暴露过长堆栈。
-     */
-    private String friendlyErrorMessage(Throwable e) {
-        if (e instanceof EmbeddingServiceUnavailableException) {
-            return "向量化服务暂时不可用，请稍后重试";
-        }
-        String msg = e.getMessage();
-        if (msg != null && (msg.contains("DashScope") || msg.contains("dashscope")
-                || msg.contains("embedding") || msg.contains("Embedding"))) {
-            return "向量化服务暂时不可用，请稍后重试";
-        }
-        if (msg == null || msg.isBlank()) {
-            msg = e.toString();
-        }
-        return msg.length() > 200 ? msg.substring(0, 200) + "..." : msg;
     }
 
     /**

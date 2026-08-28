@@ -21,8 +21,9 @@ import java.util.List;
  * 恢复以增量方式重新入队（{@link KnowledgeDocumentService#resumeInterruptedTask}）：
  * 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段，
  * 避免重复解析/切分/embedding/写入。多实例/多入口并发执行是安全的——
- * {@code resumeInterruptedTask} 内部将任务置回 PENDING 后由 {@code processTaskAsync}
- * 通过 CAS（PENDING -&gt; PROCESSING 条件更新）原子抢占，只有一例真正处理，其余直接放弃。
+ * {@code resumeInterruptedTask} 内部将任务置回 PENDING 后发送 MQ 消息，
+ * 消费者执行 {@code processTask} 通过 CAS（PENDING -&gt; PROCESSING 条件更新）原子抢占，
+ * 只有一例真正处理，其余直接放弃。
  */
 @Slf4j
 @Service

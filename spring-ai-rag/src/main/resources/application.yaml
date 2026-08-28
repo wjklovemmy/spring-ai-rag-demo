@@ -35,6 +35,25 @@ spring:
     multipart:
       max-file-size: 50MB
       max-request-size: 50MB
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    listener:
+      simple:
+        # 消费失败重试：初始执行 1 次 + 重试 3 次 = 最多 4 次消费尝试，仍失败进死信队列
+        retry:
+          enabled: true
+          max-attempts: 4
+          initial-interval: 1000
+          multiplier: 2.0
+          max-interval: 10000
+        # 重试耗尽后不重新入队（避免无限循环），按业务队列声明的死信配置自动进死信队列
+        default-requeue-rejected: false
+        # 每消费者一次只取 1 条：任务串行处理（多实例下每实例 1 并发），
+        # 避免同任务多线程并发抢占；任务处理耗时长，并发过高会打爆 embedding API 配额
+        prefetch: 1
   ai:
     deepseek:
       base-url: https://api.deepseek.com
@@ -84,20 +103,6 @@ spring:
             max-idle: 8
             min-idle: 0
   task:
-    # Embedding 异步任务线程池参数（自定义，由 AsyncTaskConfig 绑定）
-    embedding:
-      # 核心线程数
-      core-pool-size: 2
-      # 最大线程数（执行 PDF 解析 + 向量化，不宜过大，避免打爆上游 API 配额）
-      max-pool-size: 4
-      # 队列容量
-      queue-capacity: 50
-      # 空闲线程存活时间（秒）
-      keep-alive-seconds: 60
-      # 线程名前缀，日志中形如 rag-embedding-1
-      thread-name-prefix: rag-embedding-
-      # 停机时等待任务完成的最长时间（秒）
-      await-termination-seconds: 30
     pool:
       # 连接池名称，便于监控与日志区分
       pool-name: KnowledgeBase-HikariCP

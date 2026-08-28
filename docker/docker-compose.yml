@@ -94,6 +94,19 @@ services:
       - redis_data:/data
     restart: unless-stopped
 
+  # RabbitMQ：Embedding 任务异步消息队列（队列/消息持久化 + 失败重试 + 死信队列）
+  # 控制台：http://localhost:15672（默认账号 guest/guest）
+  # 队列声明见 spring-ai-rag RabbitConfig（rag.embedding.task.queue / rag.embedding.task.dlq）
+  rabbitmq:
+    container_name: knowledge-rabbitmq
+    image: rabbitmq:3.13-management-alpine
+    ports:
+      - "5672:5672"     # AMQP 协议端口（spring.rabbitmq.* 连接）
+      - "15672:15672"   # 管理控制台
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    restart: unless-stopped
+
   # Nacos 注册中心 + 配置中心（standalone 单机模式）
   # 控制台：http://localhost:8090/nacos（默认账号 nacos/nacos）
   # 客户端需同时连通 8848（HTTP API）与 9848（gRPC），缺失 9848 会导致服务发现/配置拉取失败
@@ -157,3 +170,4 @@ volumes:
   doc_minio_data:
   redis_data:
   nacos_data:
+  rabbitmq_data:
