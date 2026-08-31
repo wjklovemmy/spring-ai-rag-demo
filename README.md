@@ -40,7 +40,7 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（唯一后端；已移除本地磁盘模式——多实例部署下文件须共享） |
-| 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
+| 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史，**滑动窗口 + 摘要压缩**防无限增长（窗口为 **token 预算主控（max-tokens 16000，本地估算 ASCII 4字符/token、中文 1字符/token）+ 条数兜底（max-history 100）**，任一超限即把最老一批交给 DeepSeek 浓缩进摘要，读取返回「摘要 + 窗口原文」）；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；`RedisMemoryMonitor` 定时监控记忆膨胀（key 数/总占用超阈值告警 + 可选 Webhook）；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
 | 异步消息 | RabbitMQ（`spring-boot-starter-amqp`，docker `3.13-management-alpine`） | **Embedding 任务异步执行**：上传/恢复/重试统一走 MQ（**Quorum 队列**持久化+高可用；**Publisher Confirm/Return** 保证生产者送达，Broker nack / 路由失败即标记任务失败；消费失败重试 3 次后进死信队列）；at-least-once 重复投递由任务状态预检 + claimTask CAS + 增量处理三重防护；`RabbitQueueMonitor` 定时监控队列深度，积压超阈值告警（ERROR 日志 + 可选 Webhook） |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
@@ -214,7 +214,10 @@ spring-ai-rag-demo/
 │       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建
 │       │   └── SemanticSplitter.java          # 语义切片（段落聚类 + 断点）
 │       ├── memory/
-│       │   └── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库）
+│       │   ├── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库；token 预算+条数双窗口，摘要压缩，兼容旧版纯数组数据）
+│       │   ├── ConversationSummarizer.java    # 对话历史摘要压缩器（DeepSeek 合并最老一批对话进摘要，ai-chat 熔断保护，失败降级纯裁剪）
+│       │   ├── MessageTokenEstimator.java     # 本地 token 估算（ASCII 4字符/token、中文 1字符/token，无 API 依赖，随消息落库、旧数据读取时补算）
+│       │   └── RedisMemoryMonitor.java        # 记忆膨胀监控（@Scheduled SCAN rag:chat:memory:* + MEMORY USAGE，key 数/总占用超阈值告警 + Webhook，去抖）
 │       ├── tools/
 │       │   ├── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments / documentOutline / searchKnowledge 壳）
 │       │   └── CalculatorTool.java            # 通用计算工具（@Tool：calculate，受限表达式安全求值：+ - * / ( ) ^ %）
@@ -370,7 +373,8 @@ spring-ai-rag-demo/
   ├─ ① 会话记忆   进入问答先 touchOnChat 落会话元数据（首个问题截断为标题、补 knowledge_base_id）；
   │       MessageChatMemoryAdvisor 按会话 ID 从 Redis（key rag:chat:memory:{userId}:{sessionId}，
   │       userId 由服务端 UserContext 注入，会话按用户隔离）读取历史（仅 user/assistant 消息，
-  │       窗口保护最近 100 条，TTL 7 天）注入 prompt，实现多轮上下文连贯；
+  │       滑动窗口：存储总 token（本地估算）超 max-tokens(16000) 或条数超 max-history(100)+batch(20) 时，
+  │       最老一批由 ConversationSummarizer 浓缩进摘要，读取返回「摘要 + 窗口原文」，TTL 7 天）注入 prompt，实现多轮上下文连贯；
   │       · system 提示与工具产生的 Tool 消息均不落库（避免污染记忆）；「清空对话」= 后端删 Redis 记忆 + 前端清空消息
   │
   ├─ ② 模型推理    Agent 系统提示词（buildAgentSystemPrompt）强约束：
@@ -669,7 +673,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `spring.datasource.*` | MySQL 连接（`knowledge_base` 库） |
 | `spring.datasource.pool.*` | HikariCP 连接池（maximum-pool-size=10、minimum-idle=2、连接/空闲/存活超时等） |
 | `spring.rabbitmq.*` | RabbitMQ 连接（`localhost:5672`，guest/guest）；生产者可靠性 `publisher-confirm-type=correlated` + `publisher-returns=true`（Confirm nack / Return 路由失败 → 标记任务失败）；监听重试 `max-retries=3`（Spring Boot 4.x 语义=重试次数，即初始执行 1 次 + 重试 3 次 = 最多 4 次消费尝试）、耗尽不 requeue 进死信、`prefetch=1` 任务串行 |
-| `spring.data.redis.*` | Redis 多轮对话记忆（`RedisChatMemory`：host/port、db 0、Lettuce 连接池；key 前缀 `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天；与用户服务/网关共用同一实例） |
+| `spring.data.redis.*` | Redis 多轮对话记忆（`RedisChatMemory`：host/port、db 0、Lettuce 连接池；key 前缀 `rag:chat:memory:{userId}:{会话ID}`，TTL 7 天；存储结构 `{"summary":..., "messages":[{type,content,tokens}...]}`，tokens 为本地估算随消息落库；兼容旧版纯数组；与用户服务/网关共用同一实例） |
 | `spring.servlet.multipart.*` | 上传大小限制（50MB） |
 | `spring.cloud.nacos.*` | Nacos 注册/配置中心地址（`server-addr: localhost:8848`，3.x 默认账号 nacos/nacos） |
 | `spring.cloud.sentinel.*` | Sentinel transport（Dashboard 上报，`eager` 启动即注册，可选） |
@@ -680,6 +684,8 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `rag.rerank.*` | 重排序：enabled / model(`gte-rerank-v2`) / candidate-top-k(20) / top-n(5) / threshold(0.3) / fallback-on-error |
 | `rag.hybrid.*` | 混合检索：enabled / route-top-k(40) / min-score(0) / rrf-k(60) / fallback-on-error |
 | `rag.mq-monitor.*` | **RabbitMQ 队列积压监控**：enabled / interval-ms(30000) / ready-threshold(50) / management-url(`http://localhost:15672`) / username / password / webhook-url（企业微信/钉钉/飞书机器人，留空仅 ERROR 日志）。`RabbitQueueMonitor` 定时轮询 Management API，Ready 数超阈值判定积压并告警（持续积压去抖只告警一次，恢复自动解除） |
+| `rag.memory.*` | **对话记忆滑动窗口 + 摘要压缩**：summary-enabled(true，false 则仅纯裁剪不消耗 LLM) / **max-tokens(16000，token 预算主控**——历史总 token 估算上限，本地近似 ASCII 4字符/token、中文 1字符/token；建议按模型上下文 1/4~1/3 预留，DeepSeek 64K → 16000**) / max-history(100，条数兜底**——最多保留/返回给模型的消息条数，防单条过小时窗口无限拉长) / summary-batch-size(20，总 token 超 max-tokens 或条数超 max-history+batch 时把最老 batch 条压缩进摘要，每 batch 轮触发一次额外 DeepSeek 调用) |
+| `rag.memory-monitor.*` | **记忆膨胀监控**：enabled(true) / interval-ms(60000) / key-count-threshold(10000) / total-bytes-threshold(268435456=256MB) / webhook-url。`RedisMemoryMonitor` 定时 SCAN `rag:chat:memory:*` + MEMORY USAGE 汇总，key 数或总占用超阈值告警（ERROR 日志 + 可选 Webhook，去抖只告警一次，恢复自动解除） |
 | `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
 | `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
 | `rag.document.chunk.semantic.*` | 语义切片：enabled / threshold(0.55) / batch-size(10) / fallback-on-error |
@@ -689,6 +695,23 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `feign.sentinel.rules` | Sentinel 熔断规则（key：`default`=所有 Feign 客户端默认规则，或精确资源名如 `spring-ai-user#isAdmin(Long)`；value：DegradeRule 列表） |
 | `feign.client.config.default.*` | OpenFeign 默认连接/读取超时（connect-timeout 3000ms / read-timeout 10000ms） |
 | `internal-token` | 服务间内部调用令牌（`X-Internal-Token`，RAG 与用户服务互相回调 `/internal/**` 时由 Feign 拦截器携带，两端必须一致） |
+
+> **RAG 服务 Token 预算参考**（DeepSeek `deepseek-chat`，上下文 64K/128K，输出默认 `max_tokens=4K`）：
+> 模型上下文窗口 = **System Prompt + 历史记忆 + 工具定义 + RAG Context + User Query + 输出预留** 之和。
+> `rag.memory.max-tokens` 仅约束其中"历史记忆"一块，RAG Context 与工具定义为运行时动态拼接。
+> 各组件典型量级与配置出处：
+
+| 组件 | 典型量级 | 控制项 |
+|---|---|---|
+| System Prompt | ≈1100 | `buildAgentSystemPrompt`（工具调用规范 + 引用约束） |
+| 历史记忆（原文窗口 + 摘要） | ≤16000 | `rag.memory.max-tokens`（预算上限；摘要以 system 消息叠加，额外约 500-600） |
+| 工具定义 | ≈500-1500 | 5 个 `@Tool` 的 JSON Schema，每次请求随 tools 发送，无预算开关 |
+| RAG Context | ≈4000-5000 | `rag.rerank.top-n(5)` × 父块全文（800 token 切分）；**多轮工具调用时多份结果累积拼接**，最坏 3× |
+| User Query | 运行时值 | 无预算约束 |
+| 输出预留 | 4096 | DeepSeek `max_tokens` 默认，与输入共用窗口 |
+
+> 64K 窗口示例分配：System 1100 + 工具 1000 + 记忆 16000 + Context 5000 + Query 500 ≈ 23600（占 37%，余量充足）。
+> 注：本地 token 估算（`MessageTokenEstimator`）为保守上界（中文 1 字符/token），真实分词通常更省，预算按上界留即可。RAG Context 无独立预算约束，靠提示词约束工具调用次数兜底。
 
 **spring-ai-user 用户服务（`spring-ai-user/src/main/resources/application.yaml`）关键配置：**
 
@@ -1312,7 +1335,7 @@ npm run build        # 生产构建，产物在 dist/
 16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。前端已前后端分离（独立 Vue 3 工程 `spring-ai-web/`，Vite 构建，经 Nginx 同源代理 `/api` 或直连网关走 CORS），接口统一走 7070。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。
-19. **多轮对话记忆（Redis ChatMemory）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天，窗口保护最近 100 条），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。
+19. **多轮对话记忆（Redis ChatMemory，token 预算驱动 + 摘要压缩）**：实现 Spring AI `ChatMemory` 接口（`memory/RedisChatMemory`），按会话 ID 将 user/assistant 历史消息持久化到 Redis（key `rag:chat:memory:{userId}:{sessionId}`，TTL 7 天），经 `MessageChatMemoryAdvisor` 自动注入 prompt 实现上下文连贯；**会话按用户隔离**——userId 由服务端 `UserContext` 注入（在请求线程拼装、经 advisor param 传递，不依赖流式回调线程），不同用户即使 sessionId 相同也不串号；**system 检索上下文与工具调用产生的 Tool 消息均不落库**（避免污染记忆）。**防记忆无限增长（双保险）**：① 存储结构 `{"summary","messages"}` 两级，窗口为 **token 预算主控 + 条数兜底**——每条消息写入时由 `MessageTokenEstimator` 本地估算 token（ASCII 4 字符/token、中文 1 字符/token，保守上界、零 API 调用）并落库，`add` 时总 token 超 `max-tokens(16000)` 或条数超 `max-history(100)+batch(20)` 即触发：最老一批（token 超限时按需移除到预算内，不固定 20 条）由 `ConversationSummarizer` 交给 DeepSeek 浓缩进摘要（复用 `ai-chat` 熔断保护，失败降级纯裁剪、存储仍有上界），`get` 返回「摘要(system) + 窗口原文（读取端同样按 token 裁剪）」——模型上下文严格受预算约束，真正撑爆上下文的是 token 而非条数，粘贴长文档时立即触发而非攒满 20 轮；长会话早期诉求/结论/未决问题经摘要保留，不随窗口滑动丢失；关闭 `rag.memory.summary-enabled` 可省去摘要 LLM 调用（每约 20 轮一次，成本极低）；② `RedisMemoryMonitor` 定时 SCAN `rag:chat:memory:*` + `MEMORY USAGE` 汇总，key 数（默认 1 万）或总占用（默认 256MB）超阈值告警（ERROR 日志 + 可选 Webhook，去抖），兜底发现会话 key 无限增长或单会话异常膨胀；旧版纯数组/无 tokens 字段存储数据读取时自动兼容（tokens 缺失补算），无需迁移。
 20. **流式输出（SSE）+ 双模式**：问答默认以 `text/event-stream` 逐 token 流式输出（`Flux<String>` → `ServerSentEvent`），降低首字延迟；请求体 `stream=false` 可回退一次性 JSON（同步/流式链路均为 Agentic RAG：模型自主调用工具，无服务层兜底检索）。来源列表在生成完毕后随 `sources` 事件下发（**仅回答实际引用的来源**，按 [来源N] 过滤并重排为连续编号），流式/同步/历史回显（agent_task 快照回补）三种场景下引用来源一致、不漏显。
 21. **工具调用（Function Calling）实现 Agentic RAG**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments` / `documentOutline` + `searchKnowledge` 委托壳），问答不再预检索注入上下文，由模型自主决定何时检索——知识类问题先调用 `searchKnowledge`（检索链路收敛于 `RagRetrievalService` 组件 + `KnowledgeSearchService`：显式文档解析→Hybrid 召回→过滤→Rerank→[来源N]上下文组装→编号累积合并），再严格基于工具返回片段逐字引用回答；澄清/寒暄/告知无信息类问题不检索、不下发来源。服务层**不兜底检索**（检索决策完全交给模型）。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
 22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。

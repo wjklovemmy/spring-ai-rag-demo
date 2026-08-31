@@ -36,6 +36,12 @@ public class RagConfigProperties {
     /** RabbitMQ 队列积压监控配置（Ready 消息数告警） */
     private MqMonitor mqMonitor = new MqMonitor();
 
+    /** 对话记忆配置（滑动窗口 + 摘要压缩，防单会话历史无限增长） */
+    private Memory memory = new Memory();
+
+    /** 对话记忆监控配置（Redis key 数量 / 总占用告警） */
+    private MemoryMonitor memoryMonitor = new MemoryMonitor();
+
     @Data
     public static class DocumentGlobal {
         /** 文档版本共存天数：旧版本在新版本上传后 N 天内仍可检索，超期后自动过滤（默认30天） */
@@ -220,6 +226,36 @@ public class RagConfigProperties {
         private String managementUsername = "guest";
         /** Management API 密码 */
         private String managementPassword = "guest";
+        /** 告警 Webhook（企业微信/钉钉/飞书机器人地址），留空仅打 ERROR 日志 */
+        private String webhookUrl = "";
+    }
+
+    @Data
+    public static class Memory {
+        /** 是否启用摘要压缩：历史超窗口时，最老一批交给 LLM 浓缩进摘要（false=仅纯裁剪，不消耗 LLM 调用） */
+        private boolean summaryEnabled = true;
+        /** 单会话记忆窗口（条数兜底）：最多保留/返回给模型的历史消息条数，防单条消息过多时无限膨胀 */
+        private int maxHistory = 100;
+        /** 单会话记忆窗口（token 预算主控）：窗口内历史消息的总 token 估算上限。
+         *  建议按模型上下文窗口的 1/4~1/3 预留（DeepSeek 64K → 取 16000）。
+         *  token 估算为本地保守上界（ASCII 4 字符/token、中文 1 字符/token），非精确计数 */
+        private int maxTokens = 16000;
+        /** 摘要压缩批次（条数）：存储超过 maxHistory + batch 条，或总 token 超过 maxTokens 时，
+         *  把最老的 batch 条压缩进摘要。每 batch 轮对话触发一次压缩（额外消耗一次 DeepSeek 调用），
+         *  batch 越小压缩越频繁、摘要越精细 */
+        private int summaryBatchSize = 20;
+    }
+
+    @Data
+    public static class MemoryMonitor {
+        /** 是否启用记忆膨胀监控（false 关闭定时轮询） */
+        private boolean enabled = true;
+        /** 轮询间隔（毫秒）：上一次检查完成后延迟该时长再检查 */
+        private long intervalMs = 60000;
+        /** 会话 key 数量告警阈值：SCAN rag:chat:memory:* 计数超过即告警 */
+        private long keyCountThreshold = 10000;
+        /** 记忆总占用告警阈值（字节）：各 key MEMORY USAGE 汇总超过即告警，默认 256MB */
+        private long totalBytesThreshold = 256L * 1024 * 1024;
         /** 告警 Webhook（企业微信/钉钉/飞书机器人地址），留空仅打 ERROR 日志 */
         private String webhookUrl = "";
     }

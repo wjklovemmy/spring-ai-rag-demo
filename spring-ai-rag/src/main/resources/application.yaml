@@ -263,6 +263,31 @@ rag:
     # 企业微信/钉钉/飞书机器人 Webhook 地址，留空则仅打 ERROR 日志
     webhook-url: ""
 
+  # 对话记忆：滑动窗口 + 摘要压缩（防单会话历史无限增长）
+  memory:
+    # 是否启用摘要压缩：存储超窗口时，最老一批对话交给 DeepSeek 浓缩进摘要
+    # （每 summary-batch-size 轮触发一次，额外消耗一次 LLM 调用；false=仅纯裁剪不调用 LLM）
+    summary-enabled: true
+    # 单会话记忆窗口（token 预算主控）：历史总 token 估算上限（本地近似：ASCII 4字符/token、中文 1字符/token）。
+    # 真正撑爆模型上下文的是 token 数而非条数；建议按模型上下文窗口 1/4~1/3 预留（DeepSeek 64K → 16000）
+    max-tokens: 16000
+    # 单会话记忆窗口（条数兜底）：最多保留/返回给模型的历史消息条数，防单条消息过小时窗口无限拉长
+    max-history: 100
+    # 摘要压缩批次：存储超过 max-history + batch 条，或总 token 超过 max-tokens 时，把最老的 batch 条压缩进摘要
+    summary-batch-size: 20
+  # 对话记忆监控：定时 SCAN rag:chat:memory:*，key 数/总占用超阈值告警
+  # （持续超阈值只告警一次，恢复自动解除；兜底发现会话 key 无限增长或单会话异常膨胀）
+  memory-monitor:
+    enabled: true
+    # 轮询间隔（毫秒）：上一次检查完成后延迟该时长再检查
+    interval-ms: 60000
+    # 会话 key 数量告警阈值
+    key-count-threshold: 10000
+    # 记忆总占用告警阈值（字节）：MEMORY USAGE 汇总，默认 256MB
+    total-bytes-threshold: 268435456
+    # 企业微信/钉钉/飞书机器人 Webhook 地址，留空则仅打 ERROR 日志
+    webhook-url: ""
+
 # ==================== 网关信任配置 ====================
 # 网关内部信任令牌：GatewayIdentityFilter 校验 X-Gateway-Token 头，
 # 确认请求经由本服务网关转发（防绕过网关直连伪造身份），必须与 gateway 模块一致
