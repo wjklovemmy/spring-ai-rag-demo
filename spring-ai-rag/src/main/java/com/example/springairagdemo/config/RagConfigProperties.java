@@ -244,6 +244,49 @@ public class RagConfigProperties {
          *  把最老的 batch 条压缩进摘要。每 batch 轮对话触发一次压缩（额外消耗一次 DeepSeek 调用），
          *  batch 越小压缩越频繁、摘要越精细 */
         private int summaryBatchSize = 20;
+        /** Phase 1 长期记忆：是否把会话摘要持久化到 MySQL chat_session_memory（跨会话复用） */
+        private boolean historyPersistEnabled = true;
+        /** 新会话问答开始时注入的历史会话摘要条数上限（0 = 关闭历史背景注入） */
+        private int historyInjectLimit = 5;
+        /** Redis 记忆无摘要时，取最近 N 轮对话原文作为「会话要点」落库（0 = 跳过无摘要会话） */
+        private int fallbackLastTurns = 6;
+        /** Phase 2 长期记忆：用户级长期记忆（saveMemory/searchMemory 工具 + 问答注入 + 会话后自动抽取） */
+        private LongTerm longTerm = new LongTerm();
+    }
+
+    /** Phase 2 用户级长期记忆配置（rag.memory.long-term.*） */
+    @Data
+    public static class LongTerm {
+        /** 用户级长期记忆总开关（saveMemory/searchMemory 工具注册 + 问答前注入 + 自动抽取） */
+        private boolean enabled = true;
+        /** Milvus 全局用户记忆集合名（userId 标量字段做用户隔离，主键 = MySQL memory id） */
+        private String collectionName = "rag_user_memory";
+        /** 每次问答按问题语义召回的长期记忆条数上限（≤0 关闭问答前注入） */
+        private int injectLimit = 5;
+        /** 注入系统提示的【用户长期记忆】文本总字符上限（超出截断，避免挤占上下文） */
+        private int maxChars = 1600;
+        /** 召回最低余弦相似度（低于该分的记忆不注入/不返回，避免无关记忆干扰模型） */
+        private double minScore = 0.3;
+        /** searchMemory 工具单次召回条数上限 */
+        private int searchTopK = 8;
+        /** 保存时语义去重阈值：与已有记忆余弦相似度达到该值视为同一事实，不重复新增 */
+        private double dedupeThreshold = 0.95;
+        /** 单用户记忆条数上限（防无限膨胀；达到后自动抽取跳过、工具保存拒绝） */
+        private int maxPerUser = 500;
+        /** 会话结束后自动抽取用户长期记忆的开关 */
+        private boolean autoExtractEnabled = true;
+        /** 同一用户自动抽取最小间隔（分钟）：防抖，避免每次问答都触发一次 LLM 抽取 */
+        private long autoExtractIntervalMinutes = 30;
+        /** 自动抽取输入（近期对话原文）总字符上限 */
+        private int extractMaxChars = 4000;
+        /** 单次抽取最多保存的记忆条数 */
+        private int extractMaxFacts = 6;
+        /** 向量后台补偿开关：vector_status=0（embedding 临时不可用而降级文本落库）的记忆定期重试向量化入库 */
+        private boolean vectorSyncEnabled = true;
+        /** 向量后台补偿扫描间隔（毫秒）：上一轮补偿完成后延迟该时长再扫描下一轮 */
+        private long vectorSyncIntervalMs = 60000;
+        /** 每轮后台补偿条数上限（限制突发批量，避免向量服务刚恢复即被打满/触发熔断） */
+        private int vectorSyncBatchSize = 20;
     }
 
     @Data

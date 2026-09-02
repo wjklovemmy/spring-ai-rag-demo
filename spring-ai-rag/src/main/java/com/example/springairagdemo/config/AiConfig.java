@@ -6,6 +6,7 @@ import com.alibaba.csp.sentinel.slots.block.degrade.DegradeRuleManager;
 import com.example.springairagdemo.embedding.DashScopeEmbeddingModel;
 import com.example.springairagdemo.tools.CalculatorTool;
 import com.example.springairagdemo.tools.KbQueryTools;
+import com.example.springairagdemo.tools.MemoryTools;
 import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.ai.chat.client.ChatClient;
@@ -59,11 +60,15 @@ public class AiConfig {
      *       经 prompt.toolContext() 注入。</li>
      *   <li>{@link CalculatorTool}：数学表达式计算，解决"年假还剩几天"等需要数值运算的问题，
      *       模型把自然语言翻译为受限表达式，由服务端安全求值。</li>
+     *   <li>{@link MemoryTools}：用户级长期记忆（Phase 2），saveMemory / searchMemory，
+     *       模型自主"记住用户 / 想起用户"，跨会话个性化；userId/会话标识由 Service 层
+     *       经 prompt.toolContext() 注入。</li>
      * </ul>
      */
     @Bean
-    public ToolCallbackProvider kbQueryToolCallbacks(KbQueryTools tools, CalculatorTool calculatorTool) {
-        return MethodToolCallbackProvider.builder().toolObjects(tools, calculatorTool).build();
+    public ToolCallbackProvider kbQueryToolCallbacks(KbQueryTools tools, CalculatorTool calculatorTool,
+                                                     MemoryTools memoryTools) {
+        return MethodToolCallbackProvider.builder().toolObjects(tools, calculatorTool, memoryTools).build();
     }
 
     /**

@@ -110,6 +110,14 @@ public class RedisChatMemory implements ChatMemory {
     }
 
     /**
+     * 读取存储的会话记忆快照（含摘要与消息窗口），供服务层做长期记忆持久化。
+     * 与 {@link #get} 的区别：返回原始存储结构，不注入为 Spring AI 消息、不裁剪窗口。
+     */
+    public StoredConversation readStored(String conversationId) {
+        return read(key(conversationId));
+    }
+
+    /**
      * 滑动窗口压缩（双触发）：存储条数超过 {@code maxHistory + batch}，或总 token 估算
      * 超过 {@code maxTokens} 时，把最老的 batch 条（token 超限时按需移除更多）压缩进摘要。
      * 摘要成功 → 剩余消息已回落到窗口内；摘要未启用或失败 → 纯裁剪（同 {@link #trimToBudget}）。

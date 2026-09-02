@@ -471,7 +471,32 @@ async function ask() {
     scroll()
     // 首问后会话标题由后端生成，刷新列表保持最新
     loadSessions()
+    // 会话结束：后台可能异步自动抽取长期记忆（防抖窗口内仅首次问答触发），延迟探测结果并轻提醒
+    pollAutoExtractResult(Date.now())
   }
+}
+
+/** 自动沉淀提醒：问答结束后后台异步抽取长期记忆，延迟轮询后端结果，
+ *  若本次会话触发了新沉淀则 toast；抽取未完成/网络偶发失败时静默（长期记忆页同样可见）。 */
+function pollAutoExtractResult(afterMs) {
+  const delays = [3500, 7000, 10000]
+  let attempt = 0
+  const probe = async () => {
+    if (attempt >= delays.length) return
+    await new Promise(r => setTimeout(r, delays[attempt++]))
+    try {
+      const res = await fetchApi(`/api/memory/auto-extract-result?after=${afterMs}`)
+      const data = await res.json()
+      if (data && data.success && data.data && data.data.saved > 0) {
+        showToast(`已自动沉淀 ${data.data.saved} 条长期记忆，可在「长期记忆」页查看`, 'success')
+        return
+      }
+    } catch (e) {
+      // 静默失败：等待下一次探测
+    }
+    probe()
+  }
+  probe()
 }
 
 /** 读取 SSE 响应流，按空行分隔事件并交给 handleSseEvent 处理 */

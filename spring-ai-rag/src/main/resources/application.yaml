@@ -275,6 +275,16 @@ rag:
     max-history: 100
     # 摘要压缩批次：存储超过 max-history + batch 条，或总 token 超过 max-tokens 时，把最老的 batch 条压缩进摘要
     summary-batch-size: 20
+    # Phase 2 用户级长期记忆（rag.memory.long-term.*，完整项见 RagConfigProperties.LongTerm）：
+    # Milvus 全局集合 rag_user_memory（userId 隔离）已含 userId/category/importance 标量倒排索引
+    long-term:
+      # 向量后台补偿：新增/抽取记忆时若 embedding 临时不可用，记忆降级为文本落库（vector_status=0），
+      # 后台任务定期重试向量化 + 写入 Milvus，向量服务恢复后无需人工干预即可补齐
+      vector-sync-enabled: true
+      # 补偿扫描间隔（毫秒）：上一轮补偿完成后延迟该时长再扫描下一轮
+      vector-sync-interval-ms: 60000
+      # 每轮补偿条数上限（限制突发批量，避免向量服务刚恢复即被打满/触发熔断）
+      vector-sync-batch-size: 20
   # 对话记忆监控：定时 SCAN rag:chat:memory:*，key 数/总占用超阈值告警
   # （持续超阈值只告警一次，恢复自动解除；兜底发现会话 key 无限增长或单会话异常膨胀）
   memory-monitor:

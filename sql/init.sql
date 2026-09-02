@@ -196,6 +196,31 @@ CREATE TABLE IF NOT EXISTS `chat_session` (
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='聊天会话';
 
 -- ============================================================
+-- 会话长期记忆（Phase 1：跨会话情景记忆）
+-- 说明：
+--   1. 每轮问答结束后，把该会话在 Redis 中的「历史对话摘要」（摘要压缩产物）
+--      同步持久化到本表；Redis 无摘要时取最近几轮对话原文拼成会话要点
+--   2. 新会话问答开始时，按用户（同知识库优先）检索最近活跃会话摘要注入系统提示，
+--      实现跨会话的「记得之前聊过什么」
+--   3. 删除会话时级联逻辑删除本表记录（deleted=1），防止已删会话摘要继续被注入
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `chat_session_memory` (
+    `id`                BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `user_id`           BIGINT      NOT NULL COMMENT '所属用户 ID',
+    `session_id`        VARCHAR(64) NOT NULL COMMENT '来源会话 ID（chat_session.session_id）',
+    `knowledge_base_id` BIGINT      DEFAULT NULL COMMENT '来源会话关联知识库 ID（跨库会话为 NULL）',
+    `summary`           TEXT        NOT NULL COMMENT '会话摘要（摘要压缩产物，或最近对话要点）',
+    `create_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time`       DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `deleted`           TINYINT     NOT NULL DEFAULT 0 COMMENT '逻辑删除：0 正常 / 1 已删除（删除会话时置 1，MyBatis-Plus 自动过滤）',
+    `deleted_by`        BIGINT      DEFAULT NULL COMMENT '删除人用户 ID',
+    `delete_time`       DATETIME    DEFAULT NULL COMMENT '删除时间',
+    UNIQUE KEY `uk_user_session` (`user_id`, `session_id`),
+    KEY `idx_user_update` (`user_id`, `update_time`),
+    KEY `idx_user_kb_update` (`user_id`, `knowledge_base_id`, `update_time`)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='会话长期记忆（跨会话摘要）';
+
+-- ============================================================
 -- Agent 任务（一次提问的执行审计单元）
 -- 说明：
 --   1. 一次提问 = 一条 agent_task，记录问题/最终回答/状态/耗时/工具调用次数，
@@ -248,6 +273,27 @@ CREATE TABLE IF NOT EXISTS `agent_task_step` (
     `delete_time` DATETIME     DEFAULT NULL COMMENT '删除时间',
     KEY `idx_task` (`task_id`, `id`)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='Agent 任务步骤轨迹';
+
+-- ============================================================
+-- Phase 2 用户级长期记忆（个人事实/偏好/经历，跨会话、跨知识库持久，按用户隔离）
+-- 文本存 MySQL（数据源），向量存 Milvus 全局集合 rag_user_memory（userId 过滤召回）
+-- ============================================================
+CREATE TABLE IF NOT EXISTS `user_long_term_memory` (
+    `id`             BIGINT AUTO_INCREMENT PRIMARY KEY,
+    `user_id`        BIGINT       NOT NULL COMMENT '用户 ID',
+    `content`        TEXT         NOT NULL COMMENT '长期记忆内容（一条 = 一个事实/偏好，尽量简短具体）',
+    `category`       VARCHAR(32)  NOT NULL DEFAULT 'fact' COMMENT '类别：fact 事实 / preference 偏好 / interest 兴趣 / goal 目标 / event 经历',
+    `importance`     TINYINT      NOT NULL DEFAULT 5 COMMENT '重要度 1-10（模型判定，越高越重要）',
+    `source_session` VARCHAR(128) DEFAULT NULL COMMENT '来源会话（conversationId，形如 {userId}:{sessionId}）',
+    `vector_status`  TINYINT      NOT NULL DEFAULT 0 COMMENT '向量同步状态：0 待同步/失败 / 1 已同步',
+    `create_time`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+    `update_time`    DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    `deleted`        TINYINT      NOT NULL DEFAULT 0 COMMENT '逻辑删除：0 正常 / 1 已删除',
+    `deleted_by`     BIGINT       DEFAULT NULL COMMENT '删除人用户 ID',
+    `delete_time`    DATETIME     DEFAULT NULL COMMENT '删除时间',
+    KEY `idx_user_update` (`user_id`, `update_time`),
+    KEY `idx_user_category` (`user_id`, `category`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户长期记忆（个人事实/偏好，跨会话持久）';
 
 -- 内置 ADMIN 角色 / 权限种子 / admin 管理员账号及其绑定关系，
 -- 已全部迁移至用户域独立库脚本 sql/user.sql（应用启动时 UserDataInitializer 也会自动补齐）。

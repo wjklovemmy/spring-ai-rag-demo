@@ -22,6 +22,9 @@ public class ChatSessionServiceImpl extends ServiceImpl<ChatSessionMapper, ChatS
     @Autowired
     private AgentTaskService agentTaskService;
 
+    @Autowired
+    private ChatSessionMemoryService chatSessionMemoryService;
+
     @Override
     public ChatSessionEntity createSession(Long userId, Long knowledgeBaseId) {
         ChatSessionEntity s = new ChatSessionEntity();
@@ -95,6 +98,8 @@ public class ChatSessionServiceImpl extends ServiceImpl<ChatSessionMapper, ChatS
                 .update();
         // 2. 级联逻辑删除该会话下的 Agent 任务与步骤轨迹（记录删除人/时间）
         agentTaskService.logicalDeleteBySession(userId, sessionId, operatorId);
+        // 3. 级联逻辑删除该会话的长期记忆（防止已删会话摘要继续被注入）
+        chatSessionMemoryService.logicalDeleteBySession(userId, sessionId, operatorId);
     }
 
     /** 问题截断为会话标题（单行、去空白） */

@@ -62,6 +62,7 @@ import { showToast } from '../utils/toast'
 
 import HomeTab from '../components/HomeTab.vue'
 import ChatTab from '../components/ChatTab.vue'
+import MemoryTab from '../components/MemoryTab.vue'
 import UploadTab from '../components/UploadTab.vue'
 import DocsTab from '../components/DocsTab.vue'
 import TasksTab from '../components/TasksTab.vue'
@@ -69,6 +70,7 @@ import AgentTasksTab from '../components/AgentTasksTab.vue'
 import KbTab from '../components/KbTab.vue'
 import UsersTab from '../components/UsersTab.vue'
 import RolesTab from '../components/RolesTab.vue'
+import MemoryAdminTab from '../components/MemoryAdminTab.vue'
 
 const router = useRouter()
 
@@ -82,6 +84,7 @@ const navItems = computed(() => {
   const items = [
     { key: 'home', icon: '🏠', title: '首页' },
     { key: 'chat', icon: '💬', title: '知识问答' },
+    { key: 'memory', icon: '🧠', title: '长期记忆' },
     { key: 'upload', icon: '📤', title: '上传文档' },
     { key: 'docs', icon: '📄', title: '文档列表' },
     { key: 'tasks', icon: '⏳', title: '任务列表' },
@@ -90,6 +93,7 @@ const navItems = computed(() => {
   if (isAdmin.value) {
     items.push(
       { key: 'kb', icon: '🗂️', title: '知识库管理' },
+      { key: 'memoryStats', icon: '🧠', title: '记忆概览' },
       { key: 'users', icon: '👥', title: '用户管理' },
       { key: 'roles', icon: '🛡️', title: '角色管理' }
     )
@@ -100,11 +104,13 @@ const navItems = computed(() => {
 const tabComponents = {
   home: HomeTab,
   chat: ChatTab,
+  memory: MemoryTab,
   upload: UploadTab,
   docs: DocsTab,
   tasks: TasksTab,
   agentTasks: AgentTasksTab,
   kb: KbTab,
+  memoryStats: MemoryAdminTab,
   users: UsersTab,
   roles: RolesTab
 }
@@ -112,8 +118,9 @@ const tabComponents = {
 const currentComponent = shallowRef(tabComponents[activeTab.value])
 
 const tabTitles = {
-  home: '首页', chat: '知识问答', upload: '上传文档', docs: '文档列表',
-  tasks: '任务列表', agentTasks: 'Agent 任务', kb: '知识库管理', users: '用户管理', roles: '角色管理'
+  home: '首页', chat: '知识问答', memory: '长期记忆', upload: '上传文档', docs: '文档列表',
+  tasks: '任务列表', agentTasks: 'Agent 任务', kb: '知识库管理', memoryStats: '记忆概览',
+  users: '用户管理', roles: '角色管理'
 }
 const currentTitle = computed(() => tabTitles[activeTab.value])
 

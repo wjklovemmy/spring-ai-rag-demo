@@ -119,6 +119,18 @@ public abstract class KnowledgeDocumentService {
     @Autowired
     protected RagConfigProperties ragConfig;
 
+    /** Phase 1 长期记忆：会话摘要持久化与跨会话历史背景注入 */
+    @Autowired
+    protected ChatSessionMemoryService chatSessionMemoryService;
+
+    /** Phase 2 长期记忆：用户级长期记忆领域服务（saveMemory/searchMemory 工具 + 问答前注入） */
+    @Autowired
+    protected MemoryService memoryService;
+
+    /** Phase 2 长期记忆：会话结束后台抽取用户级长期记忆（防抖，不影响问答） */
+    @Autowired
+    protected MemoryExtractionService memoryExtractionService;
+
     /** 检索核心（Hybrid 召回/Rerank/上下文组装），由 searchKnowledge 工具调用 */
     @Autowired
     protected KnowledgeSearchService knowledgeSearchService;
@@ -1260,7 +1272,10 @@ public abstract class KnowledgeDocumentService {
         // 1. Agent 化：不再预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具检索；
         //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，各轮结果累积合并、编号全局唯一）
         AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
-        String systemPrompt = buildAgentSystemPrompt();
+        // Phase 1+2 长期记忆：注入跨会话历史摘要 + 用户级长期记忆（按本次问题语义召回），
+        // 让模型既"记得之前聊过什么"，也"记得这个人的偏好与事实"
+        String systemPrompt = appendMemoryContext(
+                appendHistoryContext(buildAgentSystemPrompt(), knowledgeBaseId), question);
 
         // 2. LLM 生成回答（同步，带 Sentinel 熔断降级 + 多轮记忆 + 工具调用）
         //    同步链路执行轨迹在回答生成后才落库（此时尚无 Agent 任务 ID），taskId 传 null
@@ -1281,6 +1296,8 @@ public abstract class KnowledgeDocumentService {
             } catch (Exception e) {
                 log.warn("Agent 降级问答落库失败（不影响返回）：{}", e.getMessage());
             }
+            // Phase 1 长期记忆：会话摘要落库（降级场景也保留用户问题，跨会话可追溯）
+            persistSessionMemory(UserContext.getUserId(), sessionId, knowledgeBaseId);
             return new ChatResult(answer, List.of());
         }
 
@@ -1329,6 +1346,9 @@ public abstract class KnowledgeDocumentService {
         } catch (Exception e) {
             log.warn("Agent 同步问答落库失败（不影响返回）：{}", e.getMessage());
         }
+
+        // Phase 1 长期记忆：会话摘要落库（有摘要用摘要，无摘要取最近对话要点），跨会话复用
+        persistSessionMemory(UserContext.getUserId(), sessionId, knowledgeBaseId);
 
         return new ChatResult(answer, sources);
     }
@@ -1488,6 +1508,11 @@ public abstract class KnowledgeDocumentService {
                 + "- 用户询问某文档的结构/章节大纲 → 调用 documentOutline 工具。\n"
                 + "- 用户问题涉及具体数值的算术计算（如年假余额=总天数-已休天数、金额运算、"
                 + "百分比换算、差值/合计等）→ 调用 calculate 工具，把数值和运算翻译成数学表达式（如 5-2、8000*(1-10%)）传入。\n"
+                + "- 用户透露值得长期记住的稳定个人事实/偏好/经历（生日、岗位、公司、饮食/生活习惯、兴趣爱好、"
+                + "重要目标/计划、已确认的安排等）→ 调用 saveMemory 工具保存为用户长期记忆，"
+                + "仅保存确定且稳定的信息，一次只保存一条；不要把知识库检索到的文档内容当记忆保存。\n"
+                + "- 需要基于该用户的历史偏好/个人事实回答（如“我之前说过什么”“我的偏好是什么”"
+                + "“我是什么岗位/做什么的”“按我上次提的要求处理”）→ 调用 searchMemory 工具查询用户长期记忆。\n"
                 + "- 与知识库内容无关的问题（闲聊、常识等）→ 直接正常回答，无需调用工具。\n"
                 + "回答方式：当检索到的知识库内容能直接回答用户问题时，请逐字引用原文片段作答，"
                 + "不要用自己的话总结、概括、润色或扩展原文内容；多个相关片段可按原文顺序拼接，"
@@ -1521,6 +1546,8 @@ public abstract class KnowledgeDocumentService {
         kbAuthorizationService.assertRole(knowledgeBaseId, KbRole.VIEWER);
         // 会话联动：补建/刷新会话元数据（标题、知识库、时间），旧 sessionId 平滑接入会话列表
         chatSessionService.touchOnChat(UserContext.getUserId(), sessionId, knowledgeBaseId, question);
+        // Phase 1 长期记忆：在请求线程捕获用户 ID（响应式回调线程无法读取 ThreadLocal，落库需要）
+        Long currentUserId = UserContext.getUserId();
 
         // 0. 懒标记过期文档（TTL 到期的 SUCCESS/DEPRECATED 置为 EXPIRED），无需定时任务
         expireOverdueDocuments();
@@ -1528,7 +1555,10 @@ public abstract class KnowledgeDocumentService {
         // 1. Agent 化：不预检索注入上下文，由模型自主决定是否调用 searchKnowledge 工具；
         //    工具检索结果经 ToolContext 回调收集（模型可能多轮调用，各轮结果累积合并、编号全局唯一）
         AtomicReference<KnowledgeSearchService.SearchResult> toolSearchRef = new AtomicReference<>();
-        String systemPrompt = buildAgentSystemPrompt();
+        // Phase 1+2 长期记忆：注入跨会话历史摘要 + 用户级长期记忆（按本次问题语义召回），
+        // 让模型既"记得之前聊过什么"，也"记得这个人的偏好与事实"
+        String systemPrompt = appendMemoryContext(
+                appendHistoryContext(buildAgentSystemPrompt(), knowledgeBaseId), question);
 
         // 2.1 执行轨迹落库（agent_task / agent_task_step）：一次提问 = 一条任务，
         //     记录 LLM 实际输入 prompt（系统提示+问题）与模型名，支撑可观测性审计；
@@ -1587,6 +1617,8 @@ public abstract class KnowledgeDocumentService {
                             log.warn("Agent 任务完成落库失败：{}", e.getMessage());
                         }
                     }
+                    // Phase 1 长期记忆：会话摘要落库（userId 已在请求线程捕获）
+                    persistSessionMemory(currentUserId, sessionId, knowledgeBaseId);
                 })
                 .doOnError(ex -> {
                     if (taskId != null) {
@@ -1714,6 +1746,67 @@ public abstract class KnowledgeDocumentService {
     }
 
     // ===================== 辅助方法 =====================
+
+    /** Phase 1 长期记忆：把跨会话历史摘要追加进系统提示（失败/无历史时不改动原提示） */
+    private String appendHistoryContext(String systemPrompt, Long knowledgeBaseId) {
+        int limit = ragConfig.getMemory().getHistoryInjectLimit();
+        if (limit <= 0) {
+            return systemPrompt;
+        }
+        try {
+            String ctx = chatSessionMemoryService.buildHistoryContext(
+                    UserContext.getUserId(), knowledgeBaseId, limit);
+            if (ctx != null && !ctx.isBlank()) {
+                return (systemPrompt == null ? "" : systemPrompt) + "\n\n" + ctx;
+            }
+        } catch (Exception e) {
+            log.warn("历史会话摘要注入失败（忽略，继续正常问答）：{}", e.getMessage());
+        }
+        return systemPrompt;
+    }
+
+    /**
+     * Phase 2 长期记忆：按本次问题语义召回用户长期记忆并追加进系统提示。
+     * 快路径：该用户没有任何长期记忆（含 60s TTL 缓存）时直接跳过，不触发 embedding。
+     * 失败/无召回时原样返回 systemPrompt，不影响正常问答。
+     */
+    private String appendMemoryContext(String systemPrompt, String question) {
+        try {
+            RagConfigProperties.LongTerm longTerm = ragConfig.getMemory().getLongTerm();
+            if (longTerm == null || !longTerm.isEnabled() || longTerm.getInjectLimit() <= 0) {
+                return systemPrompt;
+            }
+            String ctx = memoryService.buildInjectionContext(UserContext.getUserId(), question,
+                    longTerm.getInjectLimit(), longTerm.getMinScore(), longTerm.getMaxChars());
+            if (ctx != null && !ctx.isBlank()) {
+                return (systemPrompt == null ? "" : systemPrompt) + "\n\n" + ctx;
+            }
+        } catch (Exception e) {
+            log.warn("用户长期记忆注入失败（忽略，继续正常问答）：{}", e.getMessage());
+        }
+        return systemPrompt;
+    }
+
+    /**
+     * Phase 1+2 长期记忆：会话结束后把 Redis 摘要持久化到 MySQL，
+     * 并调度用户级长期记忆的后台抽取（内部防抖 + 独立开关，均失败仅告警，不影响问答）。
+     */
+    private void persistSessionMemory(Long userId, String sessionId, Long knowledgeBaseId) {
+        // Phase 1：会话摘要落库（开关：rag.memory.history-persist-enabled）
+        if (ragConfig.getMemory().isHistoryPersistEnabled()) {
+            try {
+                chatSessionMemoryService.persistFromRedis(userId, sessionId, knowledgeBaseId);
+            } catch (Exception e) {
+                log.warn("会话长期记忆持久化失败（不影响问答）：{}", e.getMessage());
+            }
+        }
+        // Phase 2：调度用户级长期记忆后台抽取（失败不影响问答）
+        try {
+            memoryExtractionService.tryAutoExtract(userId, sessionId, knowledgeBaseId);
+        } catch (Exception e) {
+            log.warn("用户长期记忆后台抽取调度失败（不影响问答）：{}", e.getMessage());
+        }
+    }
 
     /**
      * 会话 ID 归一化：拼入当前用户 ID，记忆 key 形如 {@code rag:chat:memory:{userId}:{sessionId}}，
