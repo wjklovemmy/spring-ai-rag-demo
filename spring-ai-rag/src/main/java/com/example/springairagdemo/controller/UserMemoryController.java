@@ -17,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -56,11 +57,13 @@ public class UserMemoryController {
         MemoryService.SaveResult result = memoryService.save(userId, content,
                 request == null ? null : request.category(),
                 request == null ? null : request.importance(), "manual");
-        return ResponseEntity.ok(Map.of(
-                "success", result.id() != null,
-                "duplicate", result.duplicate(),
-                "message", result.message(),
-                "data", result.id() == null ? null : Map.of("id", result.id())));
+        // Map.of 不允许 null 值，data 可能为 null，需用 HashMap 构造
+        Map<String, Object> body = new HashMap<>();
+        body.put("success", result.id() != null);
+        body.put("duplicate", result.duplicate());
+        body.put("message", result.message());
+        body.put("data", result.id() == null ? null : Map.of("id", result.id()));
+        return ResponseEntity.ok(body);
     }
 
     /** 删除本人某条长期记忆（逻辑删除 + 同步删向量） */
@@ -119,7 +122,11 @@ public class UserMemoryController {
         MemoryExtractionService.AutoExtractResult result =
                 memoryExtractionService.latestAutoExtract(UserContext.getUserId());
         if (result == null || (after != null && result.finishedAtMs() <= after)) {
-            return ResponseEntity.ok(Map.of("success", true, "data", null));
+            // Map.of 不允许 null 值（data 为 null），需用 HashMap 构造
+            Map<String, Object> body = new HashMap<>();
+            body.put("success", true);
+            body.put("data", null);
+            return ResponseEntity.ok(body);
         }
         return ResponseEntity.ok(Map.of(
                 "success", true,

@@ -1,6 +1,6 @@
 server:
   # 外部统一入口（前端 API_BASE=http://localhost:7070 与其一致）
-  port: 7070
+  port: 7080
 
 spring:
   application:

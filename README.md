@@ -18,7 +18,8 @@
   - [3. 文档删除](#3-文档删除)
   - [4. 用户认证与授权（JWT + RBAC）](#4-用户认证与授权jwt--rbac)
   - [5. 聊天会话管理](#5-聊天会话管理)
-  - [6. Agent 升级问题与解决方案](#6-agent-升级问题与解决方案)
+  - [6. 用户长期记忆（跨会话 + 用户级）](#6-用户长期记忆跨会话--用户级)
+  - [7. Agent 升级问题与解决方案](#7-agent-升级问题与解决方案)
 - [数据库设计](#数据库设计)
 - [配置说明](#配置说明)
 - [快速开始](#快速开始)
@@ -40,7 +41,7 @@
 | 向量数据库 | Milvus 2.6.0（SDK `milvus-sdk-java` 2.6.23） | 向量存储 + **BM25 全文检索（Hybrid Search，RRF 融合）** |
 | 数据库 | MySQL 8.x + MyBatis-Plus 3.5.16 | 业务元数据 / 用户域 RBAC / chunk 文本持久化 |
 | 对象存储 | MinIO（docker `RELEASE.2024-12-18`） | 原始文档文件存储（唯一后端；已移除本地磁盘模式——多实例部署下文件须共享） |
-| 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史，**滑动窗口 + 摘要压缩**防无限增长（窗口为 **token 预算主控（max-tokens 16000，本地估算 ASCII 4字符/token、中文 1字符/token）+ 条数兜底（max-history 100）**，任一超限即把最老一批交给 DeepSeek 浓缩进摘要，读取返回「摘要 + 窗口原文」）；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；`RedisMemoryMonitor` 定时监控记忆膨胀（key 数/总占用超阈值告警 + 可选 Webhook）；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例 |
+| 会话记忆/管理 | Redis（`spring-boot-starter-data-redis` + Lettuce 连接池）+ MySQL `chat_session` 表 | **多轮对话记忆**（`RedisChatMemory` 实现 Spring AI `ChatMemory`，按 `{userId}:{sessionId}` 存取、用户隔离，TTL 7 天）承载消息历史，**滑动窗口 + 摘要压缩**防无限增长（窗口为 **token 预算主控（max-tokens 16000，本地估算 ASCII 4字符/token、中文 1字符/token）+ 条数兜底（max-history 100）**，任一超限即把最老一批交给 DeepSeek 浓缩进摘要，读取返回「摘要 + 窗口原文」）；**会话元数据**（标题/关联知识库/时间）落 MySQL `chat_session`，支撑会话列表/切换/删除；`RedisMemoryMonitor` 定时监控记忆膨胀（key 数/总占用超阈值告警 + 可选 Webhook）；sessionId 由后端生成；Redis 与网关 Token 黑名单、用户服务刷新令牌共用同一实例；**长期记忆双阶段**——Phase 1 会话摘要跨会话注入（MySQL `chat_session_memory`），Phase 2 用户级长期记忆（MySQL `user_long_term_memory` 文本 + Milvus 全局集合 `rag_user_memory` 向量，`saveMemory`/`searchMemory` 工具 + 问答前语义召回注入 + 会话后自动抽取沉淀） |
 | 异步消息 | RabbitMQ（`spring-boot-starter-amqp`，docker `3.13-management-alpine`） | **Embedding 任务异步执行**：上传/恢复/重试统一走 MQ（**Quorum 队列**持久化+高可用；**Publisher Confirm/Return** 保证生产者送达，Broker nack / 路由失败即标记任务失败；消费失败重试 3 次后进死信队列）；at-least-once 重复投递由任务状态预检 + claimTask CAS + 增量处理三重防护；`RabbitQueueMonitor` 定时监控队列深度，积压超阈值告警（ERROR 日志 + 可选 Webhook） |
 | 注册中心/配置中心 | Nacos 3.1.1（Spring Cloud Alibaba 2025.1.0.0） | 三服务统一注册（服务发现，网关路由用 `lb://服务名`）；公共密钥上收配置中心 `common.yaml`；配置存储使用**外部 MySQL（nacos_config 库）** |
 | 服务间调用 | OpenFeign 5.0.0（spring-cloud-starter-openfeign） | RAG ↔ 用户服务跨进程调用（`UserFeignClient` / `RagSyncFeignClient`，服务名经 Nacos 发现 + 负载均衡）；`X-Internal-Token` 由全局 RequestInterceptor 注入 |
@@ -88,6 +89,8 @@ graph TB
         TOOLS["KbQueryTools<br/>@Tool 文档清单/文件搜索<br/>+ CalculatorTool 计算"]
         SESSION["ChatSessionService<br/>会话列表/切换/删除"]
         MEM["RedisChatMemory<br/>ChatMemory 多轮记忆"]
+        UMEM["MemoryService<br/>用户长期记忆(Phase 2)<br/>saveMemory/searchMemory 工具"]
+        SESMEM["ChatSessionMemoryService<br/>跨会话摘要(Phase 1)"]
     end
 
     subgraph Storage["存储层"]
@@ -126,6 +129,11 @@ graph TB
     EMBED --> MILVUS
     SVC --> CHAT --> AI
     CHAT --> MEM --> REDIS
+    CHAT -.记忆注入.-> UMEM
+    CHAT -.跨会话背景.-> SESMEM
+    UMEM --> MYSQL
+    UMEM --> MILVUS
+    SESMEM --> MYSQL
     CHAT -.工具回调.-> TOOLS --> MYSQL
     SESSION --> MYSQL
     SESSION -.读/删记忆.-> MEM
@@ -185,6 +193,8 @@ spring-ai-rag-demo/
 │       │   ├── KnowledgeDocumentController.java # 上传/任务轮询/问答(SSE 流式+同步双模式)/删除/下载/清空记忆
 │       │   ├── ChatSessionController.java     # 聊天会话管理（创建/列表/消息/删除，历史消息引用来源回补）
 │       │   ├── AgentTaskController.java       # Agent 任务可观测性（列表/详情含步骤轨迹）
+│       │   ├── UserMemoryController.java      # 本人长期记忆管理（列表/新增/删除/改重要度/一键清除/手动沉淀/自动沉淀结果轮询）
+│       │   ├── MemoryAdminController.java     # 长期记忆全局概览（仅 ADMIN：统计 + 明细分页）
 │       │   └── InternalController.java        # /internal/kb/**（用户服务回调：删除校验/清理/审计）
 │       ├── security/                          # 防越权 + 本地身份上下文
 │       │   ├── KbRole.java                    # 知识库角色枚举 VIEWER < EDITOR < OWNER
@@ -205,9 +215,11 @@ spring-ai-rag-demo/
 │       │   ├── KbMemberEntity.java            # 知识库成员授权（数据权限）
 │       │   ├── KbAccessLogEntity.java         # 访问审计日志
 │       │   ├── ChatSessionEntity.java         # 聊天会话元数据（标题/关联知识库/时间）
+│       │   ├── ChatSessionMemoryEntity.java   # 会话长期记忆（跨会话摘要持久化，Phase 1）
+│       │   ├── UserLongTermMemoryEntity.java  # 用户长期记忆（个人事实/偏好，Phase 2）
 │       │   ├── AgentTaskEntity.java           # Agent 任务（一次提问的执行审计单元）
 │       │   └── AgentTaskStepEntity.java       # Agent 任务步骤（工具调用轨迹）
-│       ├── mapper/                            # MyBatis-Plus Mapper（业务表，含 ChatSessionMapper）
+│       ├── mapper/                            # MyBatis-Plus Mapper（业务表，含 ChatSessionMapper / ChatSessionMemoryMapper / UserLongTermMemoryMapper）
 │       ├── parser/
 │       │   ├── DocumentParser.java            # 解析接口
 │       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
@@ -220,7 +232,8 @@ spring-ai-rag-demo/
 │       │   └── RedisMemoryMonitor.java        # 记忆膨胀监控（@Scheduled SCAN rag:chat:memory:* + MEMORY USAGE，key 数/总占用超阈值告警 + Webhook，去抖）
 │       ├── tools/
 │       │   ├── KbQueryTools.java              # 知识库查询工具集（@Tool：listDocuments / searchDocuments / documentOutline / searchKnowledge 壳）
-│       │   └── CalculatorTool.java            # 通用计算工具（@Tool：calculate，受限表达式安全求值：+ - * / ( ) ^ %）
+│       │   ├── CalculatorTool.java            # 通用计算工具（@Tool：calculate，受限表达式安全求值：+ - * / ( ) ^ %）
+│       │   └── MemoryTools.java               # 用户长期记忆工具（@Tool：saveMemory 保存 / searchMemory 查询，经 ToolContext 取 userId）
 │       ├── feign/                             # 跨服务调用用户服务
 │       │   ├── UserFeignClient.java           # /internal/users/**（isAdmin / 用户摘要）
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
@@ -241,6 +254,12 @@ spring-ai-rag-demo/
 │           ├── KbAuthorizationService.java        # 权限判定中枢（assertRole/visibleKbIds/授权）
 │           ├── KbMemberService.java / KbAccessLogService.java
 │           ├── ChatSessionService.java / ChatSessionServiceImpl.java # 会话元数据（MySQL）+ 消息联动（创建/列表/消息/删除）
+│           ├── ChatSessionMemoryService.java / impl/            # Phase 1 会话长期记忆：问答后摘要落库 + 新会话注入「过往对话背景」
+│           ├── MemoryService.java                 # Phase 2 用户长期记忆领域服务：语义去重保存（分段锁）/召回/buildInjectionContext/删除（MySQL + Milvus 组合，异常不外抛）
+│           ├── MemoryVectorService.java           # 用户记忆向量库（Milvus 全局集合 rag_user_memory，userId 标量过滤 + 余弦召回）
+│           ├── MemoryExtractionService.java       # 会话后自动抽取沉淀（后台单线程 + 用户级防抖，DeepSeek 输出 JSON，ai-chat 熔断保护）
+│           ├── MemoryVectorSyncTask.java          # 记忆向量后台补偿（vector_status=0 的记忆定期重试向量化，限批量防打满）
+│           ├── UserLongTermMemoryService.java / impl/ # 用户长期记忆表 CRUD + 管理端统计/分页
 │           ├── KbMemberDeletionGuard.java         # 删用户前最后所有者保护 + 清理 kb_member
 │           ├── KbAccessLogAuditHandler.java       # 管理操作审计落库 kb_access_log
 │           ├── UserClient.java                    # 远程查用户服务：isAdmin / 用户摘要
@@ -376,6 +395,10 @@ spring-ai-rag-demo/
   │       滑动窗口：存储总 token（本地估算）超 max-tokens(16000) 或条数超 max-history(100)+batch(20) 时，
   │       最老一批由 ConversationSummarizer 浓缩进摘要，读取返回「摘要 + 窗口原文」，TTL 7 天）注入 prompt，实现多轮上下文连贯；
   │       · system 提示与工具产生的 Tool 消息均不落库（避免污染记忆）；「清空对话」= 后端删 Redis 记忆 + 前端清空消息
+  │       · 跨会话背景（Phase 1）：按用户（同知识库优先）取最近 N 条历史会话摘要（chat_session_memory）
+  │         拼「过往对话背景」注入系统提示——新会话也"记得之前聊过什么"（见第 6 节）
+  │       · 用户长期记忆（Phase 2）：按本次问题语义召回该用户的长期记忆（Milvus rag_user_memory，
+  │         userId 过滤 + 余弦阈值），拼【用户长期记忆】注入系统提示（见第 6 节）
   │
   ├─ ② 模型推理    Agent 系统提示词（buildAgentSystemPrompt）强约束：
   │       · 知识类问题必须先调用 searchKnowledge 工具检索，再严格基于 [来源N] 片段逐字引用回答
@@ -589,7 +612,44 @@ spring-ai-rag-demo/
 
 ---
 
-### 6. Agent 升级问题与解决方案
+### 6. 用户长期记忆（跨会话 + 用户级）
+
+多轮对话记忆（Redis，TTL 7 天）只解决"单会话内上下文连贯"，本模块解决"跨会话记得用户"，分两阶段：
+
+**Phase 1 — 会话长期记忆（跨会话情景记忆，`chat_session_memory` 表）**
+
+- **写入**：每轮问答结束后（`finally` 中，不阻塞问答）读取 Redis 记忆快照，有摘要用摘要、无摘要取最近几轮对话原文拼「会话要点」，按 `user_id + session_id` upsert；
+- **读取**：新会话问答开始时，按用户（**同知识库优先**）按更新时间倒序取最近 `history-inject-limit`（默认 5）条摘要，拼「过往对话背景」注入系统提示（总长 2000 字符上限）；
+- **删除**：删除会话时级联逻辑删除本表记录，防已删会话摘要继续被注入。
+
+**Phase 2 — 用户级长期记忆（个人事实/偏好/经历，`user_long_term_memory` 表 + Milvus `rag_user_memory` 集合）**
+
+文本存 MySQL（数据源），向量存 Milvus 全局集合（主键 = MySQL 记忆 id，userId 标量字段做用户隔离），由 `MemoryService` 统一编排（所有异常不外抛，降级为"无记忆/未保存"，不影响主问答链路）：
+
+```
+写入路径（三条入口，全部经 save 语义去重：与已有记忆余弦相似度 ≥0.95 视为重复不落库；
+          同用户分段锁（256 段）串行化，消除并发判重竞态）
+  ├─ Agent 工具：saveMemory    模型在用户透露稳定个人事实/偏好时自主调用（@Tool，ToolContext 取 userId）
+  ├─ 手动接口：POST /api/memory  用户在「记忆」页手工新增
+  └─ 自动抽取：会话问答结束后后台单线程执行（rag.memory.long-term.auto-extract-*）
+        · 用户级防抖：同一用户 30 分钟内不重复抽取
+        · 输入 = Redis 近期对话原文（摘要 + 窗口，4000 字符上限）
+        · DeepSeek 输出 JSON 列表（fact/preference/interest/goal/event + importance 1-10）
+        · 受 ai-chat 熔断保护；最近一次结果缓存，供前端轮询 /api/memory/auto-extract-result 提醒
+```
+
+- **问答注入**：每次问答按本次问题向量召回该用户记忆（userId 过滤 + 余弦阈值 0.3，最多 5 条、1600 字符），拼【用户长期记忆】注入系统提示；无记忆（60s 计数缓存快路径）连 embedding 都省掉；
+- **searchMemory 工具**：模型可按主题主动查询用户记忆（单次最多 8 条），支撑"我上次提过什么要求"类指代问题；
+- **向量补偿**：embedding 临时不可用时记忆降级为仅文本落库（`vector_status=0`），`MemoryVectorSyncTask` 定期（60s）批量重试向量化入库（每轮上限 20 条，防打满/触发熔断）；
+- **防膨胀**：单用户记忆条数上限 `max-per-user`（默认 500），达到后自动抽取跳过、工具保存拒绝；
+- **管理端**：`/api/memory/admin`（仅 ADMIN，远程判定经用户服务）全站记忆统计 + 明细分页（补全用户名/昵称，用户服务不可用降级显示 userId）；
+- **个人中心**：本人记忆列表/过滤/新增/改重要度/删除/一键清除/手动触发沉淀（`/api/memory/**`，严格限定当前登录用户）。
+
+> 对应代码：`service/MemoryService`（编排 + 去重 + 分段锁）、`service/MemoryVectorService`（Milvus）、`service/MemoryExtractionService`（自动抽取）、`service/MemoryVectorSyncTask`（补偿）、`service/ChatSessionMemoryService`（Phase 1）、`tools/MemoryTools`（saveMemory/searchMemory）、`controller/UserMemoryController` / `MemoryAdminController`、`KnowledgeDocumentService`（问答注入 + 问答后 persist/extract 调度）。
+
+---
+
+### 7. Agent 升级问题与解决方案
 
 Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `agent_task_step`）与会话管理在升级过程中遇到的问题及对应解法：
 
@@ -623,7 +683,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 另外 **Nacos 配置中心**也使用同一 MySQL 实例中的 `nacos_config` 库存储配置（见 [快速开始](#快速开始) 第 1 步）。
 
 初始化脚本（均幂等，需手动在 MySQL 各执行一次）：
-- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session` / `agent_task` / `agent_task_step`。
+- `sql/init.sql` — RAG 业务库：`knowledge_base` / `knowledge_document` / `knowledge_chunk` / `knowledge_embedding_task` / `kb_member` / `kb_access_log` / `chat_session` / `chat_session_memory` / `user_long_term_memory` / `agent_task` / `agent_task_step`。
 - `sql/migration_agent_logic_delete.sql` — 已按旧版 init.sql 初始化的库升级用：为 `chat_session` / `agent_task` / `agent_task_step` 补充逻辑删除字段（新装库执行 init.sql 即可，无需本脚本）。
 - `sql/migration_parent_child.sql` — **Parent-Child 检索升级用**：为已存在的 `knowledge_chunk` 补充 `parent_id` 列、`idx_parent_id` 索引，并将唯一索引扩展为 `(document_id, chunk_index, parent_id)`（新装库执行 init.sql 即可，无需本脚本）。
 - `sql/user.sql` — 用户域独立库：`sys_user` / `sys_role` / `sys_permission` / `sys_user_role` / `sys_role_permission`，以及内置 `ADMIN` 角色、6 个权限种子、`admin` 账号与绑定关系。
@@ -643,6 +703,8 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `kb_member` | 知识库成员授权（数据权限） | knowledge_id、user_id、role(VIEWER/EDITOR/OWNER)、create_time |
 | `kb_access_log` | 访问审计日志 | user_id、knowledge_id、action、ip、create_time |
 | `chat_session` | 聊天会话元数据 | user_id、session_id(后端 UUID 唯一，`uk_user_session`)、title(首个问题截断 30 字)、knowledge_base_id、create_time/update_time、**deleted/deleted_by/delete_time(逻辑删除审计)** |
+| `chat_session_memory` | 会话长期记忆（Phase 1，跨会话摘要） | user_id、session_id(`uk_user_session` 联合唯一)、knowledge_base_id、summary(摘要压缩产物或最近对话要点)、create_time/update_time、deleted/deleted_by/delete_time(随会话删除置 1) |
+| `user_long_term_memory` | 用户长期记忆（Phase 2，个人事实/偏好跨会话持久） | user_id、content(TEXT 一条=一个事实)、category(fact/preference/interest/goal/event)、importance(1-10)、source_session(来源会话)、**vector_status(0 待同步/1 已同步，补偿任务据此重试)**、deleted/deleted_by/delete_time；向量存 Milvus 集合 `rag_user_memory`（userId 标量过滤） |
 | `agent_task` | Agent 任务（一次提问的执行审计单元，可观测性） | user_id、session_id、kb_id、question、answer(LONGTEXT)、sources(引用来源 JSON)、prompt(LLM 实际输入)、model、prompt_tokens/completion_tokens/total_tokens、status(0执行中/1成功/2失败)、tool_count、cost_ms、error_msg、start_ms、create_time/finish_time、**deleted/deleted_by/delete_time(随会话删除置 1)** |
 | `agent_task_step` | Agent 任务步骤轨迹（工具调用过程） | task_id、type(TOOL_CALL)、tool_name、status(running/done/error)、args、result、latency_ms(该步耗时)、create_time、**deleted/deleted_by/delete_time(随任务删除置 1)** |
 
@@ -684,7 +746,8 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `rag.rerank.*` | 重排序：enabled / model(`gte-rerank-v2`) / candidate-top-k(20) / top-n(5) / threshold(0.3) / fallback-on-error |
 | `rag.hybrid.*` | 混合检索：enabled / route-top-k(40) / min-score(0) / rrf-k(60) / fallback-on-error |
 | `rag.mq-monitor.*` | **RabbitMQ 队列积压监控**：enabled / interval-ms(30000) / ready-threshold(50) / management-url(`http://localhost:15672`) / username / password / webhook-url（企业微信/钉钉/飞书机器人，留空仅 ERROR 日志）。`RabbitQueueMonitor` 定时轮询 Management API，Ready 数超阈值判定积压并告警（持续积压去抖只告警一次，恢复自动解除） |
-| `rag.memory.*` | **对话记忆滑动窗口 + 摘要压缩**：summary-enabled(true，false 则仅纯裁剪不消耗 LLM) / **max-tokens(16000，token 预算主控**——历史总 token 估算上限，本地近似 ASCII 4字符/token、中文 1字符/token；建议按模型上下文 1/4~1/3 预留，DeepSeek 64K → 16000**) / max-history(100，条数兜底**——最多保留/返回给模型的消息条数，防单条过小时窗口无限拉长) / summary-batch-size(20，总 token 超 max-tokens 或条数超 max-history+batch 时把最老 batch 条压缩进摘要，每 batch 轮触发一次额外 DeepSeek 调用) |
+| `rag.memory.*` | **对话记忆滑动窗口 + 摘要压缩**：summary-enabled(true，false 则仅纯裁剪不消耗 LLM) / **max-tokens(16000，token 预算主控**——历史总 token 估算上限，本地近似 ASCII 4字符/token、中文 1字符/token；建议按模型上下文 1/4~1/3 预留，DeepSeek 64K → 16000**) / max-history(100，条数兜底**——最多保留/返回给模型的消息条数，防单条过小时窗口无限拉长) / summary-batch-size(20，总 token 超 max-tokens 或条数超 max-history+batch 时把最老 batch 条压缩进摘要，每 batch 轮触发一次额外 DeepSeek 调用)；**长期记忆**：history-persist-enabled(true，问答后摘要落 MySQL chat_session_memory) / history-inject-limit(5，新会话注入历史会话摘要条数，0 关闭) / fallback-last-turns(6，无摘要时取最近 N 轮原文做会话要点) |
+| `rag.memory.long-term.*` | **用户级长期记忆（Phase 2）**：enabled(true 总开关，控制工具注册+注入+自动抽取) / collection-name(`rag_user_memory`，Milvus 全局集合) / inject-limit(5，每次问答召回注入条数，≤0 关闭) / max-chars(1600，注入文本字符上限) / min-score(0.3，召回余弦阈值) / search-top-k(8，searchMemory 单次召回上限) / dedupe-threshold(0.95，保存语义判重阈值) / max-per-user(500，单用户记忆条数上限) / auto-extract-enabled(true，会话后自动抽取) / auto-extract-interval-minutes(30，用户级防抖) / extract-max-chars(4000，抽取输入上限) / extract-max-facts(6，单次抽取条数上限) / vector-sync-enabled(true，向量补偿) / vector-sync-interval-ms(60000) / vector-sync-batch-size(20) |
 | `rag.memory-monitor.*` | **记忆膨胀监控**：enabled(true) / interval-ms(60000) / key-count-threshold(10000) / total-bytes-threshold(268435456=256MB) / webhook-url。`RedisMemoryMonitor` 定时 SCAN `rag:chat:memory:*` + MEMORY USAGE 汇总，key 数或总占用超阈值告警（ERROR 日志 + 可选 Webhook，去抖只告警一次，恢复自动解除） |
 | `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
 | `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
@@ -1296,6 +1359,15 @@ npm run build        # 生产构建，产物在 dist/
 | GET | `/api/chat-session/list` | 是 | 当前用户会话列表（按最近更新倒序） |
 | GET | `/api/chat-session/{sessionId}/messages` | 是 | 拉取指定会话历史消息（仅本人会话，归属校验 404） |
 | DELETE | `/api/chat-session/{sessionId}` | 是 | 删除会话：MySQL 元数据 + Redis 记忆联动清除 |
+| GET | `/api/memory/list` | 是 | 本人长期记忆列表（可选 `category`/`limit`） |
+| POST | `/api/memory` | 是 | 手工新增一条长期记忆（body `{content, category?, importance?}`，语义去重） |
+| PUT | `/api/memory/{id}` | 是 | 修改本人记忆重要度（body `{importance: 1-10}`，同步重写向量元数据） |
+| DELETE | `/api/memory/{id}` | 是 | 删除本人某条记忆（逻辑删除 + 同步删向量） |
+| DELETE | `/api/memory` | 是 | 一键清除本人全部长期记忆（逻辑删除 + 删全部向量） |
+| POST | `/api/memory/extract` | 是 | 手动触发"近期会话沉淀为长期记忆"（同步执行，返回新增条数） |
+| GET | `/api/memory/auto-extract-result` | 是 | 最近一次自动沉淀结果（聊天页轮询提醒；可选 `after` 毫秒时间戳过滤旧结果，无结果返回 `data: null`） |
+| GET | `/api/memory/admin/stats` | 是 | 全站记忆统计概览（需 ADMIN） |
+| GET | `/api/memory/admin/list` | 是 | 全站记忆明细分页（需 ADMIN，可选 `userId`/`category`/`keyword`/`page`/`size`，补全用户名/昵称） |
 | DELETE | `/api/knowledge-document/{id}` | 是 | 删除文档（需 EDITOR，对象级校验） |
 | GET | `/api/knowledge-document/{id}/download` | 是 | 下载原始文件（需 VIEWER，对象级校验） |
 | GET | `/api/knowledge-document/list` | 是 | 文档列表（按可见知识库过滤，含 statusText/version/进度等） |
@@ -1340,3 +1412,4 @@ npm run build        # 生产构建，产物在 dist/
 21. **工具调用（Function Calling）实现 Agentic RAG**：文档名等元数据不在 chunk 正文，纯向量检索回答不了"知识库中有哪些文档""有没有某份文档"等枚举问题。将查询能力注册为 Spring AI `@Tool`（`tools/KbQueryTools`：`listDocuments` / `searchDocuments` / `documentOutline` + `searchKnowledge` 委托壳），问答不再预检索注入上下文，由模型自主决定何时检索——知识类问题先调用 `searchKnowledge`（检索链路收敛于 `RagRetrievalService` 组件 + `KnowledgeSearchService`：显式文档解析→Hybrid 召回→过滤→Rerank→[来源N]上下文组装→编号累积合并），再严格基于工具返回片段逐字引用回答；澄清/寒暄/告知无信息类问题不检索、不下发来源。服务层**不兜底检索**（检索决策完全交给模型）。工具回调线程不在请求线程内，userId/kbId 经 `ToolContext` 显式传递，回调内用显式 userId 版 `canAccess` 校验 VIEWER 权限，防越权不失效；Bean 命名上工具类为 `@Component`、装配方法独立命名避免与 `@Bean` 重名冲突。
 22. **会话管理闭环（MySQL 元数据 + Redis 消息）**：sessionId 由**后端生成**（UUID），`chat_session` 表（MySQL）存会话标题/关联知识库/时间，消息历史仍在 Redis；创建/列表/消息/删除 4 个接口 + 问答入口 `touchOnChat` 对未知 ID 自动补建，删除会话时 MySQL 与 Redis **联动清除**；所有操作按 userId 归属隔离，**重新登录后原会话仍可找回并继续问答**；「清空对话」走后端 clear-memory 接口删 Redis 记忆（会话记录保留）。
 23. **Agent 可观测性（执行轨迹 + 引用来源快照）**：一次提问 = 一条 `agent_task`（question/answer/prompt/model/token 用量/耗时/状态），工具调用每步落一条 `agent_task_step`（工具名/状态/入参/结果/耗时）；同步、流式与熔断降级链路均落库，落库失败不阻塞问答仅告警。引用来源 JSON 快照进 `agent_task.sources`——Redis 记忆只存纯文本，`GET /api/chat-session/{sessionId}/messages` 据此按序回补历史消息的 sources，刷新页面引用来源不丢失。前端「Agent 轨迹」页（`AgentTasksTab.vue` / `AgentTaskDetailModal.vue`）按任务维度查看执行过程与引用来源。
+24. **跨会话长期记忆双阶段（记忆分层存储）**：在"单会话 Redis 记忆（热，TTL 7 天）"之上叠两层持久记忆——**Phase 1 会话摘要**（`chat_session_memory`，问答后异步落库、新会话按用户同库优先注入，解决"换会话就不记得"）；**Phase 2 用户级长期记忆**（MySQL 文本 + Milvus 向量双写，`saveMemory`/`searchMemory` 工具 + 问答前语义召回注入 + 会话后 LLM 自动抽取三入口，语义去重 0.95 + 256 段分段锁防并发重复，向量失败文本兜底 + 后台补偿同步，单用户条数上限防膨胀）。整条记忆链路**异常零外抛**（降级为"无记忆/未保存"并告警），绝不影响主问答链路；所有注入均有条数/字符/相似度上限，防止记忆本身挤爆上下文。
