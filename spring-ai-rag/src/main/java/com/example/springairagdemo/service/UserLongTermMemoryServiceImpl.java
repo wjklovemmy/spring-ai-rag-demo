@@ -11,10 +11,13 @@ import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.Collection;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * 用户长期记忆 MySQL 层实现（Phase 2）
@@ -95,6 +98,20 @@ public class UserLongTermMemoryServiceImpl extends ServiceImpl<UserLongTermMemor
                 .orderByAsc(UserLongTermMemoryEntity::getId)
                 .last("LIMIT " + Math.min(limit, 200))
                 .list();
+    }
+
+    @Override
+    public Set<Long> filterExistingIds(Long userId, Collection<Long> memoryIds) {
+        if (userId == null || memoryIds == null || memoryIds.isEmpty()) {
+            return Set.of();
+        }
+        // deleted 由 @TableLogic 自动附加 deleted=0，已逻辑删除的 id 不会返回
+        return lambdaQuery()
+                .eq(UserLongTermMemoryEntity::getUserId, userId)
+                .in(UserLongTermMemoryEntity::getId, memoryIds)
+                .list().stream()
+                .map(UserLongTermMemoryEntity::getId)
+                .collect(Collectors.toSet());
     }
 
     @Override

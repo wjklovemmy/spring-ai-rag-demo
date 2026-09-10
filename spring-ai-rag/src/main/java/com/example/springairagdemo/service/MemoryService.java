@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -125,18 +126,37 @@ public class MemoryService {
         // 同一用户并发保存（后台自动抽取 × 手动沉淀/工具保存）在用户级分段锁内串行化，
         // 避免"两线程同时判重未命中 → 同内容重复落库 + 重复向量"
         synchronized (saveLock(userId)) {
+            // ① 向量化（失败降级为仅文本落库，不影响保存）
+            float[] vector = null;
             try {
-                float[] vector = memoryVectorService.embed(text);
-                List<MemoryVectorService.MemoryVectorHit> duplicates =
-                        memoryVectorService.searchByVector(userId, vector, 1, lt.getDedupeThreshold());
-                if (!duplicates.isEmpty()) {
-                    MemoryVectorService.MemoryVectorHit hit = duplicates.get(0);
-                    if (hit.id() != null) {
-                        log.debug("用户长期记忆去重命中，跳过新增: userId={}, memoryId={}", userId, hit.id());
-                        return new SaveResult(hit.id(), true, "该记忆已存在（id=" + hit.id() + "），未重复保存");
-                    }
+                vector = memoryVectorService.embed(text);
+            } catch (Exception e) {
+                log.warn("长期记忆 embedding 暂不可用，仅文本落库（vector_status=0，后台补偿任务会自动重试向量化）: {}", e.getMessage());
+            }
+            // ② 语义判重（仅向量化成功时有意义；判重失败跳过判重直接落库，宁可冗余不可丢失）
+            if (vector != null) {
+                List<MemoryVectorService.MemoryVectorHit> duplicates = List.of();
+                try {
+                    duplicates = memoryVectorService.searchByVector(userId, vector, 1, lt.getDedupeThreshold());
+                    duplicates = filterExisting(duplicates, userId);
+                } catch (Exception e) {
+                    log.warn("长期记忆语义判重失败（跳过判重直接落库）: userId={}, err={}", userId, e.getMessage());
                 }
+                if (!duplicates.isEmpty() && duplicates.get(0).id() != null) {
+                    Long existId = duplicates.get(0).id();
+                    log.debug("用户长期记忆去重命中，跳过新增: userId={}, memoryId={}", userId, existId);
+                    return new SaveResult(existId, true, "该记忆已存在（id=" + existId + "），未重复保存");
+                }
+            }
+            // ③ MySQL 落库（独立处理失败：不重试、不误标为 embedding 问题，失败向上返回错误提示）
+            try {
                 userLongTermMemoryService.save(entity);
+            } catch (Exception e) {
+                log.error("长期记忆落库失败: userId={}, err={}", userId, e.getMessage(), e);
+                return new SaveResult(null, false, "保存失败，请稍后重试");
+            }
+            // ④ 向量 upsert（失败仅告警，vector_status=0 交由后台补偿任务补齐）
+            if (vector != null) {
                 try {
                     memoryVectorService.upsertWithVector(entity.getId(), userId, text, normalizedCategory,
                             normalizedImportance, vector);
@@ -144,32 +164,48 @@ public class MemoryService {
                 } catch (Exception e) {
                     log.warn("长期记忆向量写入失败（文本已落库 vector_status=0，将由后台补偿任务自动同步向量）: {}", e.getMessage());
                 }
-                countCache.remove(userId);
-                return new SaveResult(entity.getId(), false, "已记住：" + text);
-            } catch (Exception e) {
-                log.warn("长期记忆 embedding 暂不可用，仅文本落库（vector_status=0，后台补偿任务会自动重试向量化）: {}", e.getMessage());
-                userLongTermMemoryService.save(entity);
-                countCache.remove(userId);
-                return new SaveResult(entity.getId(), false, "已记住：" + text);
             }
+            countCache.remove(userId);
+            return new SaveResult(entity.getId(), false, "已记住：" + text);
         }
     }
 
     /**
      * 按用户 + 查询文本召回记忆（userId 过滤 + 余弦阈值），失败/无结果返回空列表。
+     * 召回后按 MySQL 存在性复核，剔除已逻辑删除但向量删除失败残留的记忆。
      */
     public List<MemoryHit> search(Long userId, String query, int topK, double minScore) {
         if (userId == null || query == null || query.isBlank() || topK <= 0) {
             return List.of();
         }
         try {
-            return memoryVectorService.search(userId, query, topK, minScore).stream()
+            List<MemoryVectorService.MemoryVectorHit> hits = memoryVectorService.search(userId, query, topK, minScore);
+            return filterExisting(hits, userId).stream()
                     .map(hit -> new MemoryHit(hit.id(), hit.content(), hit.category(), hit.importance(), hit.score()))
                     .toList();
         } catch (Exception e) {
             log.warn("用户长期记忆向量检索失败（按无记忆处理）: {}", e.getMessage());
             return List.of();
         }
+    }
+
+    /**
+     * 剔除已逻辑删除但 Milvus 向量删除失败残留的命中：按 MySQL 存在性复核 id。
+     * 调用方需保证在 try 内（MySQL 查询失败会抛出，由调用方降级处理）。
+     */
+    private List<MemoryVectorService.MemoryVectorHit> filterExisting(
+            List<MemoryVectorService.MemoryVectorHit> hits, Long userId) {
+        if (hits.isEmpty()) {
+            return hits;
+        }
+        List<Long> ids = hits.stream()
+                .map(MemoryVectorService.MemoryVectorHit::id)
+                .filter(Objects::nonNull)
+                .toList();
+        Set<Long> existing = ids.isEmpty() ? Set.of() : userLongTermMemoryService.filterExistingIds(userId, ids);
+        return hits.stream()
+                .filter(hit -> hit.id() != null && existing.contains(hit.id()))
+                .toList();
     }
 
     /**

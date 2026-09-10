@@ -3,8 +3,10 @@ package com.example.springairagdemo.service;
 import com.baomidou.mybatisplus.extension.service.IService;
 import com.example.springairagdemo.entity.UserLongTermMemoryEntity;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 用户长期记忆 MySQL 层 Service（Phase 2）：文本数据源的增删查。
@@ -28,6 +30,12 @@ public interface UserLongTermMemoryService extends IService<UserLongTermMemoryEn
 
     /** 取待向量补偿的记录（vector_status=0，不含逻辑删除），按更新时间升序，最多 limit 条 */
     List<UserLongTermMemoryEntity> listPendingVectorSync(int limit);
+
+    /**
+     * 过滤出给定记忆 id 中仍有效（未逻辑删除、属于该用户）的 id 集合。
+     * 用于剔除 Milvus 向量删除失败产生的残留（向量召回/判重时按 MySQL 存在性复核）。
+     */
+    Set<Long> filterExistingIds(Long userId, Collection<Long> memoryIds);
 
     /** 管理员维度统计（不分用户）：总数 / 今日新增 / 近 7 日新增 / 待向量条数 / 有记忆用户数 / 类别分布 */
     Map<String, Object> adminStats();
