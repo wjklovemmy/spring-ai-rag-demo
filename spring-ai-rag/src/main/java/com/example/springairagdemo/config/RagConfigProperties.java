@@ -21,7 +21,7 @@ public class RagConfigProperties {
     /** 召回重排序（Rerank）配置 */
     private Rerank rerank = new Rerank();
 
-    /** OCR（扫描版 PDF 文字识别）配置 */
+    /** OCR（扫描版 PDF / Word 内嵌图片文字识别）配置 */
     private Ocr ocr = new Ocr();
 
     /** 混合检索（Hybrid Search：Dense 向量 + BM25 全文检索 + RRF 融合）配置 */
@@ -71,7 +71,7 @@ public class RagConfigProperties {
 
     @Data
     public static class Ocr {
-        /** 是否启用 OCR（扫描版 PDF 无文本层时自动识别） */
+        /** 是否启用 OCR（扫描版 PDF 无文本层 / Word 内嵌图片自动识别） */
         private boolean enabled = false;
         /** OCR 服务地域，如 cn-hangzhou */
         private String regionId = "cn-hangzhou";
@@ -85,6 +85,10 @@ public class RagConfigProperties {
         private int minTextLength = 20;
         /** 单页 OCR 失败时是否抛异常中断解析（false=记日志并跳过该页） */
         private boolean failOnError = false;
+        /** Word 单篇文档最多 OCR 的图片数：内嵌图片可能极多（图标/截图），限流防调用与费用失控 */
+        private int wordMaxImages = 50;
+        /** Word 图片短边小于该像素值视为图标/装饰图，不做 OCR */
+        private int wordMinImageSide = 80;
     }
 
     @Data

@@ -67,6 +67,15 @@ public class KnowledgeDocumentController {
     private final KbAuthorizationService kbAuthorizationService;
     private final KnowledgeEmbeddingTaskService knowledgeEmbeddingTaskService;
 
+    /** 上传白名单：支持的文档格式（与各 DocumentParser 实现的 supports 保持一致） */
+    private static final List<String> SUPPORTED_EXTENSIONS = List.of("pdf", "docx", "doc");
+
+    /** 下载响应的 MIME 类型（未命中回退二进制流） */
+    private static final Map<String, String> CONTENT_TYPES = Map.of(
+            "pdf", "application/pdf",
+            "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "doc", "application/msword");
+
     /**
      * 上传文档文件并建立知识库索引（需要 EDITOR 及以上）
      *
@@ -81,13 +90,13 @@ public class KnowledgeDocumentController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "上传文件为空"));
         }
 
-        // 校验文件格式（仅支持 PDF）
+        // 校验文件格式（pdf / docx / doc）
         String originalFilename = file.getOriginalFilename();
         String extension = getFileExtension(originalFilename);
-        if (!"pdf".equals(extension)) {
+        if (extension == null || !SUPPORTED_EXTENSIONS.contains(extension)) {
             return ResponseEntity.badRequest().body(Map.of(
                     "success", false,
-                    "message", "不支持的文件格式，仅支持: pdf"
+                    "message", "不支持的文件格式，仅支持: " + String.join("、", SUPPORTED_EXTENSIONS)
             ));
         }
 
@@ -498,11 +507,9 @@ public class KnowledgeDocumentController {
             }
 
             String fileName = doc.getFileName();
-            String contentType = "application/pdf";
-            if (fileName != null && fileName.contains(".")) {
-                String ext = fileName.substring(fileName.lastIndexOf('.') + 1).toLowerCase();
-                if (!"pdf".equals(ext)) contentType = "application/octet-stream";
-            }
+            String ext = getFileExtension(fileName);
+            String contentType = ext == null ? "application/octet-stream"
+                    : CONTENT_TYPES.getOrDefault(ext, "application/octet-stream");
 
             InputStream inputStream = fileStorageService.getInputStream(objectName);
             InputStreamResource resource = new InputStreamResource(inputStream);

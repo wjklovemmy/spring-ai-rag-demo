@@ -16,6 +16,7 @@ import java.util.regex.Pattern;
  * <p>
  * 识别规则（启发式）：
  * <ol>
+ *   <li>Markdown 标题：{@code # 标题}、{@code ## 标题}（Word 标题样式段落由解析器转换而来），深度 = # 个数；</li>
  *   <li>数字序号标题：{@code 1. 概述}、{@code 3.2.1 考勤}，深度 = 序号层级；</li>
  *   <li>中文序数标题：{@code 第一章}、{@code 第三节}、{@code 第五条}，深度 = 1/2/3；</li>
  *   <li>中文数字序数标题：{@code 一、项目概述}、{@code 十一、系统优化方向}、{@code （一）xxx}，
@@ -26,6 +27,8 @@ import java.util.regex.Pattern;
 @Component
 public class HeadingExtractor {
 
+    /** Markdown 标题：# / ## / ###（Word 标题样式转换产物，优先级最高，行内含标点也视为标题） */
+    private static final Pattern MD_PATTERN = Pattern.compile("^\\s*(#{1,6})\\s+(.+)$");
     /** 数字序号：1、1.1、3.2.1，后跟 空格/点/顿号/冒号 等 */
     private static final Pattern NUM_PATTERN = Pattern.compile(
             "^\\s*(\\d+(?:\\.\\d+)*)\\s*[.、．:：)）]?\\s*");
@@ -80,7 +83,9 @@ public class HeadingExtractor {
             while (!stack.isEmpty() && stack.peek().depth() >= finalDepth) {
                 stack.pop();
             }
-            stack.push(new HeadingLine(lineStart, finalDepth, line, ""));
+            // Markdown 标题前缀（#）仅用于标识层级，标题链中只保留纯标题文本
+            String title = stripMdMarker(line);
+            stack.push(new HeadingLine(lineStart, finalDepth, title, ""));
 
             // 构建完整链（栈内仅依赖 title/depth，实时计算）
             List<String> chainParts = new ArrayList<>();
@@ -101,6 +106,13 @@ public class HeadingExtractor {
         if (line.isEmpty() || line.length() > cfg.getMaxLength() || line.length() < 2) {
             return null;
         }
+
+        // Markdown 标题（Word 标题样式段落转换而来）：'#' 前缀是明确信号，优先判定
+        Matcher md = MD_PATTERN.matcher(line);
+        if (md.matches()) {
+            return Math.min(md.group(1).length(), cfg.getMaxDepth());
+        }
+
         if (EOL_PUNCT.matcher(line).find()) {
             return null;
         }
@@ -139,6 +151,12 @@ public class HeadingExtractor {
             return -1;
         }
         return null;
+    }
+
+    /** 去掉 Markdown 标题的 '#' 标记，返回纯标题文本（非 Markdown 标题原样返回） */
+    private String stripMdMarker(String line) {
+        Matcher md = MD_PATTERN.matcher(line);
+        return md.matches() ? md.group(2).strip() : line;
     }
 
     private boolean containsCjk(String s) {

@@ -1,6 +1,6 @@
 <template>
   <div class="card">
-    <div class="card-title">上传 PDF 文档</div>
+    <div class="card-title">上传文档</div>
 
     <div class="form-row" style="margin-bottom: 16px;">
       <div style="flex: 1; min-width: 240px;">
@@ -11,7 +11,7 @@
         </select>
       </div>
       <div style="display: flex; align-items: flex-end;">
-        <input type="file" ref="fileInput" accept=".pdf" style="display: none" @change="onFileChange">
+        <input type="file" ref="fileInput" accept=".pdf,.docx,.doc" style="display: none" @change="onFileChange">
         <button class="btn btn-outline" @click="pickFile">选择文件</button>
       </div>
     </div>
@@ -25,8 +25,8 @@
       @drop.prevent="handleDrop"
     >
       <div class="dz-icon">📄</div>
-      <div class="dz-text">点击选择或将 PDF 拖拽到此处</div>
-      <div class="dz-sub">支持 .pdf 格式，单文件最大 50MB</div>
+      <div class="dz-text">点击选择或将文档拖拽到此处</div>
+      <div class="dz-sub">支持 .pdf / .docx / .doc 格式，单文件最大 50MB</div>
     </div>
 
     <div class="msg-info" v-if="uploadMsg" :class="uploadType">{{ uploadMsg }}</div>
@@ -116,7 +116,7 @@ async function uploadFile() {
 
 function buildStageBars(t) {
   return [
-    ['PDF 解析', t.parseProgress],
+    ['文档解析', t.parseProgress],
     ['文本切片', t.splitProgress],
     ['Chunk 入库', t.chunkProgress],
     ['向量化 Embedding', t.embedProgress],

@@ -8,9 +8,19 @@ import java.io.InputStream;
 import java.util.List;
 
 /**
- * 文档解析器接口：包含读取原始内容和切分两个独立步骤
+ * 文档解析器接口：包含读取原始内容和切分两个独立步骤。
+ * <p>
+ * 每种文档格式一个实现（PDF / Word …），由 {@link DocumentParserRegistry} 按文件扩展名选择，
+ * 因此各实现无需感知其它格式。
  */
 public interface DocumentParser {
+
+    /**
+     * 是否支持该文档格式
+     *
+     * @param fileType 文件扩展名（小写，如 pdf / docx / doc）
+     */
+    boolean supports(String fileType);
 
     /**
      * 读取文档文件原始内容（不含切分）

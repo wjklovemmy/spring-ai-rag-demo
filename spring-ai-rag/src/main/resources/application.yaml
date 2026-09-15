@@ -156,7 +156,7 @@ rag:
     rrf-k: 60
     # Hybrid 检索异常时降级为纯向量检索
     fallback-on-error: true
-  # OCR：扫描版 PDF（无文本层）自动渲染页面并识别文字
+  # OCR：扫描版 PDF（无文本层）自动渲染页面识别；Word 内嵌图片（含整篇扫描件）识别图片内文字
   ocr:
     enabled: true
     # 阿里云 OCR 服务地域
@@ -170,6 +170,10 @@ rag:
     min-text-length: 20
     # 单页 OCR 失败时是否抛异常中断（false=记日志跳过该页）
     fail-on-error: false
+    # Word 单篇文档最多 OCR 的图片数（超出跳过，防内嵌大量图片导致调用与费用失控）
+    word-max-images: 50
+    # Word 图片短边小于该像素数视为图标/装饰图，不做 OCR
+    word-min-image-side: 80
   # 文件存储配置：MinIO 对象存储（唯一后端，多实例部署下文件共享；
   # 已移除本地磁盘模式——本地盘在 K8s 多副本下实例间文件不互通）
   storage:

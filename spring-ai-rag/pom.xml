@@ -99,6 +99,19 @@
             <artifactId>spring-ai-pdf-document-reader</artifactId>
         </dependency>
 
+        <!-- Apache POI：Word 文档解析（poi-ooxml 支持 .docx，poi-scratchpad 支持 .doc 老格式）；
+             5.4.1 为修复 CVE-2025-31672（XLSX/XML 解析资源耗尽）后的版本 -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>5.4.1</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-scratchpad</artifactId>
+            <version>5.4.1</version>
+        </dependency>
+
         <!-- 对象存储（文档附件存储）；8.5.12 存在 CVE-2025-59952（XML 值替换），官方修复版为 8.6.0（8.x 分支，API 兼容）；
              9.x 为重大重构版（API 与 S3 规范同步，partSize 等签名有破坏性变更），暂不采用 -->
         <dependency>

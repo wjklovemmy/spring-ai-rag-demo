@@ -2,7 +2,7 @@
 
 一个基于 **Spring Boot 4 + Spring AI 2.0** 的企业级 **RAG（Retrieval-Augmented Generation，检索增强生成）** 演示项目。
 
-项目将 PDF 文档解析、切分、向量化后存入 Milvus 向量数据库；问答采用 **Agentic RAG** 模式——由模型自主决定是否调用 `searchKnowledge` 工具检索知识库，再严格基于检索到的 [来源N] 片段逐字引用回答（DeepSeek 生成），并附带可溯源的知识库引用。
+项目将 PDF / Word 文档解析、切分、向量化后存入 Milvus 向量数据库；问答采用 **Agentic RAG** 模式——由模型自主决定是否调用 `searchKnowledge` 工具检索知识库，再严格基于检索到的 [来源N] 片段逐字引用回答（DeepSeek 生成），并附带可溯源的知识库引用。
 
 ---
 
@@ -48,8 +48,9 @@
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（7070）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志 |
-| PDF 解析 | Spring AI `PagePdfDocumentReader` | 按页解析 PDF（文本层） |
-| OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）自动识别文字 |
+| PDF 解析 | Apache PDFBox（经 `spring-ai-pdf-document-reader` 传递引入） | 按页解析 PDF（文本层）；不直接用 `PagePdfDocumentReader`——它会过滤无文本页，导致扫描件 OCR 兜底失效 |
+| Word 解析 | Apache POI（`poi-ooxml` 解析 .docx、`poi-scratchpad` 解析 .doc） | 段落 + **表格**（`| 单元格 |` 保留行列对应关系，表头补分隔行、嵌套表格递归）+ **图片**（OCR 识别图片内文字并按原位插回正文）+ **扫描件**（整篇为图片时逐图 OCR，一图一单元）；标题样式（Heading 1-9）转 Markdown 前缀供标题链识别 |
+| OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）与 Word 内嵌图片（架构图/流程图/截图/扫描表格/整篇扫描件）自动识别文字；同图去重、图标按尺寸过滤、单篇张数限流 |
 | 前端 | Vue 3（Vite 5）+ vue-router | 独立工程 `spring-ai-web/`：Vite + Vue 3 SPA（组件化开发），`npm run build` 产物 `dist/`，前后端分离单独部署（Nginx 托管 `dist/` + `/api` 反代网关 7070，或直连网关走 CORS） |
 
 ---
@@ -81,7 +82,7 @@ graph TB
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
         SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
-        PARSER["Parser<br/>PagePdfDocumentReader + OCR 兜底"]
+        PARSER["Parser<br/>按格式分派：PDF(PDFBox+OCR) / Word(POI+OCR)"]
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
@@ -96,7 +97,7 @@ graph TB
     subgraph Storage["存储层"]
         MYSQL[("MySQL 双库<br/>RAG: 文档/Chunk/kb_member/chat_session/agent_task<br/>用户域: RBAC 五表")]
         MILVUS[("Milvus<br/>向量库 kb_{id}<br/>Dense + BM25 + RRF")]
-        MINIO[("MinIO<br/>原始 PDF 文件")]
+        MINIO[("MinIO<br/>原始文档文件")]
         REDIS[("Redis<br/>对话记忆 rag:chat:memory:{userId}:{sessionId}<br/>TTL 7 天")]
     end
 
@@ -123,7 +124,7 @@ graph TB
     AUTHZ --> CTRL
     CTRL --> SVC
     SVC --> PARSER --> SPLIT
-    PARSER -.无文本层.-> OCRSVC
+    PARSER -.无文本层/内嵌图片.-> OCRSVC
     SPLIT --> MYSQL
     SPLIT --> EMBED --> DS
     EMBED --> MILVUS
@@ -221,9 +222,13 @@ spring-ai-rag-demo/
 │       │   └── AgentTaskStepEntity.java       # Agent 任务步骤（工具调用轨迹）
 │       ├── mapper/                            # MyBatis-Plus Mapper（业务表，含 ChatSessionMapper / ChatSessionMemoryMapper / UserLongTermMemoryMapper）
 │       ├── parser/
-│       │   ├── DocumentParser.java            # 解析接口
+│       │   ├── DocumentParser.java            # 解析接口（supports(fileType) 声明支持的格式）
+│       │   ├── DocumentParserRegistry.java    # 解析器注册表：按扩展名路由（pdf/docx/doc）
 │       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
-│       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建
+│       │   ├── WordDocumentParser.java        # Word 解析实现（.docx/.doc：段落 + 表格 + 内嵌图片 OCR + 扫描件逐图 OCR）
+│       │   ├── OcrTextMerger.java             # OCR 结果与文本层按行去重合并（PDF 混合页 / Word 图片共用）
+│       │   ├── TextChunkSplitter.java         # 通用切分链路（语义切片 + 标题注入 + Parent-Child，各格式共用）
+│       │   ├── HeadingExtractor.java          # 标题行识别 / 标题链构建（支持 Markdown 标题）
 │       │   └── SemanticSplitter.java          # 语义切片（段落聚类 + 断点）
 │       ├── memory/
 │       │   ├── RedisChatMemory.java           # ChatMemory 实现：多轮对话记忆（Redis 持久化，TTL 7 天，工具消息不入库；token 预算+条数双窗口，摘要压缩，兼容旧版纯数组数据）
@@ -239,8 +244,7 @@ spring-ai-rag-demo/
 │       │   └── UserFeignClientFallbackFactory.java # 熔断降级兜底（安全默认值）
 │       └── service/
 │           ├── AgentTaskService.java             # Agent 任务/步骤落库 + 按会话回补引用来源快照
-│           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（流式/同步 + 多轮记忆，抽象类）
-│           ├── PdfKnowledgeDocumentServiceImpl.java # PDF 摄取实现
+│           ├── KnowledgeDocumentService.java      # 摄取异步流水线 + 问答（流式/同步 + 多轮记忆，按扩展名分派解析器）
 │           ├── VectorStoreService.java            # Milvus 增删查（embedChunks / upsertVectors，熔断保护）
 │           ├── HybridSearchService.java           # 混合检索编排（RRF 融合 + 异常降级）
 │           ├── KnowledgeSearchService.java        # 知识库检索唯一入口（召回→过滤→Rerank→[来源N]上下文组装），searchKnowledge 工具复用
@@ -327,7 +331,7 @@ spring-ai-rag-demo/
 ```
 
 ```
-上传 PDF（multipart）
+上传文档（multipart，支持 pdf / docx / doc）
   │
   ├─ ① 提交阶段（submitIngest，接口立即返回 taskNo）
   │       · saveDocumentInfo   写入 MySQL knowledge_document
@@ -335,14 +339,16 @@ spring-ai-rag-demo/
   │             （版本号取同名文档全部状态中的最大版本 +1，防重号）
   │           - 状态置 0（UPLOADING 上传中）
   │       · persistUploadedFile 最先持久化原始文件到 MinIO，失败可恢复
-  │           - 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.pdf
+  │           - 路径规则：{知识库id}/{年/月/日}/{文档id}_{清洗文件名}.{原扩展名}
   │       · 创建 Embedding 任务（status=0 待处理），发送 MQ 消息异步执行
   │       · 提交阶段失败 → 补偿删除文件 + document/task 记录（防孤儿）
   │
   └─ ② MQ 消费处理（processTask，任务状态 0待处理→1处理中→2成功/3失败；失败重试 3 次进死信）
         │  文档状态 0上传中 → 1解析中 → 2向量化中 → 3成功 / 4失败
         │
-        ├─ 解析       PagePdfDocumentReader 按页解析（无文本层 OCR 兜底）
+        ├─ 解析       按扩展名分派解析器：PDF 逐页解析（无文本层 OCR 兜底）
+        │             / Word 段落 + 表格（`| 单元格 |`）+ 内嵌图片 OCR（按原位插回正文；整篇仅图片则视为扫描件逐图 OCR）
+        │             （Word 标题样式段转 Markdown 前缀；无分页概念，按标题边界/4000 字符切逻辑单元）
         │             → parse_progress = 100%
         ├─ 切分       SemanticSplitter：语义切片 + 标题感知注入
         │             · 段落批量 embedding 聚类 → 相邻相似度 < 0.55 处断点
@@ -749,7 +755,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `rag.memory.*` | **对话记忆滑动窗口 + 摘要压缩**：summary-enabled(true，false 则仅纯裁剪不消耗 LLM) / **max-tokens(16000，token 预算主控**——历史总 token 估算上限，本地近似 ASCII 4字符/token、中文 1字符/token；建议按模型上下文 1/4~1/3 预留，DeepSeek 64K → 16000**) / max-history(100，条数兜底**——最多保留/返回给模型的消息条数，防单条过小时窗口无限拉长) / summary-batch-size(20，总 token 超 max-tokens 或条数超 max-history+batch 时把最老 batch 条压缩进摘要，每 batch 轮触发一次额外 DeepSeek 调用)；**长期记忆**：history-persist-enabled(true，问答后摘要落 MySQL chat_session_memory) / history-inject-limit(5，新会话注入历史会话摘要条数，0 关闭) / fallback-last-turns(6，无摘要时取最近 N 轮原文做会话要点) |
 | `rag.memory.long-term.*` | **用户级长期记忆（Phase 2）**：enabled(true 总开关，控制工具注册+注入+自动抽取) / collection-name(`rag_user_memory`，Milvus 全局集合) / inject-limit(5，每次问答召回注入条数，≤0 关闭) / max-chars(1600，注入文本字符上限) / min-score(0.3，召回余弦阈值) / search-top-k(8，searchMemory 单次召回上限) / dedupe-threshold(0.95，保存语义判重阈值) / max-per-user(500，单用户记忆条数上限) / auto-extract-enabled(true，会话后自动抽取) / auto-extract-interval-minutes(30，用户级防抖) / extract-max-chars(4000，抽取输入上限) / extract-max-facts(6，单次抽取条数上限) / vector-sync-enabled(true，向量补偿) / vector-sync-interval-ms(60000) / vector-sync-batch-size(20) |
 | `rag.memory-monitor.*` | **记忆膨胀监控**：enabled(true) / interval-ms(60000) / key-count-threshold(10000) / total-bytes-threshold(268435456=256MB) / webhook-url。`RedisMemoryMonitor` 定时 SCAN `rag:chat:memory:*` + MEMORY USAGE 汇总，key 数或总占用超阈值告警（ERROR 日志 + 可选 Webhook，去抖只告警一次，恢复自动解除） |
-| `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200) / min-text-length(20) |
+| `rag.ocr.*` | OCR：enabled / region-id(cn-hangzhou) / access-key-id/secret（环境变量 `ALIYUN_OCR_AK/SK`）/ dpi(200，PDF 页渲染分辨率) / min-text-length(20，文本层低于该字符数视为无文本层，触发整篇扫描件识别) / fail-on-error(false，单页/单图失败记日志跳过) / **word-max-images(50，Word 单篇最多 OCR 图片数，超出跳过——防内嵌大量图片导致调用与费用失控)** / **word-min-image-side(80，图片短边小于该像素视为图标/装饰图不识别)** |
 | `rag.document.chunk.heading.*` | 标题感知切分：enabled / max-depth(3) / max-length(40) / prefix-template(`【{heading}】`) |
 | `rag.document.chunk.semantic.*` | 语义切片：enabled / threshold(0.55) / batch-size(10) / fallback-on-error |
 | `rag.document.chunk.parent-child.*` | **Parent-Child 检索**：enabled(true) / child-chunk-size(200) / child-min-chunk-size-chars(80) / child-min-chunk-length-to-embed(40) / child-max-num-chunks(50000) / child-keep-separator(true)。切分结果为父块（存 MySQL 不向量化），再细分 200 token 子块向量化存 Milvus；检索命中子块 → 反查父块全文作为 LLM 上下文。`enabled: false` 即回退单级模式（旧数据兼容） |
@@ -865,9 +871,10 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | `spring-ai-starter-model-deepseek` | 2.0.0 | DeepSeek ChatModel（spring-ai-deepseek） |
 | `spring-ai-starter-vector-store-milvus` | 2.0.0 | Milvus 向量库（spring-ai-milvus-store → milvus-sdk-java 2.6.23） |
 | `spring-ai-pdf-document-reader` | 2.0.0 | PDF 解析（pdfbox 3.0.7） |
+| `poi-ooxml` / `poi-scratchpad` | 5.4.1 | Word 解析（.docx / .doc；5.4.1 修复 CVE-2025-31672） |
 | `minio` | 8.6.0 | 文档附件对象存储 |
 | `okhttp` | 4.12.0 | MinIO HTTP 客户端（回退 4.x） |
-| `com.aliyun:ocr_api20210707` | 3.1.3 | 扫描版 PDF OCR |
+| `com.aliyun:ocr_api20210707` | 3.1.3 | 扫描版 PDF 与 Word 内嵌图片 OCR |
 
 ### spring-ai-user（:8082）专属依赖
 
@@ -906,6 +913,7 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
 | HikariCP | 7.0.2 | SB BOM（`spring-boot-starter-jdbc`） |
 | AspectJ Weaver | 1.9.25.1 | SB BOM |
 | PDFBox | 3.0.7 | `spring-ai-pdf-document-reader` |
+| Apache POI | 5.4.1 | `poi-ooxml` + `poi-scratchpad`（Word 解析） |
 | gRPC / Protobuf | protobuf-java 3.25.5 | `milvus-sdk-java` 2.6.23 |
 | fastjson2 | 2.0.58 | `sentinel-transport-common` |
 | Spring Data Redis / Commons | 4.0.6 | SB BOM |
@@ -1064,6 +1072,16 @@ Agent 工具调用（`KbQueryTools`）、可观测性落库（`agent_task` / `ag
     <dependency>
         <groupId>org.springframework.ai</groupId>
         <artifactId>spring-ai-pdf-document-reader</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.poi</groupId>
+        <artifactId>poi-ooxml</artifactId>
+        <version>5.4.1</version>
+    </dependency>
+    <dependency>
+        <groupId>org.apache.poi</groupId>
+        <artifactId>poi-scratchpad</artifactId>
+        <version>5.4.1</version>
     </dependency>
     <dependency>
         <groupId>io.minio</groupId>
@@ -1247,7 +1265,7 @@ CREATE DATABASE IF NOT EXISTS nacos_config DEFAULT CHARACTER SET utf8mb4;
 |----------|------|
 | `DEEPSEEK_API_KEY` | DeepSeek 对话模型（`deepseek-chat`） |
 | `DASHSCOPE_API_KEY` | DashScope 向量模型（`text-embedding-v3`）与重排序（`gte-rerank-v2`） |
-| `ALIYUN_OCR_AK` / `ALIYUN_OCR_SK` | 阿里云 OCR AccessKey（仅扫描版 PDF 需要，需在[阿里云 OCR 控制台](https://ocr.console.aliyun.com/)开通服务） |
+| `ALIYUN_OCR_AK` / `ALIYUN_OCR_SK` | 阿里云 OCR AccessKey（扫描版 PDF 与 Word 内嵌图片需要，需在[阿里云 OCR 控制台](https://ocr.console.aliyun.com/)开通服务） |
 
 设置示例（Windows cmd）：
 
@@ -1350,7 +1368,7 @@ npm run build        # 生产构建，产物在 dist/
 | GET | `/api/knowledge-base/{id}/members` | 是 | 成员列表（需 OWNER） |
 | POST | `/api/knowledge-base/{id}/members` | 是 | 授权/调整成员角色（需 OWNER，body `{userId, role}`） |
 | DELETE | `/api/knowledge-base/{id}/members/{userId}` | 是 | 移除成员（需 OWNER，最后一个 OWNER 不可移除） |
-| POST | `/api/knowledge-document/upload` | 是 | 上传 PDF 并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
+| POST | `/api/knowledge-document/upload` | 是 | 上传文档（pdf / docx / doc）并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
 | POST | `/api/knowledge-document/chat` | 是 | 知识问答（Agentic RAG，需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`tool`/`delta`/`final`/`sources`/`done`/`error` 事件，`tool` 展示模型自主调用 searchKnowledge 工具的过程、`final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆） |
@@ -1389,11 +1407,11 @@ npm run build        # 生产构建，产物在 dist/
 
 ## 关键设计决策
 
-1. **异步任务 + 增量执行（RabbitMQ 全链路可靠性）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。可靠性链：① **Quorum 队列**——Raft 多副本持久化队列（队列/消息/死信参数均持久化），单节点挂掉不丢消息，是官方替代镜像队列的高可用方案（classic mirroring 自 RabbitMQ 4.0 移除）；② **生产者可靠性**——`publisher-confirm-type=correlated` + `publisher-returns=true`（mandatory 模式），Confirm nack 或路由不到队列时通过 `CorrelationData(taskId)` / `x-task-id` 头定位任务并标记失败，不静默丢失；③ **消费者可靠性**——失败重试 3 次（`max-retries=3`，共 4 次消费尝试），耗尽 `RejectAndDontRequeueRecoverer` 拒绝 → 死信队列统一标记失败（幂等）；④ **积压监控**——`RabbitQueueMonitor` 定时轮询 Management API，Ready 超阈值告警（ERROR 日志 + 可选 Webhook），及早发现"消费者跟不上生产者"；⑤ **防重复**——重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），子类只需实现 `parseDocument` / `splitDocument`，便于扩展 Word、Markdown 等格式。
+1. **异步任务 + 增量执行（RabbitMQ 全链路可靠性）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。可靠性链：① **Quorum 队列**——Raft 多副本持久化队列（队列/消息/死信参数均持久化），单节点挂掉不丢消息，是官方替代镜像队列的高可用方案（classic mirroring 自 RabbitMQ 4.0 移除）；② **生产者可靠性**——`publisher-confirm-type=correlated` + `publisher-returns=true`（mandatory 模式），Confirm nack 或路由不到队列时通过 `CorrelationData(taskId)` / `x-task-id` 头定位任务并标记失败，不静默丢失；③ **消费者可靠性**——失败重试 3 次（`max-retries=3`，共 4 次消费尝试），耗尽 `RejectAndDontRequeueRecoverer` 拒绝 → 死信队列统一标记失败（幂等）；④ **积压监控**——`RabbitQueueMonitor` 定时轮询 Management API，Ready 超阈值告警（ERROR 日志 + 可选 Webhook），及早发现"消费者跟不上生产者"；⑤ **防重复**——重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），解析器按扩展名分派（`DocumentParser` + `DocumentParserRegistry`，新增格式只需加一个实现类、切分链路复用），便于继续扩展 Markdown、Excel 等格式。
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。
-5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字，扫描版文档与文本型文档走同一条 RAG 链路。
+5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字；Word 内嵌图片（架构图/流程图/截图/扫描表格）识别后按原位插回正文、未定位图片（页眉页脚/浮动图片）追加文末、整篇仅图片的 Word（扫描件）逐图 OCR 一图一单元；图片按内容指纹去重、按尺寸过滤图标、单篇张数限流，扫描版与文本型文档走同一条 RAG 链路。
 6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
 7. **标题感知注入**：识别数字/中文序数/无序号标题行构建标题链，将所属标题以 `【标题链】正文` 前缀注入 chunk 文本（参与向量化，孤立 chunk 也有上下文）并写 `metadata.heading` 供溯源。
 8. **来源溯源（按引用过滤 + 重排编号 + 综合引用引导）**：回答中标注 `[来源n]` 并返回引用列表；引用列表**只返回回答实际引用的来源**（按 [来源N] 过滤候选，回答无引用则不下发），并重排为连续升序编号、回答文本同步重写（回答引用 1、3、7 → 回答与来源列表同步重写为 1、2、3，前端 `scrollToSource` 点击定位一一对应）；系统提示引导"综合引用"——多相关片段分别标注 `[来源1][来源2][来源3]`，工具结果回答末尾统一标注（"以上内容详见[来源1][来源2][来源3]"）；引用编号经 `alignCitations` 对齐校验（逐字引用片段与来源内容包含匹配，纠正张冠李戴，无法判定则保守保留）。
@@ -1403,7 +1421,7 @@ npm run build        # 生产构建，产物在 dist/
 12. **数据授权为唯一权威**：`kb_member` 表（用户×知识库×角色）是知识库访问的唯一判定依据，`ADMIN` 全局放行；不信任前端传参（创建人取自登录态），并保护最后一个 OWNER 不可被移除。
 13. **角色双轨模型**：垂直 RBAC（`sys_user_role` 全局角色）+ 水平数据授权（`kb_member`），分离"能访问哪些库"与"在库内能做什么"；权限与文档处理策略完全解耦。
 14. **Batch 批处理流水线**：Embedding 与 Milvus 写入按 `rag.document.batch-size`（默认 100）分批执行，每批 = 一次 embedding 批量调用 + 一次 Milvus upsert + 一次 `milvus_id` 回填 + 一次进度回写，降低超大文档（上限 10000 chunk）单次调用的内存与超时风险；MySQL 写入用 MyBatis-Plus `saveBatch`（内部默认 1000/批），与 Milvus 批次相互独立、互不耦合。
-15. **分阶段进度**：任务记录 5 个阶段进度（PDF解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
+15. **分阶段进度**：任务记录 5 个阶段进度（文档解析/文本切片/Chunk入库/Embedding/Milvus，0-100），前端轮询 `task/{taskNo}` 以等宽进度条逐阶段实时展示，Embedding 与 Milvus 为两阶段顺序推进。
 16. **认证前置到网关**：JWT 校验、Redis 黑名单、用户身份头（`X-User-Id`/`X-Username`/`X-Permissions`）注入统一在 Gateway 的 `JwtAuthGlobalFilter` 完成；下游服务（RAG / 用户服务）仅校验内部信任令牌（`X-Gateway-Token`）防绕过网关直连伪造身份，业务代码零感知。前端已前后端分离（独立 Vue 3 工程 `spring-ai-web/`，Vite 构建，经 Nginx 同源代理 `/api` 或直连网关走 CORS），接口统一走 7070。
 17. **用户域独立服务**：认证/用户/角色/系统管理从 RAG 拆分为独立服务 `spring-ai-user`（8082，独立库 `spring_ai_user`），网关按路径分流。跨进程协作：RAG 经 `UserClient` 调用户服务 `/internal/users/**`（isAdmin / 用户摘要）；用户服务经 `RagSyncClient` 回调 RAG `/internal/kb/**`（删除前校验/删除后清理 kb_member/管理操作审计落库），替代原同进程 SPI；服务间内部接口均以 `X-Internal-Token` 鉴权。两个服务各自维护本地 `GatewayIdentityFilter` + `UserContext`，均只消费网关透传身份头。
 18. **熔断降级全覆盖**：三个 AI 依赖（DeepSeek 问答 / DashScope 向量化 / 跨服务 Feign）均受 Sentinel 保护——问答与向量化走 `CircuitBreakerFactory`（资源 `ai-chat` / `dashscope-embedding`），Feign 走 fallbackFactory，任一上游故障时服务返回友好降级提示而非 5xx。

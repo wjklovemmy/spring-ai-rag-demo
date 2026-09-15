@@ -14,7 +14,6 @@ import org.apache.pdfbox.rendering.ImageType;
 import org.apache.pdfbox.rendering.PDFRenderer;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.ai.document.Document;
-import org.springframework.ai.transformer.splitter.TokenTextSplitter;
 import org.springframework.stereotype.Component;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -28,43 +27,39 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 /**
- * PDF 文档解析器：读取 PDF 文件内容，按全局配置分块后返回文档列表。
+ * PDF 文档解析器：逐页提取 PDF 文本，并按全局配置切分后返回文档列表。
  * <p>
  * 对扫描版 PDF（无文本层）：自动将页面渲染为图片并调用 OCR 识别，
  * 用识别出的文字替换空白页文本；对"文本层 + 图片"混合页额外做 OCR，
  * 把图片内文字与文本层按行去重拼接，保证图表/扫描插图的内容不丢失。
  * <p>
- * 切分策略（自研，Spring AI 2.0 无 SemanticTextSplitter）：
- * <ol>
- *   <li>语义切片：段落批量 embedding 聚类，按相邻相似度找语义断点；</li>
- *   <li>标题注入：识别标题行构建标题链，将所属标题前缀注入 chunk 文本并写入 metadata.heading。</li>
- * </ol>
+ * 切分统一委托 {@link TextChunkSplitter}（语义切片 + 标题注入 + Parent-Child），与 Word 等其它格式共用同一套策略。
  */
 @Component
 @Slf4j
 public class PdfDocumentParser implements DocumentParser {
 
-    /** metadata 键：父块全文（Parent-Child 检索）。语义/token 切分结果作为父块注入标题后，
-     *  再细分为子块；每个子块都携带 parent_text 以便检索命中后反查父块全文，以及摄取阶段重建父块列表 */
-    public static final String META_PARENT_TEXT = "parent_text";
+    /** metadata 键：父块全文（Parent-Child 检索），实际定义在 {@link TextChunkSplitter}，此处保留转发兼容既有引用 */
+    public static final String META_PARENT_TEXT = TextChunkSplitter.META_PARENT_TEXT;
 
     private final RagConfigProperties config;
     private final OcrService ocrService;
-    private final SemanticSplitter semanticSplitter;
-    private final HeadingExtractor headingExtractor;
+    private final TextChunkSplitter chunkSplitter;
 
     public PdfDocumentParser(RagConfigProperties config, OcrService ocrService,
-                             SemanticSplitter semanticSplitter, HeadingExtractor headingExtractor) {
+                             TextChunkSplitter chunkSplitter) {
         this.config = config;
         this.ocrService = ocrService;
-        this.semanticSplitter = semanticSplitter;
-        this.headingExtractor = headingExtractor;
+        this.chunkSplitter = chunkSplitter;
+    }
+
+    @Override
+    public boolean supports(String fileType) {
+        return "pdf".equalsIgnoreCase(fileType);
     }
 
     @Override
@@ -162,8 +157,8 @@ public class PdfDocumentParser implements DocumentParser {
                     // Spring AI 2.0 Document 不可变，重建替换
                     doc.getMetadata().put("ocr", true);
                     String mergedText = hasTextLayer
-                            ? mergeTextLayerAndOcr(text, ocrText)  // 混合页：文本层 + 图片内文字
-                            : ocrText;                              // 扫描页：OCR 结果整体替换
+                            ? OcrTextMerger.merge(text, ocrText)  // 混合页：文本层 + 图片内文字（按行去重）
+                            : ocrText;                            // 扫描页：OCR 结果整体替换
                     Document ocrDocument = Document.builder()
                             .text(mergedText)
                             .metadata(doc.getMetadata())
@@ -217,59 +212,6 @@ public class PdfDocumentParser implements DocumentParser {
         return false;
     }
 
-    /**
-     * 混合页合并：保留文本层，把 OCR 识别出的图片内文字按行去重后追加在末尾。
-     * <p>
-     * 整页渲染 OCR 会把正文也识别出来，与文本层重复；通过归一化行匹配剔除重复行，
-     * 仅保留图片新增内容。若追加内容过少（如图片只是装饰/logo），回退为纯文本层。
-     */
-    private String mergeTextLayerAndOcr(String textLayer, String ocrText) {
-        List<String> layerLines = new ArrayList<>();
-        for (String line : textLayer.split("\\R")) {
-            String norm = normalizeOcrLine(line);
-            if (!norm.isEmpty()) {
-                layerLines.add(norm);
-            }
-        }
-        Set<String> layerSet = new HashSet<>(layerLines);
-
-        StringBuilder sb = new StringBuilder(textLayer);
-        if (sb.length() > 0 && sb.charAt(sb.length() - 1) != '\n') {
-            sb.append('\n');
-        }
-        int added = 0;
-        for (String line : ocrText.split("\\R")) {
-            String norm = normalizeOcrLine(line);
-            if (norm.isEmpty() || layerSet.contains(norm)) {
-                continue;
-            }
-            // 防 OCR 截断/合并导致的重复：双方足够长且互相包含，视为同一内容
-            boolean dup = false;
-            for (String l : layerLines) {
-                if (l.length() >= 4 && norm.length() >= 4
-                        && (l.contains(norm) || norm.contains(l))) {
-                    dup = true;
-                    break;
-                }
-            }
-            if (!dup) {
-                sb.append(line.trim()).append('\n');
-                added++;
-            }
-        }
-        if (added == 0) {
-            // 图片内无新增文字（装饰图/logo），保持纯文本层，避免噪声污染
-            return textLayer;
-        }
-        log.info("混合页合并：追加 OCR 新增 {} 行", added);
-        return sb.toString();
-    }
-
-    /** OCR 行归一化：去首尾空白、压缩连续空白，用于文本层与 OCR 结果的重复匹配 */
-    private String normalizeOcrLine(String line) {
-        return line.trim().replaceAll("[\\s\u00A0]+", " ");
-    }
-
     private byte[] toPngBytes(BufferedImage image) throws IOException {
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
         ImageIO.write(image, "png", baos);
@@ -284,134 +226,6 @@ public class PdfDocumentParser implements DocumentParser {
 
     @Override
     public List<Document> split(List<Document> documents) {
-        RagConfigProperties.Chunk chunk = config.getDocument().getChunk();
-        RagConfigProperties.Heading headingCfg = chunk.getHeading();
-        RagConfigProperties.Semantic semanticCfg = chunk.getSemantic();
-
-        List<Document> result = new ArrayList<>();
-        for (Document pageDoc : documents) {
-            // 1. 提取页面标题链（按字符偏移定位）
-            List<HeadingExtractor.HeadingLine> headings = headingCfg.isEnabled()
-                    ? headingExtractor.extract(pageDoc.getText(), headingCfg)
-                    : List.of();
-
-            // 2. 语义切片（失败降级 token 切分）
-            List<Document> pageChunks;
-            if (semanticCfg.isEnabled()) {
-                try {
-                    pageChunks = semanticSplitter.split(pageDoc, semanticCfg,
-                            chunk.getChunkSize(), chunk.getMinChunkSizeChars());
-                } catch (Exception e) {
-                    if (semanticCfg.isFallbackOnError()) {
-                        log.warn("语义切片失败，降级为 token 切分: {}", e.getMessage());
-                        pageChunks = tokenSplit(pageDoc, chunk);
-                    } else {
-                        throw new RuntimeException("语义切片失败", e);
-                    }
-                }
-            } else {
-                pageChunks = tokenSplit(pageDoc, chunk);
-            }
-
-            // 3. 标题前缀注入：语义/token 切分结果 = 父块（注入标题链后作为完整上下文单元）
-            RagConfigProperties.ParentChild pcCfg = chunk.getParentChild();
-            List<Document> parents = new ArrayList<>();
-            for (Document pageChunk : pageChunks) {
-                parents.add(injectHeading(pageChunk, headings, headingCfg));
-            }
-
-            // 4. Parent-Child：父块再细分为子块（子块向量化检索，命中后反查父块全文）
-            if (pcCfg.isEnabled()) {
-                for (Document parent : parents) {
-                    result.addAll(childSplit(parent, pcCfg));
-                }
-            } else {
-                result.addAll(parents);
-            }
-        }
-
-        log.info("PDF 文档分割为 {} 个文本片段（Parent-Child 已启用: {}）",
-                result.size(), chunk.getParentChild().isEnabled());
-        return result;
-    }
-
-    /**
-     * 将父块细分为子块（Parent-Child 检索）。
-     * <p>
-     * 父块文本已含标题链前缀；子块由 TokenTextSplitter 按 {@code childChunkSize} 二次切分，
-     * 每个子块的 metadata 记录 {@link #META_PARENT_TEXT}（父块全文），
-     * 供摄取阶段重建父块列表、检索阶段反查父块上下文。
-     * <p>
-     * 子块切分不启用 minChunkLengthToEmbed 过滤（设为 1），避免父块尾部内容因过短被丢弃。
-     */
-    private List<Document> childSplit(Document parent, RagConfigProperties.ParentChild cfg) {
-        TokenTextSplitter splitter = TokenTextSplitter.builder()
-                .withChunkSize(cfg.getChildChunkSize())
-                .withMinChunkSizeChars(cfg.getChildMinChunkSizeChars())
-                .withMinChunkLengthToEmbed(1)
-                .withMaxNumChunks(cfg.getChildMaxNumChunks())
-                .withKeepSeparator(cfg.isChildKeepSeparator())
-                .build();
-        List<Document> children = splitter.apply(List.of(parent));
-        List<Document> result = new ArrayList<>(children.size());
-        for (Document child : children) {
-            Map<String, Object> meta = new HashMap<>(child.getMetadata());
-            meta.put(META_PARENT_TEXT, parent.getText());
-            result.add(Document.builder().text(child.getText()).metadata(meta).build());
-        }
-        return result;
-    }
-
-    /**
-     * 整页 token 切分（语义切片关闭或降级时使用）
-     */
-    private List<Document> tokenSplit(Document pageDoc, RagConfigProperties.Chunk chunk) {
-        TokenTextSplitter splitter = TokenTextSplitter.builder()
-                .withChunkSize(chunk.getChunkSize())
-                .withMinChunkSizeChars(chunk.getMinChunkSizeChars())
-                .withMinChunkLengthToEmbed(chunk.getMinChunkLengthToEmbed())
-                .withMaxNumChunks(chunk.getMaxNumChunks())
-                .withKeepSeparator(chunk.isKeepSeparator())
-                .build();
-        return splitter.apply(List.of(pageDoc));
-    }
-
-    /**
-     * 按 chunk 在页面文本中的起始偏移定位所属标题，将标题链前缀注入文本并写入 metadata.heading。
-     * 无偏移（token 切分产物）时使用页面首个标题链。
-     */
-    private Document injectHeading(Document chunk, List<HeadingExtractor.HeadingLine> headings,
-                                   RagConfigProperties.Heading cfg) {
-        if (!cfg.isEnabled() || headings.isEmpty()) {
-            return chunk;
-        }
-
-        Object startObj = chunk.getMetadata().get(SemanticSplitter.META_CHUNK_START);
-        int start = startObj instanceof Number n ? n.intValue() : -1;
-
-        HeadingExtractor.HeadingLine target = null;
-        if (start >= 0) {
-            for (HeadingExtractor.HeadingLine h : headings) {
-                if (h.offset() <= start) {
-                    target = h;
-                } else {
-                    break;
-                }
-            }
-        }
-        if (target == null) {
-            target = headings.get(0);
-        }
-        if (target.chain() == null || target.chain().isBlank()) {
-            return chunk;
-        }
-
-        String prefix = cfg.getPrefixTemplate().replace("{heading}", target.chain());
-        Map<String, Object> meta = new HashMap<>(chunk.getMetadata());
-        meta.put("heading", target.chain());
-        return Document.builder()
-                .text(prefix + chunk.getText())
-                .metadata(meta)
-                .build();
+        return chunkSplitter.split(documents);
     }
 }

@@ -78,7 +78,7 @@ const stages = computed(() => {
   const t = detail.value
   if (!t) return []
   return [
-    ['PDF 解析', t.parseProgress],
+    ['文档解析', t.parseProgress],
     ['文本切片', t.splitProgress],
     ['Chunk 入库', t.chunkProgress],
     ['向量化 Embedding', t.embedProgress],

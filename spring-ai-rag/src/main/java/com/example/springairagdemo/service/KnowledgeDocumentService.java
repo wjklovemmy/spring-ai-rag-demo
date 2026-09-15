@@ -8,6 +8,8 @@ import com.example.springairagdemo.entity.KnowledgeDocumentEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskEntity;
 import com.example.springairagdemo.entity.KnowledgeEmbeddingTaskStatus;
 import com.example.springairagdemo.mq.EmbeddingTaskProducer;
+import com.example.springairagdemo.parser.DocumentParser;
+import com.example.springairagdemo.parser.DocumentParserRegistry;
 import com.example.springairagdemo.parser.PdfDocumentParser;
 import com.example.springairagdemo.security.KbRole;
 import com.example.springairagdemo.security.UserContext;
@@ -21,6 +23,7 @@ import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.client.circuitbreaker.CircuitBreakerFactory;
 import org.springframework.dao.DuplicateKeyException;
+import org.springframework.stereotype.Service;
 
 import java.util.concurrent.atomic.AtomicReference;
 import tools.jackson.databind.ObjectMapper;
@@ -54,14 +57,14 @@ import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
- * 知识文档服务抽象类：定义文档摄取的模板流程和基于知识库的问答能力
+ * 知识文档服务：定义文档摄取的模板流程和基于知识库的问答能力
  * <p>
  * 上传流程（submitIngest → RabbitMQ 消息 → processTask）：
  * 1. 保存原始文档信息到 MySQL knowledge_document
  * 2. 原始文件最先持久化到存储后端（MinIO/本地）
  * 3. 创建 knowledge_embedding_task 任务（0待处理），立即返回任务编号
- * 4. MQ 消费：解析文档（子类实现）
- * 5. MQ 消费：切分文档（子类实现）
+ * 4. MQ 消费：按文件扩展名选择解析器（{@link DocumentParserRegistry}）读取文档内容
+ * 5. MQ 消费：切分文档（格式无关的通用切分链路）
  * 6. MQ 消费：chunk 文本写入 MySQL knowledge_chunk（增量：跳过已处理片段）
  * 7. MQ 消费：chunk 向量写入 Milvus（仅存向量 + 引用字段，稳定主键 upsert 幂等）
  * 8. 任务成功/失败状态回写 knowledge_embedding_task
@@ -70,15 +73,24 @@ import java.util.stream.Collectors;
  * 恢复/重跑（resumeInterruptedTask → RabbitMQ 重新入队 → processTask）支持增量执行：
  * 已完整处理（MySQL + 向量均完成）的 chunk 直接跳过，只补齐缺失或内容变化的片段；
  * Milvus 幂等 upsert 兜底并发/重复执行。
+ * <p>
+ * 支持格式：pdf（含 OCR 兜底）、docx、doc；新增格式只需新增一个 {@link DocumentParser} 实现。
  */
+@Service
 @Slf4j
-public abstract class KnowledgeDocumentService {
+public class KnowledgeDocumentService {
 
     /** 同名文档并发上传版本号冲突时的最大重试次数 */
     private static final int MAX_VERSION_RETRY = 5;
 
     /** AI 服务（DeepSeek）不可用时的降级提示 */
     private static final String AI_SERVICE_UNAVAILABLE = "AI服务暂时不可用，请稍后再试";
+
+    /** 支持的文档格式与 MIME 类型（对象存储 contentType 与下载响应头共用） */
+    private static final Map<String, String> CONTENT_TYPES = Map.of(
+            "pdf", "application/pdf",
+            "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "doc", "application/msword");
 
     @Autowired
     protected KnowledgeBaseService knowledgeBaseService;
@@ -118,6 +130,10 @@ public abstract class KnowledgeDocumentService {
 
     @Autowired
     protected RagConfigProperties ragConfig;
+
+    /** 文档解析器注册表：按文件扩展名（pdf / docx / doc）分派到对应格式解析器 */
+    @Autowired
+    protected DocumentParserRegistry documentParserRegistry;
 
     /** Phase 1 长期记忆：会话摘要持久化与跨会话历史背景注入 */
     @Autowired
@@ -505,20 +521,25 @@ public abstract class KnowledgeDocumentService {
      * 从存储读取原始文件并解析（原始文件在提交阶段已最先持久化），文档状态推进为解析中；
      * 再切分为 chunks（纯计算、确定性：同输入重跑时 chunkIndex 从 0 稳定编号），
      * 并记录 chunk 总数（同时标记切片阶段完成）。
+     * <p>
+     * 解析器按文档扩展名从 {@link DocumentParserRegistry} 分派（pdf / docx / doc），
+     * 切分走格式无关的通用链路（语义切片 + 标题注入 + Parent-Child）。
      */
     private List<Document> parseAndSplit(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity)
             throws Exception {
         updateDocumentStatus(docEntity, DocumentStatus.PARSING);
+        DocumentParser parser = documentParserRegistry.resolve(docEntity.getFileType());
         List<Document> documents;
         try (InputStream inputStream = fileStorageService.getInputStream(docEntity.getFilePath())) {
-            documents = parseDocument(inputStream);
+            documents = parser.read(inputStream);
         }
-        log.info("任务 {} 解析完成，共 {} 个文档页面", task.getTaskNo(), documents.size());
+        log.info("任务 {} 解析完成（格式: {}），共 {} 个文档片段",
+                task.getTaskNo(), docEntity.getFileType(), documents.size());
         task.setParseProgress(100);
         task.setUpdateTime(new Date());
         knowledgeEmbeddingTaskService.updateById(task);
 
-        List<Document> chunks = splitDocument(documents);
+        List<Document> chunks = parser.split(documents);
         log.info("任务 {} 切分完成，共 {} 个文本片段", task.getTaskNo(), chunks.size());
 
         task.setTotalChunk(chunks.size());
@@ -1056,7 +1077,7 @@ public abstract class KnowledgeDocumentService {
                 + entity.getId() + "_" + sanitizeFileName(entity.getFileName()) + "." + extension;
 
         fileStorageService.store(new ByteArrayInputStream(fileBytes), objectName,
-                "application/" + (extension.equals("pdf") ? "pdf" : "octet-stream"));
+                CONTENT_TYPES.getOrDefault(extension, "application/octet-stream"));
         entity.setFilePath(objectName);
         knowledgeDocumentEntityService.updateById(entity);
         log.info("文件已持久化: {}", objectName);
@@ -1164,13 +1185,7 @@ public abstract class KnowledgeDocumentService {
         }
     }
 
-    // ===================== 步骤 2-3：解析与切分（子类实现） =====================
-
-    protected abstract List<Document> parseDocument(MultipartFile file) throws IOException;
-
-    protected abstract List<Document> parseDocument(InputStream inputStream) throws IOException;
-
-    protected abstract List<Document> splitDocument(List<Document> documents);
+    // ===================== 步骤 2-3：解析与切分（DocumentParser 按扩展名实现） =====================
 
     // ===================== 步骤 4/5：chunk 写入 MySQL + 向量写入 Milvus =====================
 
