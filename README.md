@@ -48,11 +48,11 @@
 | 熔断降级 | Spring Cloud Circuit Breaker（Sentinel 1.8.9） | OpenFeign fallbackFactory 兜底（Hystrix 已 EOL，Spring Cloud 2020+ 移除其集成）；AI 问答（资源 `ai-chat`）与向量化（资源 `dashscope-embedding`）经 `CircuitBreakerFactory` 熔断保护，不可用时降级返回友好提示；DashScope Embedding 对网络异常/5xx 自动重试（最多 2 次）；可选 Sentinel Dashboard（localhost:8858，账号 sentinel/sentinel） |
 | 认证/授权 | JWT（jjwt 0.12.6）+ BCrypt + RBAC | 无状态登录认证 + 知识库数据权限（防越权）；用户域独立为 `spring-ai-user` **独立服务（8082）**，Token 校验集中到网关，RAG 侧仅校验内部信任令牌 |
 | 网关 | Spring Cloud Gateway 2025.1.0（gateway-server 5.0.0） | 统一入口（7070）：按路径分流（认证/用户/角色 → `lb://spring-ai-user`，知识库/文档 → `lb://spring-ai-rag`，经 Nacos 服务发现）、JWT 校验、Redis 黑名单、CORS、访问日志 |
-| PDF 解析 | Apache PDFBox（经 `spring-ai-pdf-document-reader` 传递引入） | 按页解析 PDF（文本层）；不直接用 `PagePdfDocumentReader`——它会过滤无文本页，导致扫描件 OCR 兜底失效 |
-| Word 解析 | Apache POI（`poi-ooxml` 解析 .docx、`poi-scratchpad` 解析 .doc） | 段落 + **表格**（`| 单元格 |` 保留行列对应关系，表头补分隔行、嵌套表格递归）+ **图片**（OCR 识别图片内文字并按原位插回正文）+ **扫描件**（整篇为图片时逐图 OCR，一图一单元）；标题样式（Heading 1-9）转 Markdown 前缀供标题链识别 |
-| Excel 解析 | Apache POI（`poi-ooxml` 的 XSSF 解析 .xlsx、poi 主包 HSSF 解析 .xls，`WorkbookFactory` 按魔数判别） | **多工作表**（每表 `## 工作表: 名称` 进入标题链）+ **单元格**（公式取计算值、日期/百分比按显示格式，避免读成序列号）+ **合并单元格补全**（左上角值填充整个区域，纵向合并的部门/分类列不丢维度）+ **表格结构**（`| 单元格 |` 一行一记录，表头补分隔行且每个逻辑单元重复表头）+ **图片**（内嵌截图 OCR 后作为该表补充单元） |
+| PDF 解析 | Apache PDFBox（经 `spring-ai-pdf-document-reader` 传递引入） | **逐页解析** PDF 文本层（空文本页也保留，供 OCR 兜底）。不直接用 `PagePdfDocumentReader`——它内部用 `StringUtils.hasText` 过滤无文本页，纯图片 PDF（扫描件）会被过滤成空列表导致后续 OCR 兜底无从触发。**扫描页（无文本层）**整页渲染为图片并调用 OCR，结果整体替换空白页文本；**混合页（文本层 + 图片）**额外 OCR 图片内文字，通过 `OcrTextMerger` 与文本层按行去重拼接，避免图表/扫描插图/扫描表格内容丢失。单元 `page_number` / `source_type=pdf` 沿用既有 metadata 键供下游 page_no 落库与引用展示；切分走与 Word / Excel / Markdown 同一套语义切片 + 标题注入 + Parent-Child |
+| Word 解析 | Apache POI（`poi-ooxml` 解析 .docx、`poi-scratchpad` 解析 .doc；按文件魔数判别 OLE2 / OOXML，扩展名与实际格式不符时仍能正确解析） | 段落 + **标题**（Word Heading 1-9 样式转 Markdown `#` 前缀，供标题链识别）+ **表格**（`\| 单元格 \|` 保留行列对应关系，首行表头补 Markdown 分隔行，嵌套表格递归展开）+ **图片**（OCR 识别图片内文字**按原位置插回**正文；未定位图片（页眉页脚 / 浮动 / 未引用）追加文末；**按内容指纹去重**；短边小于 `rag.ocr.word-min-image-side` 视为图标/装饰图跳过；单篇最多 OCR `rag.ocr.word-max-images` 张）+ **扫描件**（整篇文本层字符数低于 `rag.ocr.min-text-length` 且有图片时判定为扫描件，逐图 OCR 一图一单元，与 PDF 扫描件走同一条 RAG 链路）+ **逻辑单元**（按标题边界或 4000 字符切分，单元序号写入 `page_number` 复用下游 page_no 落库与引用展示） |
+| Excel 解析 | Apache POI（`poi-ooxml` 的 XSSF 解析 .xlsx、poi 主包 HSSF 解析 .xls，`WorkbookFactory` 按魔数判别） | **多工作表**（每表 `## 工作表: 名称` 进入标题链）+ **单元格**（公式取计算值，公式求值器创建失败 / 公式计算失败时降级读缓存值避免单元格丢失；日期/百分比按 Excel 显示格式输出，避免日期读成 `45000` 这类序列号；单元格内换行/制表/不间断空格压成单空格，保证"一行一记录"）+ **合并单元格补全**（左上角值填充整个区域，纵向合并的部门/分类列不丢维度，全空行不补）+ **表格结构**（`| 单元格 |` 一行一记录，剔除全空行与**首尾**空列、**行内保留中间空列以维持列对齐**（否则 `A=姓名, B=空, C=分数` 会被错位合并），表头补分隔行且每个逻辑单元重复表头）+ **图片**（内嵌截图 OCR 后作为该表补充单元；同一张图按内容指纹去重；组合形状内的图片递归识别）+ **安全限流**（单表 > 64 列或 > 10000 行时截断并告警，防 `lastCellNum` 虚高 / 内存膨胀；全空白工作表不产单元，任务直接失败避免静默产出空索引） |
 | Markdown 解析 | 纯 JDK 实现（无需额外依赖） | **编码识别**（BOM / UTF-8 / GBK，中文 Windows 编辑器存的 GBK 文件不乱码）+ **Front Matter**（转为引用块保留 title/tags，且不污染标题链）+ **结构保留**（标题/表格/列表原样保留，本就是 LLM 友好格式）+ **代码块优先**（先识别围栏再判标题，块内 `#` 不当标题；超长块按围栏重组，每段仍是完整代码块）+ **逻辑单元**（1-2 级标题处切分，过短则继续累积，续块继承最近标题）；HTML 注释不进索引 |
-| OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）与 Word / Excel 内嵌图片（架构图/流程图/截图/扫描表格/整篇扫描件）自动识别文字；同图去重、图标按尺寸过滤、单篇张数限流 |
+| OCR | 阿里云 OCR（`ocr_api20210707` SDK） | **三种触发场景**——扫描版 PDF（无文本层，整页渲染为图片识别后整体替换空页文本）、PDF 混合页（文本层 + 内嵌图片，识别图片内文字后通过 `OcrTextMerger` 与文本层按行去重拼接）、Word / Excel 内嵌图片（架构图/流程图/截图/扫描表格/整篇扫描件）。**图片预处理收敛在 `ImageOcrSupport`**（Word 与 Excel 共用）：短边小于 `rag.ocr.word-min-image-side` 视为图标/装饰图跳过；长边超过 2400px 等比缩小（避免请求体过大）；jpg/png/bmp 直接用原始字节（避免转 PNG 体积膨胀），其余格式统一转 PNG；**按内容指纹去重**避免同图重复识别。**限流**——单篇 Word / Excel 最多 OCR `rag.ocr.word-max-images` 张、PDF 渲染分辨率 `rag.ocr.dpi`、单页/单图失败是否中断由 `rag.ocr.fail-on-error` 控制（默认 false 记日志跳过）。OCR 生成的单元 `metadata.ocr=true` 便于排查"内容来自图片识别" |
 | 前端 | Vue 3（Vite 5）+ vue-router | 独立工程 `spring-ai-web/`：Vite + Vue 3 SPA（组件化开发），`npm run build` 产物 `dist/`，前后端分离单独部署（Nginx 托管 `dist/` + `/api` 反代网关 7070，或直连网关走 CORS） |
 
 ---
@@ -84,7 +84,7 @@ graph TB
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
         SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
-        PARSER["Parser<br/>按格式分派：PDF(PDFBox+OCR) / Word、Excel(POI+OCR) / Markdown(纯文本)"]
+        PARSER["Parser<br/>按格式分派：PDF(PDFBox+OCR) / Word、Excel(POI+OCR) / Markdown(纯 JDK)"]
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
@@ -351,11 +351,15 @@ spring-ai-rag-demo/
   └─ ② MQ 消费处理（processTask，任务状态 0待处理→1处理中→2成功/3失败；失败重试 3 次进死信）
         │  文档状态 0上传中 → 1解析中 → 2向量化中 → 3成功 / 4失败
         │
-        ├─ 解析       按扩展名分派解析器：PDF 逐页解析（无文本层 OCR 兜底）
-        │             / Word 段落 + 表格（`| 单元格 |`）+ 内嵌图片 OCR（按原位插回正文；整篇仅图片则视为扫描件逐图 OCR）
-        │             （Word 标题样式段转 Markdown 前缀；无分页概念，按标题边界/4000 字符切逻辑单元）
-        │             / Excel 逐工作表解析（公式取计算值、日期按显示格式、合并单元格补全、表头补分隔行）
-        │             （每表 `## 工作表: 名称` 进标题链；按 4000 字符切逻辑单元，每个单元重复表头；内嵌图片 OCR 作为该表补充单元）
+        ├─ 解析       按扩展名分派解析器：PDF 逐页解析（保留空文本页兜底 OCR）
+        │             （扫描页整页渲染识别替换；混合页 OCR 图片内文字后与文本层按行去重拼接）
+        │             / Word 段落 + 标题（Heading 1-9 转 Markdown 前缀）+ 表格（`| 单元格 |`、嵌套表递归）+ 内嵌图片 OCR
+        │             （图片按原位插回正文，未定位图片追加文末；同图去重、图标按尺寸过滤、单篇张数限流 `rag.ocr.word-max-images`；
+        │             整篇文本层低于 `rag.ocr.min-text-length` 时判定为扫描件，逐图 OCR 一图一单元；
+        │             无分页概念，按标题边界/4000 字符切逻辑单元）
+        │             / Excel 逐工作表解析（公式取计算值、日期按显示格式、合并单元格补全、表头补分隔行、中间空列保留以维持列对齐）
+        │             （每表 `## 工作表: 名称` 进标题链；按 4000 字符切逻辑单元，每个单元重复表头；内嵌图片 OCR 作为该表补充单元；
+        │             单表 > 64 列 / 10000 行截断防 `lastCellNum` 虚高与内存膨胀）
         │             / Markdown 按编码解码（BOM/UTF-8/GBK）+ Front Matter 转引用块 + 代码块/表格/列表原样保留
         │             （先识别代码块再判标题，块内 `#` 不当标题；1-2 级标题处切逻辑单元，过短继续累积，续块继承最近标题）
         │             → parse_progress = 100%
@@ -1420,7 +1424,7 @@ npm run build        # 生产构建，产物在 dist/
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。
-5. **OCR 兜底**：PDF 文本层缺失的页面自动渲染为图片识别文字；Word 内嵌图片（架构图/流程图/截图/扫描表格）识别后按原位插回正文、未定位图片（页眉页脚/浮动图片）追加文末、整篇仅图片的 Word（扫描件）逐图 OCR 一图一单元；Excel 内嵌图片识别文字后作为该工作表的补充单元；三者的图片过滤/缩放编码/内容指纹统一收敛在 `ImageOcrSupport`，按内容指纹去重、按尺寸过滤图标、单篇张数限流，扫描版与文本型文档走同一条 RAG 链路。
+5. **OCR 兜底**：三处触发——PDF 文本层缺失的页面（**扫描页**）整页渲染为图片识别并整体替换空文本；PDF **混合页**（文本层 + 内嵌图表/扫描插图）额外识别图片内文字，与文本层按 `OcrTextMerger` **按行去重**拼接，保证图表内容不丢；Word / Excel 内嵌图片（架构图/流程图/截图/扫描表格）识别后按原位插回正文、Word 未定位图片（页眉页脚 / 浮动 / 未引用）追加文末、整篇仅图片的 Word（扫描件）逐图 OCR 一图一单元。**图片预处理收敛在 `ImageOcrSupport`**——按内容指纹去重、短边小于 `rag.ocr.word-min-image-side` 视为图标/装饰图跳过、长边超过 2400px 等比缩小、jpg/png/bmp 直传其余转 PNG；单篇 Word / Excel 最多 OCR `rag.ocr.word-max-images` 张、PDF 渲染分辨率由 `rag.ocr.dpi` 控制、单页/单图失败是否中断由 `rag.ocr.fail-on-error` 控制（默认 false 记日志跳过）。扫描版与文本型文档走同一条 RAG 链路。
 6. **语义切片（自研）**：Spring AI 2.0 已移除 `SemanticTextSplitter`，自行实现"段落 embedding 聚类 + 相邻相似度断点"的语义分块，避免固定 token 硬切导致的主题割裂；失败自动降级 `TokenTextSplitter`。
 7. **标题感知注入**：识别数字/中文序数/无序号标题行构建标题链，将所属标题以 `【标题链】正文` 前缀注入 chunk 文本（参与向量化，孤立 chunk 也有上下文）并写 `metadata.heading` 供溯源。
 8. **来源溯源（按引用过滤 + 重排编号 + 综合引用引导）**：回答中标注 `[来源n]` 并返回引用列表；引用列表**只返回回答实际引用的来源**（按 [来源N] 过滤候选，回答无引用则不下发），并重排为连续升序编号、回答文本同步重写（回答引用 1、3、7 → 回答与来源列表同步重写为 1、2、3，前端 `scrollToSource` 点击定位一一对应）；系统提示引导"综合引用"——多相关片段分别标注 `[来源1][来源2][来源3]`，工具结果回答末尾统一标注（"以上内容详见[来源1][来源2][来源3]"）；引用编号经 `alignCitations` 对齐校验（逐字引用片段与来源内容包含匹配，纠正张冠李戴，无法判定则保守保留）。
