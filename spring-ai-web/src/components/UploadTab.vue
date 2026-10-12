@@ -11,7 +11,7 @@
         </select>
       </div>
       <div style="display: flex; align-items: flex-end;">
-        <input type="file" ref="fileInput" accept=".pdf,.docx,.doc" style="display: none" @change="onFileChange">
+        <input type="file" ref="fileInput" accept=".pdf,.docx,.doc,.xlsx,.xls" style="display: none" @change="onFileChange">
         <button class="btn btn-outline" @click="pickFile">选择文件</button>
       </div>
     </div>
@@ -26,7 +26,7 @@
     >
       <div class="dz-icon">📄</div>
       <div class="dz-text">点击选择或将文档拖拽到此处</div>
-      <div class="dz-sub">支持 .pdf / .docx / .doc 格式，单文件最大 50MB</div>
+      <div class="dz-sub">支持 .pdf / .docx / .doc / .xlsx / .xls 格式，单文件最大 50MB</div>
     </div>
 
     <div class="msg-info" v-if="uploadMsg" :class="uploadType">{{ uploadMsg }}</div>

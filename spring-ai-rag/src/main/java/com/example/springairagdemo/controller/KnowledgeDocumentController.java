@@ -68,13 +68,15 @@ public class KnowledgeDocumentController {
     private final KnowledgeEmbeddingTaskService knowledgeEmbeddingTaskService;
 
     /** 上传白名单：支持的文档格式（与各 DocumentParser 实现的 supports 保持一致） */
-    private static final List<String> SUPPORTED_EXTENSIONS = List.of("pdf", "docx", "doc");
+    private static final List<String> SUPPORTED_EXTENSIONS = List.of("pdf", "docx", "doc", "xlsx", "xls");
 
     /** 下载响应的 MIME 类型（未命中回退二进制流） */
     private static final Map<String, String> CONTENT_TYPES = Map.of(
             "pdf", "application/pdf",
             "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "doc", "application/msword");
+            "doc", "application/msword",
+            "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "xls", "application/vnd.ms-excel");
 
     /**
      * 上传文档文件并建立知识库索引（需要 EDITOR 及以上）
@@ -90,7 +92,7 @@ public class KnowledgeDocumentController {
             return ResponseEntity.badRequest().body(Map.of("success", false, "message", "上传文件为空"));
         }
 
-        // 校验文件格式（pdf / docx / doc）
+        // 校验文件格式（pdf / docx / doc / xlsx / xls）
         String originalFilename = file.getOriginalFilename();
         String extension = getFileExtension(originalFilename);
         if (extension == null || !SUPPORTED_EXTENSIONS.contains(extension)) {

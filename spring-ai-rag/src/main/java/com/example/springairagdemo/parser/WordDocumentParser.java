@@ -1,7 +1,6 @@
 package com.example.springairagdemo.parser;
 
 import com.example.springairagdemo.config.RagConfigProperties;
-import com.example.springairagdemo.service.OcrService;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.poi.hwpf.HWPFDocument;
 import org.apache.poi.hwpf.extractor.WordExtractor;
@@ -25,20 +24,12 @@ import org.springframework.web.multipart.MultipartFile;
 import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
-import javax.imageio.ImageIO;
-import java.awt.Graphics2D;
-import java.awt.RenderingHints;
-import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.PushbackInputStream;
-import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -48,6 +39,9 @@ import java.util.regex.Pattern;
 
 /**
  * Word 文档解析器：支持 .docx（OOXML，poi-ooxml）与 .doc（OLE2 二进制，poi-scratchpad）。
+ * <p>
+ * 内嵌图片的过滤/编码/识别统一委托 {@link ImageOcrSupport}（与 Excel 解析器共用同一套逻辑），
+ * 本类只负责图片定位（插回正文原位）、内容去重与单篇张数限流。
  * <p>
  * 内容提取覆盖四类信息，尽量不丢内容：
  * <ol>
@@ -85,20 +79,14 @@ public class WordDocumentParser implements DocumentParser {
     /** Word 控制字符（\u0007 单元格结束符单独转为制表符保留结构）：\u000b 软换行、\u000c 分页符、\u0002 脚注引用等 */
     private static final Pattern CONTROL_CHARS = Pattern.compile("[\\u0000-\\u0006\\u0008\\u000b\\u000c\\u000e-\\u001f]");
 
-    /** OCR 可直接识别的图片格式：直接用原始字节送识别，避免大图转 PNG 体积膨胀（阿里云 OCR 有请求体上限） */
-    private static final Set<String> OCR_RAW_FORMATS = Set.of("jpg", "jpeg", "png", "bmp");
-
-    /** 送 OCR 前图片长边上限（像素）：超过则等比缩小，避免请求体过大与识别变慢 */
-    private static final int OCR_MAX_IMAGE_SIDE = 2400;
-
     private final RagConfigProperties config;
-    private final OcrService ocrService;
+    private final ImageOcrSupport imageOcr;
     private final TextChunkSplitter chunkSplitter;
 
-    public WordDocumentParser(RagConfigProperties config, OcrService ocrService,
+    public WordDocumentParser(RagConfigProperties config, ImageOcrSupport imageOcr,
                               TextChunkSplitter chunkSplitter) {
         this.config = config;
-        this.ocrService = ocrService;
+        this.imageOcr = imageOcr;
         this.chunkSplitter = chunkSplitter;
     }
 
@@ -375,22 +363,12 @@ public class WordDocumentParser implements DocumentParser {
         if (data == null || data.length == 0) {
             return;
         }
-        String hash = imageHash(data);
+        String hash = ImageOcrSupport.fingerprint(data);
         if (!imageHashes.add(hash)) {
             return;
         }
         String ext = extension == null ? "" : extension.toLowerCase(Locale.ROOT);
         images.add(new WordImage(hash, data, ext, insertIndex));
-    }
-
-    private String imageHash(byte[] data) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("MD5");
-            return HexFormat.of().formatHex(digest.digest(data));
-        } catch (Exception e) {
-            // 理论上不会发生（MD5 为 JDK 必备算法），退化为"长度 + 内容散列"
-            return data.length + "-" + java.util.Arrays.hashCode(data);
-        }
     }
 
     /**
@@ -405,7 +383,7 @@ public class WordDocumentParser implements DocumentParser {
      */
     private List<Document> assemble(List<String> blocks, List<WordImage> images, String format) {
         RagConfigProperties.Ocr ocr = config.getOcr();
-        if (!ocrService.isEnabled() || images.isEmpty()) {
+        if (!imageOcr.isEnabled() || images.isEmpty()) {
             return toDocuments(blocks, 1);
         }
 
@@ -441,14 +419,12 @@ public class WordDocumentParser implements DocumentParser {
                 break;
             }
             attempts++;
-            String text = recognize(image);
+            String text = imageOcr.recognize(image.data(), image.extension());
             if (text == null) {
                 continue;
             }
-            // Spring AI 2.0 Document 不可变，metadata 由本类构建，可直接标记 OCR 来源
-            Document unit = buildUnit(List.of(text), pageNo++);
-            unit.getMetadata().put("ocr", true);
-            units.add(unit);
+            // 图片单元标记 OCR 来源（与 Excel 图片单元一致），便于排查"内容来自图片识别"
+            units.add(buildUnit(List.of(text), pageNo++, true));
         }
         if (!units.isEmpty()) {
             log.info("Word({}) 扫描件 OCR 完成：识别 {} 张图片（尝试 {} 张）", format, units.size(), attempts);
@@ -471,7 +447,7 @@ public class WordDocumentParser implements DocumentParser {
                 break;
             }
             attempts++;
-            String text = recognize(image);
+            String text = imageOcr.recognize(image.data(), image.extension());
             if (text == null) {
                 continue;
             }
@@ -499,87 +475,6 @@ public class WordDocumentParser implements DocumentParser {
         blocks.addAll(merged);
         log.info("Word({}) 内嵌图片 OCR 完成：{} 张识别出文字并插入正文（尝试 {} 张）",
                 format, recognized, attempts);
-    }
-
-    /**
-     * 单张图片 OCR
-     *
-     * @return 识别文字；图片被过滤（图标/矢量图）或未识别出文字时返回 null
-     */
-    private String recognize(WordImage image) {
-        try {
-            byte[] payload = toOcrPayload(image);
-            if (payload == null) {
-                return null;
-            }
-            String text = ocrService.recognizeImage(payload);
-            if (text == null || text.isBlank()) {
-                return null;
-            }
-            log.debug("图片 OCR 成功：原始 {} 字节/{}，送识别 {} 字节，识别 {} 字符",
-                    image.data().length, image.extension(), payload.length, text.length());
-            return text;
-        } catch (Exception e) {
-            // 单图失败不影响整篇解析（与 PDF 单页失败跳过一致）
-            log.warn("图片 OCR 失败，已跳过: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * 生成送 OCR 的图片字节。
-     * <p>
-     * 过滤规则：不可解码的图片（emf/wmf 矢量图、异常格式）跳过；短边小于
-     * {@code rag.ocr.word-min-image-side} 的图片（图标/装饰线/logo）跳过。
-     * 编码规则：jpg/png/bmp 直接用原始字节（避免大图转 PNG 体积膨胀、超出 OCR 请求体上限），
-     * 其余格式（gif/tiff 等）统一转 PNG；长边超过 {@link #OCR_MAX_IMAGE_SIDE} 时等比缩小。
-     *
-     * @return 图片字节；应跳过时返回 null
-     */
-    private byte[] toOcrPayload(WordImage image) throws IOException {
-        BufferedImage decoded;
-        try (ByteArrayInputStream in = new ByteArrayInputStream(image.data())) {
-            decoded = ImageIO.read(in);
-        }
-        if (decoded == null) {
-            log.debug("跳过不可解码图片（可能为 emf/wmf 矢量图）：{} 字节", image.data().length);
-            return null;
-        }
-
-        int minSide = Math.min(decoded.getWidth(), decoded.getHeight());
-        if (minSide < config.getOcr().getWordMinImageSide()) {
-            log.debug("跳过过小图片（{}x{}，视为图标/装饰）", decoded.getWidth(), decoded.getHeight());
-            return null;
-        }
-
-        boolean oversize = Math.max(decoded.getWidth(), decoded.getHeight()) > OCR_MAX_IMAGE_SIDE;
-        if (!oversize && OCR_RAW_FORMATS.contains(image.extension())) {
-            return image.data();
-        }
-        return toPngBytes(oversize ? scaleDown(decoded) : decoded);
-    }
-
-    /** 等比缩小到长边不超过 {@link #OCR_MAX_IMAGE_SIDE} */
-    private BufferedImage scaleDown(BufferedImage source) {
-        double ratio = (double) OCR_MAX_IMAGE_SIDE / Math.max(source.getWidth(), source.getHeight());
-        int width = Math.max(1, (int) Math.round(source.getWidth() * ratio));
-        int height = Math.max(1, (int) Math.round(source.getHeight() * ratio));
-        BufferedImage target = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
-        Graphics2D graphics = target.createGraphics();
-        try {
-            graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
-                    RenderingHints.VALUE_INTERPOLATION_BILINEAR);
-            graphics.drawImage(source, 0, 0, width, height, null);
-        } finally {
-            graphics.dispose();
-        }
-        return target;
-    }
-
-    private byte[] toPngBytes(BufferedImage image) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        ImageIO.write(image, "png", out);
-        return out.toByteArray();
     }
 
     // ===================== 公共处理 =====================
@@ -636,6 +531,13 @@ public class WordDocumentParser implements DocumentParser {
     }
 
     private Document buildUnit(List<String> blocks, int unitNo) {
+        return buildUnit(blocks, unitNo, false);
+    }
+
+    /**
+     * @param ocr 单元内容是否来自图片 OCR（写入 metadata，便于排查"内容来自图片识别"）
+     */
+    private Document buildUnit(List<String> blocks, int unitNo, boolean ocr) {
         // 段落之间用空行分隔，与 PDF 页文本的行结构保持一致（供语义切片按空行切段）
         String text = String.join("\n\n", blocks);
         Map<String, Object> metadata = new HashMap<>();
@@ -643,6 +545,9 @@ public class WordDocumentParser implements DocumentParser {
         metadata.put("page_number", unitNo);
         metadata.put("end_page_number", unitNo);
         metadata.put("source_type", "word");
+        if (ocr) {
+            metadata.put("ocr", true);
+        }
         return Document.builder().text(text).metadata(metadata).build();
     }
 
