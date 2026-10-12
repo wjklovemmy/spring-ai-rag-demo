@@ -92,7 +92,9 @@ public class KnowledgeDocumentService {
             "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "doc", "application/msword",
             "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "xls", "application/vnd.ms-excel");
+            "xls", "application/vnd.ms-excel",
+            "md", "text/markdown",
+            "markdown", "text/markdown");
 
     @Autowired
     protected KnowledgeBaseService knowledgeBaseService;
@@ -133,7 +135,7 @@ public class KnowledgeDocumentService {
     @Autowired
     protected RagConfigProperties ragConfig;
 
-    /** 文档解析器注册表：按文件扩展名（pdf / docx / doc / xlsx / xls）分派到对应格式解析器 */
+    /** 文档解析器注册表：按文件扩展名（pdf / docx / doc / xlsx / xls / md / markdown）分派到对应格式解析器 */
     @Autowired
     protected DocumentParserRegistry documentParserRegistry;
 
@@ -524,7 +526,7 @@ public class KnowledgeDocumentService {
      * 再切分为 chunks（纯计算、确定性：同输入重跑时 chunkIndex 从 0 稳定编号），
      * 并记录 chunk 总数（同时标记切片阶段完成）。
      * <p>
-     * 解析器按文档扩展名从 {@link DocumentParserRegistry} 分派（pdf / docx / doc / xlsx / xls），
+     * 解析器按文档扩展名从 {@link DocumentParserRegistry} 分派（pdf / docx / doc / xlsx / xls / md / markdown），
      * 切分走格式无关的通用链路（语义切片 + 标题注入 + Parent-Child）。
      */
     private List<Document> parseAndSplit(KnowledgeEmbeddingTaskEntity task, KnowledgeDocumentEntity docEntity)

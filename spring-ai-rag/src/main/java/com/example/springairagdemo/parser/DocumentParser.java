@@ -10,7 +10,7 @@ import java.util.List;
 /**
  * 文档解析器接口：包含读取原始内容和切分两个独立步骤。
  * <p>
- * 每种文档格式一个实现（PDF / Word …），由 {@link DocumentParserRegistry} 按文件扩展名选择，
+ * 每种文档格式一个实现（PDF / Word / Excel / Markdown …），由 {@link DocumentParserRegistry} 按文件扩展名选择，
  * 因此各实现无需感知其它格式。
  */
 public interface DocumentParser {

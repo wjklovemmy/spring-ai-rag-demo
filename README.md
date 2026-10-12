@@ -2,7 +2,7 @@
 
 一个基于 **Spring Boot 4 + Spring AI 2.0** 的企业级 **RAG（Retrieval-Augmented Generation，检索增强生成）** 演示项目。
 
-项目将 PDF / Word / Excel 文档解析、切分、向量化后存入 Milvus 向量数据库；问答采用 **Agentic RAG** 模式——由模型自主决定是否调用 `searchKnowledge` 工具检索知识库，再严格基于检索到的 [来源N] 片段逐字引用回答（DeepSeek 生成），并附带可溯源的知识库引用。
+项目将 PDF / Word / Excel / Markdown 文档解析、切分、向量化后存入 Milvus 向量数据库；问答采用 **Agentic RAG** 模式——由模型自主决定是否调用 `searchKnowledge` 工具检索知识库，再严格基于检索到的 [来源N] 片段逐字引用回答（DeepSeek 生成），并附带可溯源的知识库引用。
 
 ---
 
@@ -51,6 +51,7 @@
 | PDF 解析 | Apache PDFBox（经 `spring-ai-pdf-document-reader` 传递引入） | 按页解析 PDF（文本层）；不直接用 `PagePdfDocumentReader`——它会过滤无文本页，导致扫描件 OCR 兜底失效 |
 | Word 解析 | Apache POI（`poi-ooxml` 解析 .docx、`poi-scratchpad` 解析 .doc） | 段落 + **表格**（`| 单元格 |` 保留行列对应关系，表头补分隔行、嵌套表格递归）+ **图片**（OCR 识别图片内文字并按原位插回正文）+ **扫描件**（整篇为图片时逐图 OCR，一图一单元）；标题样式（Heading 1-9）转 Markdown 前缀供标题链识别 |
 | Excel 解析 | Apache POI（`poi-ooxml` 的 XSSF 解析 .xlsx、poi 主包 HSSF 解析 .xls，`WorkbookFactory` 按魔数判别） | **多工作表**（每表 `## 工作表: 名称` 进入标题链）+ **单元格**（公式取计算值、日期/百分比按显示格式，避免读成序列号）+ **合并单元格补全**（左上角值填充整个区域，纵向合并的部门/分类列不丢维度）+ **表格结构**（`| 单元格 |` 一行一记录，表头补分隔行且每个逻辑单元重复表头）+ **图片**（内嵌截图 OCR 后作为该表补充单元） |
+| Markdown 解析 | 纯 JDK 实现（无需额外依赖） | **编码识别**（BOM / UTF-8 / GBK，中文 Windows 编辑器存的 GBK 文件不乱码）+ **Front Matter**（转为引用块保留 title/tags，且不污染标题链）+ **结构保留**（标题/表格/列表原样保留，本就是 LLM 友好格式）+ **代码块优先**（先识别围栏再判标题，块内 `#` 不当标题；超长块按围栏重组，每段仍是完整代码块）+ **逻辑单元**（1-2 级标题处切分，过短则继续累积，续块继承最近标题）；HTML 注释不进索引 |
 | OCR | 阿里云 OCR（`ocr_api20210707` SDK） | 扫描版 PDF（无文本层）与 Word / Excel 内嵌图片（架构图/流程图/截图/扫描表格/整篇扫描件）自动识别文字；同图去重、图标按尺寸过滤、单篇张数限流 |
 | 前端 | Vue 3（Vite 5）+ vue-router | 独立工程 `spring-ai-web/`：Vite + Vue 3 SPA（组件化开发），`npm run build` 产物 `dist/`，前后端分离单独部署（Nginx 托管 `dist/` + `/api` 反代网关 7070，或直连网关走 CORS） |
 
@@ -83,7 +84,7 @@ graph TB
         ASPECT["KbAccessAspect<br/>@RequireKbRole AOP 鉴权"]
         AUTHZ["KbAuthorizationService<br/>assertRole / visibleKbIds"]
         SVC["Service 层<br/>异步摄取流水线 / chat 问答 / 文档删除"]
-        PARSER["Parser<br/>按格式分派：PDF(PDFBox+OCR) / Word、Excel(POI+OCR)"]
+        PARSER["Parser<br/>按格式分派：PDF(PDFBox+OCR) / Word、Excel(POI+OCR) / Markdown(纯文本)"]
         SPLIT["自研 Chunking<br/>语义切片 + 标题注入"]
         EMBED["DashScopeEmbeddingModel<br/>text-embedding-v3"]
         RERANK["DashScopeRerankService<br/>gte-rerank-v2 精排"]
@@ -228,6 +229,7 @@ spring-ai-rag-demo/
 │       │   ├── PdfDocumentParser.java         # PDF 解析实现（含 OCR 兜底）
 │       │   ├── WordDocumentParser.java        # Word 解析实现（.docx/.doc：段落 + 表格 + 内嵌图片 OCR + 扫描件逐图 OCR）
 │       │   ├── ExcelDocumentParser.java       # Excel 解析实现（.xlsx/.xls：单元格/公式/日期 + 合并单元格补全 + 多工作表 + 内嵌图片 OCR）
+│       │   ├── MarkdownDocumentParser.java    # Markdown 解析实现（.md/.markdown：编码识别 + Front Matter + 代码块/表格/列表结构保留 + 按 1-2 级标题切逻辑单元）
 │       │   ├── ImageOcrSupport.java           # 内嵌图片 OCR 共用支持（尺寸过滤/缩放编码/内容指纹，Word 与 Excel 共用）
 │       │   ├── OcrTextMerger.java             # OCR 结果与文本层按行去重合并（PDF 混合页 / Word 图片共用）
 │       │   ├── TextChunkSplitter.java         # 通用切分链路（语义切片 + 标题注入 + Parent-Child，各格式共用）
@@ -334,7 +336,7 @@ spring-ai-rag-demo/
 ```
 
 ```
-上传文档（multipart，支持 pdf / docx / doc / xlsx / xls）
+上传文档（multipart，支持 pdf / docx / doc / xlsx / xls / md / markdown）
   │
   ├─ ① 提交阶段（submitIngest，接口立即返回 taskNo）
   │       · saveDocumentInfo   写入 MySQL knowledge_document
@@ -354,6 +356,8 @@ spring-ai-rag-demo/
         │             （Word 标题样式段转 Markdown 前缀；无分页概念，按标题边界/4000 字符切逻辑单元）
         │             / Excel 逐工作表解析（公式取计算值、日期按显示格式、合并单元格补全、表头补分隔行）
         │             （每表 `## 工作表: 名称` 进标题链；按 4000 字符切逻辑单元，每个单元重复表头；内嵌图片 OCR 作为该表补充单元）
+        │             / Markdown 按编码解码（BOM/UTF-8/GBK）+ Front Matter 转引用块 + 代码块/表格/列表原样保留
+        │             （先识别代码块再判标题，块内 `#` 不当标题；1-2 级标题处切逻辑单元，过短继续累积，续块继承最近标题）
         │             → parse_progress = 100%
         ├─ 切分       SemanticSplitter：语义切片 + 标题感知注入
         │             · 段落批量 embedding 聚类 → 相邻相似度 < 0.55 处断点
@@ -1373,7 +1377,7 @@ npm run build        # 生产构建，产物在 dist/
 | GET | `/api/knowledge-base/{id}/members` | 是 | 成员列表（需 OWNER） |
 | POST | `/api/knowledge-base/{id}/members` | 是 | 授权/调整成员角色（需 OWNER，body `{userId, role}`） |
 | DELETE | `/api/knowledge-base/{id}/members/{userId}` | 是 | 移除成员（需 OWNER，最后一个 OWNER 不可移除） |
-| POST | `/api/knowledge-document/upload` | 是 | 上传文档（pdf / docx / doc / xlsx / xls）并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
+| POST | `/api/knowledge-document/upload` | 是 | 上传文档（pdf / docx / doc / xlsx / xls / md / markdown）并**异步提交摄取**（需 EDITOR，multipart 字段 `file` + `knowledgeBaseId`；立即返回 `{taskNo, taskId, documentId, version}`） |
 | GET | `/api/knowledge-document/task/{taskNo}` | 是 | 任务状态轮询（含分阶段进度 parse/split/chunk/embed/milvus 与 total/success_chunk，前端 5 行进度条） |
 | GET | `/api/knowledge-document/knowledge-bases` | 是 | 当前用户可见知识库下拉（需登录） |
 | POST | `/api/knowledge-document/chat` | 是 | 知识问答（Agentic RAG，需 VIEWER，`{"question","knowledgeBaseId","sessionId","stream"}`；`stream=true`（默认）SSE 流式：`tool`/`delta`/`final`/`sources`/`done`/`error` 事件，`tool` 展示模型自主调用 searchKnowledge 工具的过程、`final` 为引用对齐校验后的最终全文，前端覆盖显示；`stream=false` 返回 `{answer, sources}`；按 `sessionId` 维持多轮记忆） |
@@ -1412,7 +1416,7 @@ npm run build        # 生产构建，产物在 dist/
 
 ## 关键设计决策
 
-1. **异步任务 + 增量执行（RabbitMQ 全链路可靠性）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。可靠性链：① **Quorum 队列**——Raft 多副本持久化队列（队列/消息/死信参数均持久化），单节点挂掉不丢消息，是官方替代镜像队列的高可用方案（classic mirroring 自 RabbitMQ 4.0 移除）；② **生产者可靠性**——`publisher-confirm-type=correlated` + `publisher-returns=true`（mandatory 模式），Confirm nack 或路由不到队列时通过 `CorrelationData(taskId)` / `x-task-id` 头定位任务并标记失败，不静默丢失；③ **消费者可靠性**——失败重试 3 次（`max-retries=3`，共 4 次消费尝试），耗尽 `RejectAndDontRequeueRecoverer` 拒绝 → 死信队列统一标记失败（幂等）；④ **积压监控**——`RabbitQueueMonitor` 定时轮询 Management API，Ready 超阈值告警（ERROR 日志 + 可选 Webhook），及早发现"消费者跟不上生产者"；⑤ **防重复**——重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），解析器按扩展名分派（`DocumentParser` + `DocumentParserRegistry`，新增格式只需加一个实现类、切分链路复用），便于继续扩展 Markdown、PPT 等格式。
+1. **异步任务 + 增量执行（RabbitMQ 全链路可靠性）**：摄取从"同步模板方法 + 事务回滚"改为**异步任务制**（`submitIngest` 立即返回 `taskNo`，通过 RabbitMQ 异步执行）；失败不再整批回滚，而是保留半成品（MySQL chunk + `milvus_id` 判空标记），重启自动恢复增量补齐。可靠性链：① **Quorum 队列**——Raft 多副本持久化队列（队列/消息/死信参数均持久化），单节点挂掉不丢消息，是官方替代镜像队列的高可用方案（classic mirroring 自 RabbitMQ 4.0 移除）；② **生产者可靠性**——`publisher-confirm-type=correlated` + `publisher-returns=true`（mandatory 模式），Confirm nack 或路由不到队列时通过 `CorrelationData(taskId)` / `x-task-id` 头定位任务并标记失败，不静默丢失；③ **消费者可靠性**——失败重试 3 次（`max-retries=3`，共 4 次消费尝试），耗尽 `RejectAndDontRequeueRecoverer` 拒绝 → 死信队列统一标记失败（幂等）；④ **积压监控**——`RabbitQueueMonitor` 定时轮询 Management API，Ready 超阈值告警（ERROR 日志 + 可选 Webhook），及早发现"消费者跟不上生产者"；⑤ **防重复**——重复投递由任务状态预检 + `claimTask` CAS + 增量处理三重防护（at-least-once 下不重复消费）。文档处理流水线经 `processTask` 统一编排（解析→切分→增量分类→入库→Embedding→Milvus→置成功→旧版下线），解析器按扩展名分派（`DocumentParser` + `DocumentParserRegistry`，新增格式只需加一个实现类、切分链路复用），便于继续扩展 PPT、HTML 等格式。
 2. **文件最先持久化**：原始文件在提交阶段最先写入对象存储（MinIO/本地），处理过程幂等可重跑，避免"处理失败但原始文件丢失"；提交阶段异常则补偿删除文件与记录，防止孤儿。
 3. **版本平滑下线（7 态状态机）**：同名文档重传自动递增版本（取同名全部状态最大版本 +1 防重号）；新版成功后旧版置 `DEPRECATED(5)` 并设 `expire_time`（TTL 默认 30 天），TTL 内仍可检索；chat 时懒标记到期的旧版为 `EXPIRED(6)` 并过滤，且同名多版本只保留版本号最高的检索结果（新版优先、防止新旧混召）。
 4. **两阶段检索（Hybrid + Rerank）**："先宽后精"——第一阶段用 **Hybrid Search**（Milvus Dense 语义向量 + BM25 全文关键词双路召回，RRF 融合）召回 20 条候选，弥补纯向量检索对"关键词精确命中"的盲区；第二阶段由百炼 gte-rerank 精排取 5 条，任一路失败均自动降级，兼顾效果与可用性。**显式文档限定**：问题点名某份文档时先用 Milvus filter 把召回限定在目标文档内（杜绝名称相近文档的 chunk 混入引用来源）；多轮指代（如"上面的问题再查一遍"）时回看会话记忆最近一轮用户问题、沿用其显式文档限定（限定文档时 Hybrid 不支持 filter，自动改走纯向量检索）。

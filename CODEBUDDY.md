@@ -2,7 +2,7 @@
 
 ## 项目概览
 
-基于 **Spring Boot 4.0.7 + Spring AI 2.0.0（Java 17）** 的企业级 RAG（检索增强生成）演示项目。PDF / Word / Excel 文档解析、切分、向量化后存入 Milvus；问答采用 **Agentic RAG**——模型自主决定是否调用 `searchKnowledge` 工具检索，严格基于 `[来源N]` 片段逐字引用回答（DeepSeek 生成）。附带用户长期记忆、聊天会话管理、Agent 执行轨迹等能力。
+基于 **Spring Boot 4.0.7 + Spring AI 2.0.0（Java 17）** 的企业级 RAG（检索增强生成）演示项目。PDF / Word / Excel / Markdown 文档解析、切分、向量化后存入 Milvus；问答采用 **Agentic RAG**——模型自主决定是否调用 `searchKnowledge` 工具检索，严格基于 `[来源N]` 片段逐字引用回答（DeepSeek 生成）。附带用户长期记忆、聊天会话管理、Agent 执行轨迹等能力。
 
 仓库为**三服务微服务**（聚合父 POM，`packaging=pom`）：
 
@@ -59,7 +59,7 @@ cd spring-ai-web && npm install && npm run dev   # 或 npm run build 产物 dist
 
 ### RAG 摄取流水线（异步任务制）
 
-`KnowledgeDocumentService.submitIngest` 立即返回 `taskNo`，实际处理走 **RabbitMQ**（Quorum 队列 + Publisher Confirm/Return + 消费重试 3 次进死信，代码在 `mq/` 包）。消费端流程：按扩展名分派解析器（PDF 用 PDFBox 逐页提取、无文本层走阿里云 OCR 兜底；Word 用 POI 提取段落/表格，标题样式转 Markdown，内嵌图片 OCR 后按原位插回正文、整篇仅图片则按扫描件逐图 OCR；Excel 用 POI 逐工作表提取单元格（公式取计算值、日期按显示格式）、补全合并单元格，每表 `## 工作表: 名称` 进标题链、按 4000 字符切逻辑单元且每单元重复表头，内嵌图片 OCR 作为该表补充单元）→ 自研 `SemanticSplitter` 语义切片 + 标题链注入 → **Parent-Child 两级切分**：父块仅存 MySQL（不向量化），再按 200 token 细分为子块、子块 metadata 记 `parent_text` 并向量化入 Milvus（按库动态集合 `kb_{id}`）→ 两级增量 diff（父块变化级联重写子块，`diffChunks`）→ 5 阶段进度回写（parse/split/chunk/embed/milvus）。失败保留半成品（`milvus_id` 判空标记），重启 `DataInitializer` 扫描中断任务重新入队增量补齐。
+`KnowledgeDocumentService.submitIngest` 立即返回 `taskNo`，实际处理走 **RabbitMQ**（Quorum 队列 + Publisher Confirm/Return + 消费重试 3 次进死信，代码在 `mq/` 包）。消费端流程：按扩展名分派解析器（PDF 用 PDFBox 逐页提取、无文本层走阿里云 OCR 兜底；Word 用 POI 提取段落/表格，标题样式转 Markdown，内嵌图片 OCR 后按原位插回正文、整篇仅图片则按扫描件逐图 OCR；Excel 用 POI 逐工作表提取单元格（公式取计算值、日期按显示格式）、补全合并单元格，每表 `## 工作表: 名称` 进标题链、按 4000 字符切逻辑单元且每单元重复表头，内嵌图片 OCR 作为该表补充单元；Markdown 按 BOM/UTF-8/GBK 解码，Front Matter 转引用块保留，代码块优先识别（块内 `#` 不当标题）、超长块按围栏重组，标题/表格/列表原样保留，按 1-2 级标题切逻辑单元且续块继承最近标题）→ 自研 `SemanticSplitter` 语义切片 + 标题链注入 → **Parent-Child 两级切分**：父块仅存 MySQL（不向量化），再按 200 token 细分为子块、子块 metadata 记 `parent_text` 并向量化入 Milvus（按库动态集合 `kb_{id}`）→ 两级增量 diff（父块变化级联重写子块，`diffChunks`）→ 5 阶段进度回写（parse/split/chunk/embed/milvus）。失败保留半成品（`milvus_id` 判空标记），重启 `DataInitializer` 扫描中断任务重新入队增量补齐。
 
 ### 问答（Agentic RAG）
 
@@ -96,9 +96,10 @@ spring-ai-rag (com.example.springairagdemo)
 ├── controller/ KnowledgeBase / KnowledgeDocument / ChatSession / AgentTask / UserMemory / MemoryAdmin / Internal(/internal/kb/**)
 ├── memory/    RedisChatMemory / ConversationSummarizer / MessageTokenEstimator / RedisMemoryMonitor(记忆膨胀告警)
 ├── tools/     KbQueryTools / CalculatorTool / MemoryTools
-├── parser/    DocumentParserRegistry(按扩展名路由 pdf/docx/doc/xlsx/xls) / PdfDocumentParser(OCR兜底) /
+├── parser/    DocumentParserRegistry(按扩展名路由 pdf/docx/doc/xlsx/xls/md/markdown) / PdfDocumentParser(OCR兜底) /
 │              WordDocumentParser(.docx/.doc：段落+表格+内嵌图片OCR+扫描件逐图OCR) /
 │              ExcelDocumentParser(.xlsx/.xls：单元格/公式/日期+合并单元格补全+多工作表+内嵌图片OCR) /
+│              MarkdownDocumentParser(.md/.markdown：编码识别+FrontMatter+代码块/表格/列表结构保留+标题切单元) /
 │              ImageOcrSupport(内嵌图片OCR共用：尺寸过滤/缩放编码/内容指纹) /
 │              OcrTextMerger(OCR与文本层按行去重合并) /
 │              TextChunkSplitter(语义切片+标题注入+Parent-Child，各格式共用) / SemanticSplitter / HeadingExtractor

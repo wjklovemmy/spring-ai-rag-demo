@@ -190,11 +190,11 @@ public class RagRetrievalService {
     }
 
     /** 常见文件扩展名（文件名匹配时忽略） */
-    private static final Pattern FILE_EXT = Pattern.compile("(?i)\\.(pdf|docx?|xlsx?|pptx?|txt|md)$");
+    private static final Pattern FILE_EXT = Pattern.compile("(?i)\\.(pdf|docx?|xlsx?|pptx?|txt|md|markdown)$");
 
     /** 问题中提取"带扩展名的完整文件名"（如 软件技术说明书.pdf），检索范围限定用 */
     private static final Pattern FILE_NAME_IN_QUESTION = Pattern.compile(
-            "[\\u4e00-\\u9fa5A-Za-z0-9_\\-（）()·、]{2,40}\\.(?:pdf|docx?|xlsx?|pptx?|txt|md)",
+            "[\\u4e00-\\u9fa5A-Za-z0-9_\\-（）()·、]{2,40}\\.(?:pdf|docx?|xlsx?|pptx?|txt|md|markdown)",
             Pattern.CASE_INSENSITIVE);
 
     /** 书名号《》内的高亮文档名（如 《软件技术说明书》），检索范围限定用 */
